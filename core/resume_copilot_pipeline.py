@@ -488,7 +488,6 @@ def build_reply_text(
     parts.append("建议优先补齐联系方式、教育时间、经历成果和可量化结果，再用于正式投递。")
     return "\n".join(part for part in parts if part)
 
-
 def final_fact_guard(
     source_truth_text: str,
     resume_data: dict[str, Any],
@@ -520,6 +519,58 @@ def final_fact_guard(
         _validate_period_entities(resume_data, source_truth_text, fab)
 
     return resume_data, fab
+
+
+def _OLD_apply_fabrication_report(
+    resume_data: dict, fab: FabricationReport,
+) -> None:
+    """Clear fabricated fields from resume_data based on report details.
+
+    The fabrication report catches field-level fabrications (school, degree,
+    major, period, company, role).  This function enforces those findings
+    by clearing the corresponding values from resume_data.
+
+    Does NOT clear date/number/skill fabrications — those are mixed with
+    legitimate values in text fields and need finer handling.
+    """
+    _CLEARABLE_TYPES = frozenset({"school", "degree", "major", "company",
+                                   "role", "work_experience", "education_level"})
+    for detail in fab.details:
+        if detail.type not in _CLEARABLE_TYPES:
+            continue
+        target = detail.content
+
+        # Meta-level fields
+        meta = resume_data.get("meta", {})
+        if isinstance(meta, dict):
+            if detail.type == "work_experience" and meta.get("work_experience") == target:
+                meta["work_experience"] = ""
+                continue
+            if detail.type == "education_level" and meta.get("education_level") == target:
+                meta["education_level"] = ""
+                continue
+
+        # Education fields
+        for edu in resume_data.get("education", []):
+            if not isinstance(edu, dict):
+                continue
+            if detail.type == "school" and edu.get("school") == target:
+                edu["school"] = ""
+            if detail.type == "degree" and edu.get("degree") == target:
+                edu["degree"] = ""
+            if detail.type == "major" and edu.get("major") == target:
+                edu["major"] = ""
+            if detail.type == "date" and edu.get("period") and target in edu.get("period", ""):
+                edu["period"] = ""
+
+        # Experience fields
+        for exp in resume_data.get("experience", []):
+            if not isinstance(exp, dict):
+                continue
+            if detail.type == "company" and exp.get("company") == target:
+                exp["company"] = ""
+            if detail.type == "role" and exp.get("role") == target:
+                exp["role"] = ""
 
 
 def _validate_experience_entities(
@@ -696,11 +747,14 @@ async def stage_ingest(
     ctx = PipelineContext()
     ctx.started = time.perf_counter()
     ctx.query_text = str(query or "").strip()
-    # Init debug output dir if configured
+    # Init debug output dir if configured (with unique request ID per run
+    # to prevent cross-contamination between concurrent requests)
     import os as _os
     _debug_out = _os.environ.get("DEBUG_OUTPUT_DIR", "").strip()
     if _debug_out:
-        ctx._debug_dir = _debug_out
+        _req_id = _os.environ.get("REQUEST_ID", "") or str(int(ctx.started * 1000000))[-10:]
+        ctx._debug_dir = _os.path.join(_debug_out, f"req_{_req_id}")
+        _os.makedirs(ctx._debug_dir, exist_ok=True)
         case_tag = (str(query or "")[:30] if query else "no-query").replace("\n", " ").replace("/", "_")
         ctx._debug_prefix = "00"
         ctx._write_debug("01_query.txt", query or "")
@@ -1006,6 +1060,7 @@ async def rewrite_path(ctx: PipelineContext) -> PipelineContext:
             logger.info("  编造 %s='%s' (原文无此内容)", getattr(_fab_item, 'type', '?'), getattr(_fab_item, 'content', '?')[:60])
     else:
         logger.info("事实核查: 通过")
+
 
     from resume_llm_repair import llm_check_fabrication
     _fab_llm = llm_check_fabrication(ctx.source_truth_text, ctx.resume_data)
