@@ -41,3 +41,9 @@ tmp/
 
 # Symlink
 core/models
+
+# Acceptance testset - big data files
+acceptance_testset/files/
+acceptance_testset/results_*.json
+acceptance_testset/0611case_testset/
+acceptance_testset/run_api_testset.py
