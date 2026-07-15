@@ -13,6 +13,22 @@ from schemas import FieldConflict, FabricationDetail, FabricationReport, Missing
 from server_runtime import logger
 
 
+# ── Shared placeholder detection ──
+
+MISSING_PLACEHOLDER_VALUES: frozenset[str] = frozenset({
+    "", "未提供", "未明确", "未知", "暂无",
+})
+
+def is_missing_placeholder(value: object) -> bool:
+    """Check if a field value is effectively empty (placeholder/non-informative).
+
+    Narrow semantic — only values that explicitly indicate 'no information
+    provided' or 'unknown'.  Does NOT include '无', '不限', '其他' etc.,
+    which may indicate explicit user intent (e.g. '无工作经历')."""
+    normalized = str(value or "").strip()
+    return normalized in MISSING_PLACEHOLDER_VALUES
+
+
 def _parse_mm_yyyy(text: str) -> Optional[tuple[int, int]]:
     """Try to parse mm-yyyy or yyyy-mm format, return (year, month)."""
     text = str(text).strip().lower()
@@ -302,7 +318,7 @@ def check_required_fields(
     # Required meta fields
     for key, label in [("name", "姓名"), ("phone", "联系电话"), ("email", "邮箱")]:
         value = str(meta.get(key, "")).strip()
-        if not value:
+        if is_missing_placeholder(value):
             field_source = "not_provided"
             reason = f"{label}为必填项，请在简历中补充"
             if source_text and _field_exists_in_source(key, source_text):
@@ -341,7 +357,7 @@ def check_required_fields(
                 continue
             for key, label in [("school", "学校名称"), ("degree", "学位"), ("major", "专业名称"), ("period", "时间")]:
                 value = str(edu.get(key, "")).strip()
-                if not value:
+                if is_missing_placeholder(value):
                     missing.append(MissingField(
                         field=f"education[{idx}].{key}",
                         label=label,

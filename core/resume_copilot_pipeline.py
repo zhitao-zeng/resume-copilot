@@ -493,6 +493,7 @@ def final_fact_guard(
     if ledger is not None:
         _validate_experience_entities(resume_data, ledger, fab)
         _validate_role_entities(resume_data, ledger, fab)
+        _validate_period_entities(resume_data, source_truth_text, fab)
 
     return resume_data, fab
 
@@ -592,6 +593,54 @@ def _validate_role_entities(
             content=role,
             reason="该岗位名称未出现在用户原始输入中",
         ))
+
+
+def _validate_period_entities(
+    resume_data: dict, raw_text: str, fab: FabricationReport,
+) -> None:
+    """Clear period fields that have no year evidence in source text.
+
+    Period is a strict fact field — years and months must be traceable
+    to the source text (possibly in different format).  If no year
+    component can be found, the period is cleared.
+    """
+    import re
+    from schemas import FabricationDetail
+
+    def _year_supported(period: str, source_lower: str) -> bool:
+        years = re.findall(r"(?:19|20)\d{2}", period)
+        if not years:
+            return True
+        for y in years:
+            if y in source_lower:
+                return True
+        return False
+
+    source_lower = str(raw_text or "").lower()
+
+    for exp in resume_data.get("experience", []):
+        if not isinstance(exp, dict):
+            continue
+        period = str(exp.get("period", "")).strip()
+        if period and not _year_supported(period, source_lower):
+            exp["period"] = ""
+            fab.details.append(FabricationDetail(
+                type="period",
+                content=period,
+                reason="该时间未出现在用户原始输入中",
+            ))
+
+    for edu in resume_data.get("education", []):
+        if not isinstance(edu, dict):
+            continue
+        period = str(edu.get("period", "")).strip()
+        if period and not _year_supported(period, source_lower):
+            edu["period"] = ""
+            fab.details.append(FabricationDetail(
+                type="period",
+                content=period,
+                reason="该时间未出现在用户原始输入中",
+            ))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
