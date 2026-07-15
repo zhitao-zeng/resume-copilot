@@ -1,0 +1,31 @@
+FROM harbor-contest.4pd.io/lizhuoju/menu-translate:base
+
+ENV LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PYTHONIOENCODING=utf-8
+
+WORKDIR /root/app
+
+COPY *.py ./
+COPY *.sh ./
+COPY eval_cases.jsonl ./
+COPY requirements.txt ./
+COPY models_slim ./models
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    fonts-noto-cjk fonts-wqy-zenhei fonts-wqy-microhei \
+    tesseract-ocr tesseract-ocr-chi-sim tesseract-ocr-eng \
+    curl \
+    && fc-cache -f && rm -rf /var/lib/apt/lists/*
+
+RUN pip install -r requirements.txt \
+    -i https://pypi.tuna.tsinghua.edu.cn/simple/ \
+    && pip install Flask==2.3.0 \
+    -i https://pypi.tuna.tsinghua.edu.cn/simple/ \
+    && pip cache purge \
+    && pip uninstall -y opencv-python-headless opencv-python 2>/dev/null; true
+
+EXPOSE 80 8000
+
+RUN chmod +x /root/app/start.sh
+CMD ["/root/app/start.sh"]

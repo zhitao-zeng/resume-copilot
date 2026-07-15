@@ -1,0 +1,81 @@
+# 本地开发测试: docker compose up -d
+# 平台部署: 只构建 copilot 镜像 (vLLM 由平台单独提供)
+
+version: "3.8"
+
+services:
+  # ═══ vLLM 推理服务 (仅本地测试) ═══
+  vllm:
+    image: vllm/vllm-openai:latest
+    runtime: nvidia
+    environment:
+      - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+    command:
+      - "--model"
+      - "${MODEL_PATH:-/data/Qwen3.5-9B-AWQ-4bit}"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8000"
+      - "--gpu-memory-utilization"
+      - "${GPU_MEM_UTIL:-0.30}"
+      - "--max-model-len"
+      - "${MAX_MODEL_LEN:-32768}"
+      - "--max-num-seqs"
+      - "${MAX_NUM_SEQS:-4}"
+      - "--dtype"
+      - "auto"
+    volumes:
+      - ${MODEL_DIR:-/data}:/models:ro
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    restart: unless-stopped
+    shm_size: 8gb
+    profiles: [local]  # 仅 docker compose --profile local up 时启动
+
+  # ═══ Resume Copilot 业务服务 ═══
+  copilot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${COPILOT_IMAGE:-resume-copilot:latest}
+    environment:
+      # LLM 后端 (本地: vllm 容器, 平台: 由平台注入)
+      - MODELHUB_BASE_URL=${MODELHUB_BASE_URL:-http://vllm:8000/v1}
+      - MODELHUB_API_KEY=not-needed
+      - MODELHUB_MODEL_NAME=${MODEL_PATH:-/data/Qwen3.5-9B-AWQ-4bit}
+      # 运行参数
+      - PORT=80
+      - ENABLE_HEURISTIC_AUDIT_FALLBACK=0
+      - ENABLE_RESUME_SHRINK_GUARD=1
+      - DEFAULT_OUTPUT_FORMAT=docx
+      - OUTPUT_DIR=/root/app/output
+      - REQUEST_TIMEOUT_SECONDS=${COPILOT_TIMEOUT:-480}
+      - LLM_TIMEOUT_SECONDS=${LLM_TIMEOUT:-180}
+    ports:
+      - "${COPILOT_PORT:-80}:80"
+    volumes:
+      - copilot_output:/root/app/output
+      - ./acceptance_testset:/root/app/acceptance_testset
+      # 本地测试: 挂载模型 (平台部署时由 NFS 提供 /mounted_model)
+      - ${MODEL_DIR:-/data}:/mounted_model:ro
+    depends_on:
+      vllm:
+        condition: service_healthy
+        required: false
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  copilot_output:

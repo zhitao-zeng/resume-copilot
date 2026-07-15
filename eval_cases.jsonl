@@ -1,0 +1,40 @@
+{"id":"s1_product_01","scenario":"scenario1","industry":"product_research","query":"请根据JD优化我的产品经理简历","cv_text":"姓名：张小二 电话13800138000 邮箱 zhang@example.com\n复旦大学 本科 计算机 09-2016 - 06-2020\n2020年7月到2024年6月在第四范式工作，担任产品经理，负责AI平台需求分析、版本规划和客户交付。","jd_text":"招聘AI产品经理，要求需求分析、跨部门协作、数据指标复盘。"}
+{"id":"s1_product_02","scenario":"scenario1","industry":"product_research","query":"投算法产品岗位","cv_text":"姓名：李明 电话13900139000 邮箱 liming@example.com\n清华大学 硕士 计算机 09-2018 - 06-2021\n2021年7月到2025年5月在某科技公司担任算法产品经理，负责推荐系统产品规划。","jd_text":"算法产品经理，关注推荐、搜索、AB实验、指标体系。"}
+{"id":"s1_ops_01","scenario":"scenario1","industry":"operations","query":"优化成用户运营方向","cv_text":"姓名：王芳 电话13700137000 邮箱 wf@example.com\n北京大学 本科 市场营销 09-2015 - 06-2019\n2019年7月到2024年6月在互联网公司做用户运营，负责活动策划、社群维护、转化复盘。","jd_text":"用户运营，要求增长活动、社群运营、数据分析。"}
+{"id":"s1_finance_01","scenario":"scenario1","industry":"finance","query":"投金融风控岗位","cv_text":"姓名：赵强 电话13600136000 邮箱 zq@example.com\n上海财经大学 本科 金融 09-2014 - 06-2018\n2018年7月到2024年6月在中国银行工作，负责贷款审核、对公客户资料核验和风险提示。","jd_text":"风控专员，要求信贷审核、风险识别、金融合规。"}
+{"id":"s1_teacher_01","scenario":"scenario1","industry":"teacher","query":"优化教师简历","cv_text":"姓名：陈老师 电话13500135000 邮箱 teacher@example.com\n华东师范大学 本科 教育学 09-2013 - 06-2017\n2017年9月到2024年6月在上海某中学任数学教师，负责初中数学授课、班级管理和教研活动。","jd_text":"数学教师，要求课程设计、课堂管理、教研能力。"}
+{"id":"s1_doctor_01","scenario":"scenario1","industry":"doctor","query":"投内科医生岗位","cv_text":"姓名：刘医生 电话13400134000 邮箱 doctor@example.com\n复旦大学医学院 硕士 临床医学 09-2012 - 06-2019\n2019年7月到2024年6月在某三甲医院内科工作，参与门诊、病区管理和病例讨论。","jd_text":"内科医师，要求临床诊疗、病例管理、患者沟通。"}
+{"id":"s2_ops_student_01","scenario":"scenario2","industry":"operations","query":"我是在校生，姓名小林，电话13300133000，邮箱 lin@example.com，想做内容运营。在学校做过社团公众号运营和活动策划。"}
+{"id":"s2_product_01","scenario":"scenario2","industry":"product_research","query":"我叫周宁，电话13200132000，邮箱 zn@example.com，计算机本科，想做产品经理，做过课程项目和需求文档。"}
+{"id":"s2_teacher_01","scenario":"scenario2","industry":"teacher","query":"姓名何洁，电话13100131000，邮箱 hejie@example.com，师范大学教育学本科，想做小学语文老师，有支教经历。"}
+{"id":"s2_finance_01","scenario":"scenario2","industry":"finance","query":"我从2020年3月到25年6月在中国银行工作，主要负责贷款管理岗位，期间做对公大客户贷款审核。想试试金融风控。"}
+{"id":"s2_doctor_01","scenario":"scenario2","industry":"doctor","query":"姓名王医生，电话13000130000，邮箱 wangdoc@example.com，临床医学硕士，想做住院医师，有实习轮转经历。"}
+{"id":"s2_design_01","scenario":"scenario2","industry":"design","query":"我叫Ada，邮箱 ada@example.com，电话12900129000，做过UI作品集，熟悉Figma，想找交互设计。"}
+{"id":"s3_product_01","scenario":"scenario3","industry":"product_research","query":"我想投产品经理，请把简历表达更贴近需求分析和指标复盘","cv_text":"姓名：钱一 电话12800128000 邮箱 qian@example.com\n浙江大学 本科 信息管理 09-2016 - 06-2020\n2020年7月到2024年5月在SaaS公司做项目经理，负责客户需求沟通和上线协调。"}
+{"id":"s3_ops_01","scenario":"scenario3","industry":"operations","query":"我想转运营方向","cv_text":"姓名：孙二 电话12700127000 邮箱 sun@example.com\n南京大学 本科 新闻 09-2015 - 06-2019\n2019年7月到2024年6月在媒体公司负责内容编辑、选题策划和账号维护。"}
+{"id":"s3_teacher_01","scenario":"scenario3","industry":"teacher","query":"我想投高中英语老师","cv_text":"姓名：吴三 电话12600126000 邮箱 wu@example.com\n北京外国语大学 本科 英语 09-2014 - 06-2018\n2018年9月到2024年6月在培训机构任英语讲师，负责课程讲授和学生辅导。"}
+{"id":"s3_sales_01","scenario":"scenario3","industry":"sales_presale","query":"我想做售前顾问","cv_text":"姓名：郑四 电话12500125000 邮箱 zheng@example.com\n同济大学 本科 自动化 09-2013 - 06-2017\n2017年7月到2024年6月在软件公司负责客户沟通、方案演示和项目交付。"}
+{"id":"s3_finance_01","scenario":"scenario3","industry":"finance","query":"希望优化为银行客户经理方向","cv_text":"姓名：冯五 电话12400124000 邮箱 feng@example.com\n中央财经大学 本科 金融 09-2012 - 06-2016\n2016年7月到2024年6月在证券公司负责客户维护和产品介绍。"}
+{"id":"s3_doctor_01","scenario":"scenario3","industry":"doctor","query":"想投临床医生岗位","cv_text":"姓名：陈六 电话12300123000 邮箱 chen6@example.com\n中山大学 医学硕士 临床医学 09-2014 - 06-2021\n2021年7月到2024年6月在医院参与门诊和住院病例管理。"}
+{"id":"s4_product_01","scenario":"scenario4","industry":"product_research","query":"姓名李七 电话12200122000 邮箱 li7@example.com，做过课程项目，想投下面JD","jd_text":"产品经理岗位，要求需求分析、原型设计、数据指标。"}
+{"id":"s4_ops_01","scenario":"scenario4","industry":"operations","query":"姓名周八 电话12100121000 邮箱 zhou8@example.com，有社团活动和公众号经验","jd_text":"内容运营岗位，负责选题策划、社群增长、数据复盘。"}
+{"id":"s4_teacher_01","scenario":"scenario4","industry":"teacher","query":"姓名林九 电话12000120000 邮箱 lin9@example.com，师范专业，有支教经历","jd_text":"小学数学老师，负责课程设计、课堂教学、家校沟通。"}
+{"id":"s4_doctor_01","scenario":"scenario4","industry":"doctor","query":"姓名赵医生 电话11900119000 邮箱 zdoc@example.com，临床医学硕士，有内科轮转经历","jd_text":"住院医师岗位，要求病历书写、临床诊疗、患者沟通。"}
+{"id":"s4_finance_01","scenario":"scenario4","industry":"finance","query":"姓名王十 电话11800118000 邮箱 wang10@example.com，银行实习做过贷款材料审核","jd_text":"金融风控岗位，负责授信资料审核、风险提示、合规跟进。"}
+{"id":"s4_design_01","scenario":"scenario4","industry":"design","query":"姓名许一 电话11700117000 邮箱 xu@example.com，做过App界面设计，熟悉Figma","jd_text":"交互设计师，负责用户流程、原型设计、设计规范。"}
+{"id":"s1_sales_02","scenario":"scenario1","industry":"sales_presale","query":"优化成售前简历","cv_text":"姓名：马一 电话11600116000 邮箱 ma@example.com\n武汉大学 本科 计算机 09-2014 - 06-2018\n2018年7月到2024年6月在企业软件公司做客户方案经理，负责方案演示和招投标支持。","jd_text":"售前顾问，负责客户需求澄清、方案讲解、标书支持。"}
+{"id":"s1_design_02","scenario":"scenario1","industry":"design","query":"投UI设计师","cv_text":"姓名：罗二 电话11500115000 邮箱 luo@example.com\n广州美术学院 本科 视觉传达 09-2015 - 06-2019\n2019年7月到2024年6月在互联网公司做UI设计，负责App界面和设计规范。","jd_text":"UI设计师，要求视觉设计、组件规范、跨团队协作。"}
+{"id":"s2_sales_02","scenario":"scenario2","industry":"sales_presale","query":"姓名唐三 电话11400114000 邮箱 tang@example.com，做过客户沟通和方案讲解，想做售前。"}
+{"id":"s2_education_02","scenario":"scenario2","industry":"education","query":"姓名宋四 电话11300113000 邮箱 song@example.com，教育学本科，做过课程运营，想去教育行业。"}
+{"id":"s3_education_02","scenario":"scenario3","industry":"education","query":"想投教育运营","cv_text":"姓名：许五 电话11200112000 邮箱 xu5@example.com\n华南师范大学 本科 教育技术 09-2016 - 06-2020\n2020年7月到2024年6月在教培机构做课程助教和班级运营。"}
+{"id":"s4_sales_02","scenario":"scenario4","industry":"sales_presale","query":"姓名沈六 电话11100111000 邮箱 shen@example.com，做过客户拜访和产品介绍","jd_text":"销售经理，负责客户开发、商机推进、合同跟进。"}
+{"id":"s4_product_student_02","scenario":"scenario4","industry":"product_research","query":"姓名韩七 电话11000110000 邮箱 han@example.com，在校生，做过小程序课程项目","jd_text":"产品实习生，要求需求调研、竞品分析、原型设计。"}
+{"id":"s1_teacher_03","scenario":"scenario1","industry":"teacher","query":"优化成班主任岗位","cv_text":"姓名：梁八 电话10900109000 邮箱 liang@example.com\n东北师范大学 本科 教育学 09-2013 - 06-2017\n2017年9月到2024年6月在初中担任班主任和语文教师。","jd_text":"班主任教师，要求班级管理、家校沟通、教学设计。"}
+{"id":"s1_doctor_03","scenario":"scenario1","industry":"doctor","query":"优化成儿科医生","cv_text":"姓名：高九 电话10800108000 邮箱 gao@example.com\n首都医科大学 硕士 儿科学 09-2013 - 06-2020\n2020年7月到2024年6月在儿童医院参与儿科门诊和病区工作。","jd_text":"儿科医生，要求儿童常见病诊疗、病历管理、沟通能力。"}
+{"id":"s2_finance_student_03","scenario":"scenario2","industry":"finance","query":"姓名姜一 电话10700107000 邮箱 jiang@example.com，在校生，金融本科，做过银行暑期实习，想投风控。"}
+{"id":"s2_teacher_student_03","scenario":"scenario2","industry":"teacher","query":"姓名潘二 电话10600106000 邮箱 pan@example.com，在校师范生，有支教和课程设计经历，想做老师。"}
+{"id":"s3_design_03","scenario":"scenario3","industry":"design","query":"希望转交互设计","cv_text":"姓名：邓三 电话10500105000 邮箱 deng@example.com\n四川大学 本科 工业设计 09-2015 - 06-2019\n2019年7月到2024年6月在硬件公司负责产品外观和用户调研。"}
+{"id":"s3_finance_03","scenario":"scenario3","industry":"finance","query":"想投信贷审核","cv_text":"姓名：雷四 电话10400104000 邮箱 lei@example.com\n西南财经大学 本科 金融 09-2014 - 06-2018\n2018年7月到2024年6月在小贷公司负责客户材料审核。"}
+{"id":"s4_ops_student_03","scenario":"scenario4","industry":"operations","query":"姓名胡五 电话10300103000 邮箱 hu@example.com，在校生，做过社团活动和公众号","jd_text":"新媒体运营实习生，负责内容发布、活动执行、数据复盘。"}
+{"id":"s4_finance_experienced_03","scenario":"scenario4","industry":"finance","query":"姓名魏六 电话10200102000 邮箱 wei@example.com，2020年到2024年在银行做柜面和客户资料审核","jd_text":"银行客户经理，要求客户维护、资料审核、合规意识。"}
+{"id":"s1_other_04","scenario":"scenario1","industry":"other","query":"优化我的综合管理简历","cv_text":"姓名：程七 电话10100101000 邮箱 cheng@example.com\n厦门大学 本科 管理学 09-2012 - 06-2016\n2016年7月到2024年6月在制造企业负责流程协调和项目推进。","jd_text":"综合管理岗位，负责流程优化、跨部门沟通、项目推进。"}

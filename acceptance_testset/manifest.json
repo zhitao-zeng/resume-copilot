@@ -1,0 +1,29 @@
+{
+  "total": 48,
+  "by_scenario": {
+    "scenario1": 12,
+    "scenario2": 12,
+    "scenario3": 12,
+    "scenario4": 12
+  },
+  "by_industry": {
+    "product_research": 8,
+    "finance": 8,
+    "teacher": 6,
+    "doctor": 5,
+    "operations": 5,
+    "sales_presale": 4,
+    "design": 4,
+    "education": 4,
+    "other": 4
+  },
+  "by_stage": {
+    "experienced": 38,
+    "student": 10
+  },
+  "file_coverage": {
+    "docx": 20,
+    "pdf": 9,
+    "png": 12
+  }
+}

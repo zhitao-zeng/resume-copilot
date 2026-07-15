@@ -1,0 +1,17 @@
+FROM harbor-contest.4pd.io/lizhuoju/menu-translate:base
+
+ENV LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PYTHONIOENCODING=utf-8 \
+    PORT=8001
+
+WORKDIR /opt
+
+# Build a simple OpenAI-compatible wrapper
+COPY vllm_openai_proxy.py /opt/vllm_openai_proxy.py
+COPY entrypoint.sh /opt/entrypoint.sh
+RUN chmod +x /opt/entrypoint.sh
+
+EXPOSE 8000 8001
+
+CMD ["/opt/entrypoint.sh"]

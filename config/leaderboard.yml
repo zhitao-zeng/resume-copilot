@@ -1,0 +1,38 @@
+inferenceVolumeMounts:
+  - name: model
+    mountPoint: /model
+    source: ceph_customer
+    srcRelativePath: zengzhitao/resume-copilot/models/Qwen3-14B-GPTQ-Int4
+
+inferenceImage:
+  repository: "harbor-contest.4pd.io/zengzhitao/resume-copilot"
+  tag: "latest"
+
+values:
+  command:
+  - ./start.sh
+  volumeMounts:
+  - mountPath: /model
+    name: ceph-customer
+    readOnly: true
+    subPath: zengzhitao/resume-copilot/models/Qwen3-14B-GPTQ-Int4
+  resources:
+    limits:
+      cpu: '4'
+      memory: 16Gi
+      nvidia.com/gpu: '1'
+      nvidia.com/gpucores: '25'
+      nvidia.com/gpumem: '30720'
+    requests:
+      cpu: '4'
+      memory: 16Gi
+      nvidia.com/gpu: '1'
+      nvidia.com/gpucores: '25'
+      nvidia.com/gpumem: '30720'
+  readinessProbe:
+    httpGet:
+      path: /ready
+      port: 80
+    initialDelaySeconds: 300
+    periodSeconds: 10
+    timeoutSeconds: 5

@@ -1,0 +1,24 @@
+{
+  "case_count": 48,
+  "fixture_file_count": 57,
+  "fixture_format_counts": {
+    "docx": 17,
+    "pdf": 16,
+    "png": 16,
+    "txt": 8
+  },
+  "path_validation": {
+    "missing_paths": 0
+  },
+  "structural_validation": {
+    "docx_opened_with_python_docx": true,
+    "pdf_opened_with_pymupdf": true,
+    "png_opened_with_pillow": true,
+    "failures": []
+  },
+  "docx_visual_render_validation": {
+    "status": "skipped",
+    "reason": "The local LibreOffice renderer failed because liblcms2.2.dylib was unavailable in this environment.",
+    "impact": "Fixture files are structurally valid, but DOCX visual QA was not completed locally."
+  }
+}

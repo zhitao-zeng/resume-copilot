@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+*.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data / generated output
+output/
+*.docx
+*.pdf
+*.zip
+
+# Models (large binaries)
+models_slim/
+models/
+core/models/
+
+# Archive
+archive/
+
+# Acceptance testset - big data files
+acceptance_testset/files/
+acceptance_testset/results_*.json
+
+# Temp
+tmp/
+/tmp/
+
+# Claude
+.claude/
+
+# Symlink
+core/models
