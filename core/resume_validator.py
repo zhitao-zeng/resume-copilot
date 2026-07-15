@@ -99,8 +99,8 @@ def _extract_named_entities(text: str) -> dict[str, set[str]]:
 
     # Heuristic: common patterns for companies/schools
     name_patterns = [
-        r"[A-Za-z\u4e00-\u9fff]{2,40}(?:有限公司|集团|公司|大学|学院|研究所|医院|中心|学校|教育|科技)",
-        r"[\u4e00-\u9fff]{3,30}(?:大学|学院|医院|学校|集团|公司|研究院|实验室)",
+        r"[A-Za-z\u4e00-\u9fff]{2,40}(?:有限公司|集团|公司|大学|学院|研究所|医院|中心|学校|教育|科技)(?![\u4e00-\u9fff])",
+        r"[\u4e00-\u9fff]{3,30}(?:大学|学院|医院|学校|集团|公司|研究院|实验室)(?![\u4e00-\u9fff])",
     ]
 
     # Verbs/phrases that should not prefix a valid entity name
@@ -817,15 +817,19 @@ def check_fabrication_heuristic(original_text: str, resume_data: dict[str, Any])
                 continue
 
             school_lower = school.lower()
-            if school_lower not in original_lower:
-                found_partial = False
-                for orig_school in orig_schools:
-                    if orig_school in school_lower or school_lower in orig_school:
-                        found_partial = True
-                        break
-
-                if not found_partial:
-                    _add_detail("school", school, "该校名称未出现在用户原始输入中")
+            # Check against entity-extracted schools (authoritative).
+            # A raw substring match (e.g. "全国大学" in "全国大学生创新创业大赛三等奖")
+            # does NOT count as entity support — the entity extractor knows
+            # which spans represent real institutions.
+            _entity_match = any(
+                orig_school == school_lower
+                for orig_school in orig_schools
+            ) or any(
+                school_lower in orig_school
+                for orig_school in orig_schools
+            )
+            if not _entity_match:
+                _add_detail("school", school, "该校名称未出现在用户原始输入中")
 
             for key, label in (("degree", "学位/学历"), ("major", "专业")):
                 value = str(edu.get(key, "")).strip()
