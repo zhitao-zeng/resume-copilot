@@ -154,15 +154,178 @@ def _ocr_image_with_rapid(content: bytes) -> str:
         return ""
 
     texts = []
-    for i in range(len(boxes)):
-        if txts and i < len(txts) and txts[i]:
-            txt = str(txts[i][0]) if isinstance(txts[i], (tuple, list)) else str(txts[i])
-        else:
-            txt = str(txts[i]) if txts and i < len(txts) and txts[i] is not None else ""
-        if txt.strip():
-            texts.append(txt.strip())
+    # Reconstruct reading order using layout information
+    ordered_texts = _reconstruct_ocr_reading_order(
+        boxes, txts, img_width=np_img.shape[1], img_height=np_img.shape[0],
+    )
+    return "\n".join(ordered_texts) if ordered_texts else ""
 
-    return "\n".join(texts)
+
+
+# ── OCR Layout Reconstruction ─────────────────────────────────────────────────
+
+
+def _reconstruct_ocr_reading_order(
+    boxes,
+    texts,
+    *,
+    img_width: int,
+    img_height: int,
+) -> list[str]:
+    """Reconstruct reading order from OCR blocks using layout analysis.
+
+    The raw OCR output orders blocks by detector confidence, not by reading
+    order.  This function:
+    1.  Extracts each block's bbox into structured fields
+    2.  Detects narrow side-column blocks (e.g. red banner with contact info)
+    3.  Identifies full-width blocks (e.g. paragraph text spanning the page)
+    4.  Clusters blocks into visual rows by y-overlap
+    5.  Orders: side column → full-width → main column, each sorted by y
+    """
+    import numpy as np  # noqa: F811
+
+    if boxes is None or len(boxes) == 0:
+        return []
+
+    # ── 1. Build block list with structured bbox fields ──
+    raw_blocks: list[dict] = []
+    for i in range(len(boxes)):
+        box = boxes[i]
+        if texts and i < len(texts) and texts[i]:
+            raw_val = str(texts[i][0]) if isinstance(texts[i], (tuple, list)) else str(texts[i])
+        else:
+            raw_val = str(texts[i]) if texts and i < len(texts) and texts[i] is not None else ""
+        text = raw_val.strip()
+        if not text:
+            continue
+
+        pts = np.array(box)
+        x_min, x_max = float(pts[:, 0].min()), float(pts[:, 0].max())
+        y_min, y_max = float(pts[:, 1].min()), float(pts[:, 1].max())
+
+        raw_blocks.append({
+            "text": text,
+            "x_min": x_min,
+            "x_max": x_max,
+            "y_min": y_min,
+            "y_max": y_max,
+            "x_center": (x_min + x_max) / 2.0,
+            "y_center": (y_min + y_max) / 2.0,
+            "width": x_max - x_min,
+            "height": y_max - y_min,
+        })
+
+    if not raw_blocks:
+        return []
+
+    # ── 2. Detect side column (banner) blocks ──
+    # Chinese resume templates often have a narrow colored banner on the left
+    # with contact info (name, phone, email, job target).  These blocks have
+    # small x_max values compared to the main content blocks.
+    #
+    # Approach: cluster all blocks by x_max.  If there's a distinct cluster
+    # with small x_max and the gap to the next cluster is large enough,
+    # treat that cluster as a side column.
+    sorted_by_xmax = sorted(raw_blocks, key=lambda b: b["x_max"])
+    n = len(sorted_by_xmax)
+
+    # Find the first large gap in x_max values
+    gap_idx = -1
+    for i in range(n - 1):
+        gap = sorted_by_xmax[i + 1]["x_max"] - sorted_by_xmax[i]["x_max"]
+        if gap >= img_width * 0.08 and i >= 1:  # 10% page width gap, at least 2 blocks before
+            gap_idx = i
+            break
+
+    side_col_x_max = 0
+    if gap_idx >= 0:
+        side_col_x_max = sorted_by_xmax[gap_idx]["x_max"]
+
+    # ── 3. Classify blocks into regions ──
+    SIDE = "side"
+    FULL = "full"
+    MAIN = "main"
+
+    def _classify(b: dict) -> str:
+        if side_col_x_max > 0 and b["x_max"] <= side_col_x_max and b["width"] < img_width * 0.4:
+            return SIDE
+        if b["width"] >= img_width * 0.6:
+            return FULL
+        return MAIN
+
+    # ── 4. Row clustering within each region ──
+    def _cluster_rows(region_blocks: list[dict]) -> list[list[dict]]:
+        if not region_blocks:
+            return []
+        region_blocks.sort(key=lambda b: b["y_center"])
+        rows: list[list[dict]] = []
+        current = [region_blocks[0]]
+        cur_y_min = region_blocks[0]["y_min"]
+        cur_y_max = region_blocks[0]["y_max"]
+
+        for b in region_blocks[1:]:
+            overlap = min(b["y_max"], cur_y_max) - max(b["y_min"], cur_y_min)
+            if overlap >= 0 or (b["y_min"] - cur_y_max) < 3:
+                current.append(b)
+                cur_y_min = min(cur_y_min, b["y_min"])
+                cur_y_max = max(cur_y_max, b["y_max"])
+            else:
+                rows.append(current)
+                current = [b]
+                cur_y_min = b["y_min"]
+                cur_y_max = b["y_max"]
+        if current:
+            rows.append(current)
+        return rows
+
+    # ── 5. Sort and flatten ──
+    side_blocks = [b for b in raw_blocks if _classify(b) == SIDE]
+    full_blocks = [b for b in raw_blocks if _classify(b) == FULL]
+    main_blocks = [b for b in raw_blocks if _classify(b) == MAIN]
+
+    # Within each row, sort blocks left-to-right
+    def _flatten_rows(rows: list[list[dict]]) -> list[str]:
+        result: list[str] = []
+        for row in rows:
+            row.sort(key=lambda b: b["x_center"])
+            for b in row:
+                result.append(b["text"])
+        return result
+
+    side_lines = _flatten_rows(_cluster_rows(side_blocks)) if side_blocks else []
+    main_lines = _flatten_rows(_cluster_rows(main_blocks)) if main_blocks else []
+    full_lines = _flatten_rows(_cluster_rows(full_blocks)) if full_blocks else []
+
+    # Order: region groups, sorted internally by y.
+    #
+    # Full-width blocks (summary text) emit first — they are at the top
+    # of the page and span both columns.
+    #
+    # Side-column blocks (name/contact/target in the left colored banner)
+    # emit second — they form a visually distinct region that should be
+    # read before entering the main content area.
+    #
+    # Main-content blocks (work/skills/projects) emit last.
+    #
+    # Within each region, blocks are clustered into rows and sorted by y.
+    # Order: assign each block a sort key based on its region and position.
+    # Only rank blocks within the same region by y to avoid merging
+    # unrelated blocks from side column and main content.
+    SIDE_PRIORITY = 0
+    FULL_PRIORITY = 1
+    MAIN_PRIORITY = 2
+
+    # Group blocks by region, sort each region by y, then concatenate.
+    # Side column (name/contact in banner) is emitted before main content
+    # even if individual side blocks have y_centers within the main content
+    # range — the banner is logically read as a whole before entering the
+    # main content area.
+    side_ordered = sorted([b for b in raw_blocks if _classify(b) == SIDE], key=lambda b: b["y_center"])
+    full_ordered = sorted([b for b in raw_blocks if _classify(b) == FULL], key=lambda b: b["y_center"])
+    main_ordered = sorted([b for b in raw_blocks if _classify(b) == MAIN], key=lambda b: b["y_center"])
+
+    result = [b["text"] for b in side_ordered] + [b["text"] for b in full_ordered] + [b["text"] for b in main_ordered]
+    return result
 
 
 def _ocr_image_multicandidate(content: bytes) -> str:
@@ -210,7 +373,7 @@ def _ocr_image_multicandidate(content: bytes) -> str:
                 return ""
             texts = []
             for i in range(len(boxes)):
-                if txts and i < len(txts) and txts[i]:
+                if texts and i < len(texts) and texts[i]:
                     txt = str(txts[i][0]) if isinstance(txts[i], (tuple, list)) else str(txts[i])
                 else:
                     txt = ""
@@ -292,7 +455,9 @@ def _normalize_extracted_resume_text(text: str) -> str:
     normalized = raw.replace("\r\n", "\n").replace("\r", "\n")
     normalized = normalized.replace("\u3000", " ").replace("\xa0", " ")
     normalized = normalized.replace("\ufeff", "").replace("\u200b", "")
-    normalized = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", "", normalized)
+    # Remove spaces/tabs between Chinese chars (NOT newlines \u2014 those separate
+    # OCR blocks and must be preserved for correct reading order).
+    normalized = re.sub(r"(?<=[\u4e00-\u9fff])[ \t]+(?=[\u4e00-\u9fff])", "", normalized)
 
     heading_alt = "|".join(re.escape(item) for item in sorted(SECTION_HEADING_KEYWORDS, key=len, reverse=True))
     if heading_alt:
