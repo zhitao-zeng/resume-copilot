@@ -229,13 +229,18 @@ def _reconstruct_ocr_reading_order(
     sorted_by_xmax = sorted(raw_blocks, key=lambda b: b["x_max"])
     n = len(sorted_by_xmax)
 
-    # Find the first large gap in x_max values
+    # Find the first large gap in x_max values that splits blocks into
+    # two meaningful groups (both sides must have >= 2 blocks).
     gap_idx = -1
+    gap_threshold = img_width * 0.08  # 8% page width
     for i in range(n - 1):
         gap = sorted_by_xmax[i + 1]["x_max"] - sorted_by_xmax[i]["x_max"]
-        if gap >= img_width * 0.08 and i >= 1:  # 10% page width gap, at least 2 blocks before
-            gap_idx = i
-            break
+        if gap >= gap_threshold:
+            left_count = i + 1
+            right_count = n - left_count
+            if left_count >= 2 and right_count >= 2:
+                gap_idx = i
+                break
 
     side_col_x_max = 0
     if gap_idx >= 0:
@@ -315,16 +320,31 @@ def _reconstruct_ocr_reading_order(
     FULL_PRIORITY = 1
     MAIN_PRIORITY = 2
 
-    # Group blocks by region, sort each region by y, then concatenate.
-    # Side column (name/contact in banner) is emitted before main content
-    # even if individual side blocks have y_centers within the main content
-    # range — the banner is logically read as a whole before entering the
-    # main content area.
+    # Sort each region's blocks by y, then interleave by vertical position.
+    #
+    # For side-column vs main content: side column blocks are emitted first
+    # at each y-band, since the banner is logically read before the main
+    # content area at the same vertical level.
+    #
+    # For full-width blocks: they are placed before side column content if
+    # they sit above the side column (page header), or after main content
+    # if they sit below it (page footer).
     side_ordered = sorted([b for b in raw_blocks if _classify(b) == SIDE], key=lambda b: b["y_center"])
     full_ordered = sorted([b for b in raw_blocks if _classify(b) == FULL], key=lambda b: b["y_center"])
     main_ordered = sorted([b for b in raw_blocks if _classify(b) == MAIN], key=lambda b: b["y_center"])
 
-    result = [b["text"] for b in side_ordered] + [b["text"] for b in full_ordered] + [b["text"] for b in main_ordered]
+    # Find the y range of side column content to position full-width blocks
+    if side_ordered:
+        side_min_y = min(b["y_min"] for b in side_ordered)
+        side_max_y = max(b["y_max"] for b in side_ordered)
+    else:
+        side_min_y, side_max_y = 0, 0
+
+    full_headers = [b for b in full_ordered if b["y_max"] < side_min_y or not side_ordered]
+    full_footers = [b for b in full_ordered if b["y_min"] >= side_max_y]
+    full_mid = [b for b in full_ordered if b not in full_headers and b not in full_footers]
+
+    result = [b["text"] for b in full_headers] + [b["text"] for b in side_ordered] + [b["text"] for b in full_mid] + [b["text"] for b in main_ordered] + [b["text"] for b in full_footers]
     return result
 
 

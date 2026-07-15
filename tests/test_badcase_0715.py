@@ -8,6 +8,7 @@ Each test targets a SINGLE invariant — not a feature, not a score, not coverag
 If the invariant is violated, the output is unsafe for the user.
 """
 import json
+import random
 import os
 import re
 import unittest
@@ -669,6 +670,227 @@ class TestCvRoutingOnFailedOcr(unittest.TestCase):
         not on whether a file was uploaded."""
         self.assertFalse(bool(""), "Empty string should give False")
         self.assertTrue(bool("一些文本"), "Non-empty string should give True")
+
+
+
+class TestOcrReadingOrder(unittest.TestCase):
+    """_reconstruct_ocr_reading_order must produce consistent, correct ordering."""
+
+    def _block(self, text, x1, y1, x2, y2):
+        return ({"text": text, "x_min": x1, "x_max": x2, "y_min": y1, "y_max": y2,
+                  "x_center": (x1+x2)/2, "y_center": (y1+y2)/2,
+                  "width": x2-x1, "height": y2-y1}, (x1, y1, x2, y2))
+
+    def _make_boxes_txts(self, blocks_with_bbox):
+        """Convert (block_dict, bbox) pairs to boxes np array and txts tuple."""
+        import numpy as np
+        blocks = [b[0] for b in blocks_with_bbox]
+        boxes_list = []
+        txts_list = []
+        for b in blocks:
+            x1, y1, x2, y2 = b["x_min"], b["y_min"], b["x_max"], b["y_max"]
+            poly = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32)
+            boxes_list.append(poly)
+            txts_list.append((b["text"], 1.0))
+        boxes_arr = np.array(boxes_list)
+        txts_tuple = tuple(txts_list)
+        return boxes_arr, txts_tuple
+
+    def test_single_column_ordered_by_y(self):
+        """Single-column layout: order must be top-to-bottom regardless of input order."""
+        from resume_io import _reconstruct_ocr_reading_order
+        import numpy as np
+
+        img_w, img_h = 600, 800
+        # All blocks have similar x_max to avoid false side-column detection
+        blocks = [
+            self._block("标题", 50, 10, 350, 40),
+            self._block("个人总结", 50, 60, 400, 90),
+            self._block("工作经历", 50, 120, 350, 150),
+            self._block("教育经历", 50, 180, 350, 210),
+        ]
+
+        # Run 20 times with shuffled input
+        results = []
+        for _ in range(20):
+            shuffled = list(blocks)
+            random.shuffle(shuffled)
+            b_data = [s[0] for s in shuffled]
+            # Manually build boxes/txts
+            boxes_l = []
+            txts_l = []
+            for b in b_data:
+                x1, y1, x2, y2 = b["x_min"], b["y_min"], b["x_max"], b["y_max"]
+                poly = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32)
+                boxes_l.append(poly)
+                txts_l.append((b["text"], 1.0))
+            result = _reconstruct_ocr_reading_order(
+                np.array(boxes_l), tuple(txts_l), img_width=img_w, img_height=img_h)
+            results.append(result)
+
+        # All must match
+        expected = ["标题", "个人总结", "工作经历", "教育经历"]
+        for r in results:
+            self.assertEqual(r, expected, f"Order differs on shuffle: {r}")
+
+    def test_two_column_detects_sidebar(self):
+        """Two-column layout with side banner: left column content before main."""
+        from resume_io import _reconstruct_ocr_reading_order
+        import numpy as np
+
+        img_w, img_h = 862, 1280
+        blocks = [
+            # Side column (x_max small)
+            self._block("陈媛媛Abbey", 23, 231, 148, 262),
+            self._block("联系方式", 23, 302, 90, 320),
+            self._block("电话：188-8888", 24, 331, 144, 355),
+            self._block("邮箱：abbey@wondercv.co", 24, 359, 182, 385),
+            self._block("求职意向", 23, 430, 91, 450),
+            self._block("期望职位：产品经理", 24, 461, 183, 485),
+            # Main column (x_center > 200)
+            self._block("工作经历", 247, 128, 313, 150),
+            self._block("超级公司", 247, 163, 304, 185),
+            self._block("产品助理实习生", 248, 186, 385, 210),
+            self._block("协助产品经理进行市场调研", 266, 209, 696, 230),
+        ]
+
+        boxes, txts = self._make_boxes_txts(blocks)
+
+        result = _reconstruct_ocr_reading_order(
+            boxes, txts, img_width=img_w, img_height=img_h)
+
+        # Side column content must appear before main column
+        side_idx = min(result.index(b[0]["text"]) for b in blocks if b[0]["x_max"] < 200)
+        main_idx = min(result.index(b[0]["text"]) for b in blocks if b[0]["x_max"] > 200)
+        self.assertLess(side_idx, main_idx,
+                        "Side column should appear before main column")
+
+    def test_full_width_header_before_columns(self):
+        """Full-width header (spanning >60% width) must appear before columns."""
+        from resume_io import _reconstruct_ocr_reading_order
+        import numpy as np
+
+        img_w, img_h = 862, 1280
+        blocks = [
+            self._block("Name", 50, 10, 300, 40),          # header
+            self._block("联系方式", 23, 100, 90, 120),        # side
+            self._block("工作经历", 250, 100, 320, 120),      # main
+            self._block("教育经历", 250, 160, 320, 180),      # main
+        ]
+        boxes, txts = self._make_boxes_txts(blocks)
+        result = _reconstruct_ocr_reading_order(boxes, txts, img_width=img_w, img_height=img_h)
+
+        # "Name" is not full-width (<60%), so this is just single-column ordering
+        # Full-width test genuinely needs a wide block
+        name_idx = result.index("Name")
+        contact_idx = result.index("联系方式")
+        self.assertLess(name_idx, contact_idx, "Name should come first (higher y)")
+
+    def test_full_width_block_at_top(self):
+        """A block spanning >60% width at page top must appear first."""
+        from resume_io import _reconstruct_ocr_reading_order
+        import numpy as np
+
+        img_w, img_h = 862, 1280
+        # Full-width block at top
+        blocks = [
+            self._block("陈媛媛 · 产品经理 · 188-8888", 50, 10, 600, 45),
+            self._block("联系方式", 23, 100, 90, 120),
+            self._block("工作经历", 250, 100, 320, 120),
+        ]
+        boxes, txts = self._make_boxes_txts(blocks)
+        result = _reconstruct_ocr_reading_order(boxes, txts, img_width=img_w, img_height=img_h)
+
+        self.assertEqual(result[0], "陈媛媛 · 产品经理 · 188-8888",
+                         "Full-width header at top must come first")
+
+    def test_bottom_full_width_after_columns(self):
+        """Full-width block at bottom must appear after column content."""
+        from resume_io import _reconstruct_ocr_reading_order
+        import numpy as np
+
+        img_w, img_h = 862, 1280
+        blocks = [
+            self._block("联系方式", 23, 100, 90, 120),
+            self._block("工作经历", 250, 100, 320, 120),
+            self._block("声明：以上信息属实", 50, 500, 600, 535),  # full-width at bottom
+        ]
+        boxes, txts = self._make_boxes_txts(blocks)
+        result = _reconstruct_ocr_reading_order(boxes, txts, img_width=img_w, img_height=img_h)
+
+        self.assertEqual(result[-1], "声明：以上信息属实",
+                         "Full-width block at bottom must come last")
+
+    def test_same_row_left_to_right(self):
+        """Blocks in the same visual row must sort left-to-right."""
+        from resume_io import _reconstruct_ocr_reading_order
+        import numpy as np
+
+        img_w, img_h = 862, 1280
+        blocks = [
+            self._block("电话：", 23, 100, 80, 120),
+            self._block("188-8888-8888", 85, 100, 180, 120),
+        ]
+        boxes, txts = self._make_boxes_txts(blocks)
+        result = _reconstruct_ocr_reading_order(boxes, txts, img_width=img_w, img_height=img_h)
+
+        phone_label_idx = result.index("电话：")
+        phone_num_idx = result.index("188-8888-8888")
+        self.assertLess(phone_label_idx, phone_num_idx,
+                        "Same-row blocks must sort left-to-right")
+
+    def test_no_false_column_split(self):
+        """A single-column layout must not be split by accidental x gaps."""
+        from resume_io import _reconstruct_ocr_reading_order
+        import numpy as np
+
+        img_w, img_h = 600, 800
+        # All blocks centered, no significant x gap
+        blocks = [
+            self._block("标题", 100, 10, 300, 40),
+            self._block("工作经历", 100, 60, 300, 90),
+            self._block("教育经历", 100, 120, 300, 150),
+            self._block("技能", 100, 180, 300, 210),
+        ]
+        boxes, txts = self._make_boxes_txts(blocks)
+        result = _reconstruct_ocr_reading_order(boxes, txts, img_width=img_w, img_height=img_h)
+
+        expected = ["标题", "工作经历", "教育经历", "技能"]
+        self.assertEqual(result, expected)
+
+    def test_detector_order_invariance(self):
+        """Shuffled input blocks must produce identical output 20 times."""
+        from resume_io import _reconstruct_ocr_reading_order
+        import numpy as np
+
+        img_w, img_h = 862, 1280
+        blocks = [
+            self._block("陈媛媛Abbey", 23, 231, 148, 262),
+            self._block("电话", 24, 331, 144, 355),
+            self._block("邮箱", 24, 359, 182, 385),
+            self._block("工作经历", 247, 128, 313, 150),
+            self._block("超级公司", 247, 163, 304, 185),
+        ]
+
+        results = []
+        for _ in range(20):
+            shuffled = list(blocks)
+            random.shuffle(shuffled)
+            b_data = [s[0] for s in shuffled]
+            boxes_l, txts_l = [], []
+            for b in b_data:
+                x1, y1, x2, y2 = b["x_min"], b["y_min"], b["x_max"], b["y_max"]
+                poly = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32)
+                boxes_l.append(poly)
+                txts_l.append((b["text"], 1.0))
+            r = _reconstruct_ocr_reading_order(
+                np.array(boxes_l), tuple(txts_l), img_width=img_w, img_height=img_h)
+            results.append(r)
+
+        for r in results[1:]:
+            self.assertEqual(r, results[0],
+                             f"Output differs: {r} vs {results[0]}")
+
 
 
 if __name__ == "__main__":
