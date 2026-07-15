@@ -1112,6 +1112,108 @@ class TestMissingPlaceholder(unittest.TestCase):
                          "Education period 01-2019: year evidence exists in source")
 
 
+
+class TestPeriodGuardBoundaries(unittest.TestCase):
+    """_validate_period_entities — negative guard only, known limitations."""
+
+    def test_year_from_different_section_matches(self):
+        """Period year from education section should NOT be accepted
+        as evidence for experience period. This is a KNOWN LIMITATION
+        of current year-level global check (no section provenance)."""
+        from resume_copilot_pipeline import final_fact_guard
+        from fact_ledger import build_ledger
+
+        source_text = "教育：2021-2024，工作经历：2023年7月至10月"
+        resume_data = {
+            "meta": {"name": ""},
+            "education": [{"school": "X大学", "degree": "本科", "period": "09-2021 - 06-2024"}],
+            "experience": [{"company": "Y公司", "role": "", "period": "09-2021 - 06-2024",
+                           "bullets": ["test"]}],
+            "projects": [],
+            "skills": {"languages": [], "frameworks": [], "tools": [], "domains": []},
+        }
+        ledger = build_ledger(resume_data, source_text, run_repair=False)
+        cleaned, _ = final_fact_guard(source_text, resume_data, ledger=ledger)
+
+        # Year 2021 and 2024 exist in source (from education), so year-level
+        # check passes — but the period is WRONG for experience.
+        self.assertEqual(
+            cleaned["experience"][0].get("period", ""), "09-2021 - 06-2024",
+            "KNOWN LIMITATION: year-level check cannot detect section-provenance error"
+        )
+
+    def test_month_wrong_but_year_passes(self):
+        """Correct year but wrong month should NOT be detected.
+        KNOWN LIMITATION — no month alignment."""
+        from resume_copilot_pipeline import final_fact_guard
+        from fact_ledger import build_ledger
+
+        source_text = "2023年9月至2024年6月在实验室工作"
+        resume_data = {
+            "meta": {"name": ""},
+            "education": [],
+            "experience": [{"company": "实验室", "role": "", "period": "01-2023 - 12-2024",
+                           "bullets": ["test"]}],
+            "projects": [],
+            "skills": {"languages": [], "frameworks": [], "tools": [], "domains": []},
+        }
+        ledger = build_ledger(resume_data, source_text, run_repair=False)
+        cleaned, _ = final_fact_guard(source_text, resume_data, ledger=ledger)
+
+        self.assertEqual(
+            cleaned["experience"][0].get("period", ""), "01-2023 - 12-2024",
+            "KNOWN LIMITATION: year-level check passes even with wrong months"
+        )
+
+    def test_no_year_evidence_cleared(self):
+        """Period with no year evidence in source must be cleared."""
+        from resume_copilot_pipeline import final_fact_guard
+        from fact_ledger import build_ledger
+
+        source_text = "目前负责模型训练和参数调优。"
+        resume_data = {
+            "meta": {"name": ""},
+            "education": [],
+            "experience": [{"company": "实验室", "role": "", "period": "01-2021 - 12-2023",
+                           "bullets": ["负责模型训练"]}],
+            "projects": [],
+            "skills": {"languages": [], "frameworks": [], "tools": [], "domains": []},
+        }
+        ledger = build_ledger(resume_data, source_text, run_repair=False)
+        cleaned, _ = final_fact_guard(source_text, resume_data, ledger=ledger)
+
+        self.assertEqual(
+            cleaned["experience"][0].get("period", ""), "",
+            "Period with no year evidence must be cleared"
+        )
+
+    def test_normalized_date_not_cleared(self):
+        """Normalized dates (e.g. 2023.09 → 09-2023) must not be cleared."""
+        from resume_copilot_pipeline import final_fact_guard
+        from fact_ledger import build_ledger
+
+        source_text = "2019年7月至2025年5月工作"
+        resume_data = {
+            "meta": {"name": ""},
+            "education": [],
+            "experience": [{"company": "医院", "role": "", "period": "07-2019 - 05-2025",
+                           "bullets": ["test"]}],
+            "projects": [],
+            "skills": {"languages": [], "frameworks": [], "tools": [], "domains": []},
+        }
+        ledger = build_ledger(resume_data, source_text, run_repair=False)
+        cleaned, _ = final_fact_guard(source_text, resume_data, ledger=ledger)
+
+        self.assertEqual(
+            cleaned["experience"][0].get("period", ""), "07-2019 - 05-2025",
+            "Normalized date with year evidence must be kept"
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
 if __name__ == "__main__":
     unittest.main()
 

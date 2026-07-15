@@ -598,11 +598,21 @@ def _validate_role_entities(
 def _validate_period_entities(
     resume_data: dict, raw_text: str, fab: FabricationReport,
 ) -> None:
-    """Clear period fields that have no year evidence in source text.
+    """Clear period fields that completely lack year evidence in source text.
 
-    Period is a strict fact field — years and months must be traceable
-    to the source text (possibly in different format).  If no year
-    component can be found, the period is cleared.
+    NEGATIVE GUARD ONLY — clears periods where no single year from the
+    period value appears anywhere in source_truth_text.  This catches
+    e.g. an LLM fabricating "01-2020 - 12-2023" when the user's query
+    contains no year dates at all.
+
+    LIMITATIONS (do NOT expand semantic without provenance tracking):
+    - Year existence ≠ period verified.  A period's year may match a
+      year belonging to a *different* section (e.g. education year
+      appearing in experience period).
+    - Month-level alignment is NOT checked.
+    - Section-level provenance is NOT tracked.
+
+    This is a cheap negative filter, not a date audit system.
     """
     import re
     from schemas import FabricationDetail
