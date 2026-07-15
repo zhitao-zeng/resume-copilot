@@ -1,0 +1,103 @@
+{
+  "summary": {
+    "case_count": 12,
+    "success_count": 0,
+    "failure_count": 12,
+    "failure_rate": 1.0,
+    "usable_count": 0,
+    "usable_rate": 0.0,
+    "validation_failure_count": 0,
+    "average_score": 0.0,
+    "average_readability": 0.0,
+    "average_completeness": 0.0,
+    "average_expression": 0.0,
+    "average_response": 0.0,
+    "average_elapsed_s": 7.228
+  },
+  "rows": [
+    {
+      "id": "S1-FIN-JD-001",
+      "ok": false,
+      "status": 500,
+      "elapsed_s": 13.412,
+      "error": "Internal Server Error"
+    },
+    {
+      "id": "S1-AI-JD-DOCX-002",
+      "ok": false,
+      "status": 500,
+      "elapsed_s": 14.681,
+      "error": "Internal Server Error"
+    },
+    {
+      "id": "S1-DATA-JD-PDF-003",
+      "ok": false,
+      "status": 500,
+      "elapsed_s": 18.277,
+      "error": "Internal Server Error"
+    },
+    {
+      "id": "S2-QUERY-AI-004",
+      "ok": false,
+      "status": 500,
+      "elapsed_s": 0.004,
+      "error": "Internal Server Error"
+    },
+    {
+      "id": "S2-QUERY-SPR-005",
+      "ok": false,
+      "status": 500,
+      "elapsed_s": 0.004,
+      "error": "Internal Server Error"
+    },
+    {
+      "id": "S2-QUERY-GEO-006",
+      "ok": false,
+      "status": 500,
+      "elapsed_s": 0.004,
+      "error": "Internal Server Error"
+    },
+    {
+      "id": "S3-AI-CV-DOCX-007",
+      "ok": false,
+      "status": 500,
+      "elapsed_s": 14.807,
+      "error": "Internal Server Error"
+    },
+    {
+      "id": "S3-FIN-CV-PDF-008",
+      "ok": false,
+      "status": 500,
+      "elapsed_s": 13.384,
+      "error": "Internal Server Error"
+    },
+    {
+      "id": "S3-DATA-CV-009",
+      "ok": false,
+      "status": 500,
+      "elapsed_s": 12.15,
+      "error": "Internal Server Error"
+    },
+    {
+      "id": "S4-QUERY-JD-AI-010",
+      "ok": false,
+      "status": 500,
+      "elapsed_s": 0.006,
+      "error": "Internal Server Error"
+    },
+    {
+      "id": "S4-QUERY-JD-SPR-011",
+      "ok": false,
+      "status": 500,
+      "elapsed_s": 0.006,
+      "error": "Internal Server Error"
+    },
+    {
+      "id": "S4-QUERY-JD-CONFLICT-012",
+      "ok": false,
+      "status": 500,
+      "elapsed_s": 0.006,
+      "error": "Internal Server Error"
+    }
+  ]
+}

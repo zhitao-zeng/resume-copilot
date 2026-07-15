@@ -331,13 +331,6 @@ def _extract_experience(text: str) -> list[dict[str, Any]]:
         company = org.group(1).strip() if org else ""
         if company and company.endswith("的"):
             company = company[:-1]
-        # Skip if the extracted company is a generic placeholder word
-        _PLACEHOLDER_ORGS = frozenset({
-            "实验室", "学校", "学院", "研究院", "研究所", "大学",
-            "部门", "团队", "项目组", "项目", "中心", "总部", "分部",
-        })
-        if company and company.strip("（）()").strip() in _PLACEHOLDER_ORGS:
-            company = ""
         bullet = sentence
         if company or role or period:
             experience.append({"company": company, "role": role.group(1).strip() if role else "", "team": "", "start_date": start, "end_date": end, "period": period, "function_description": bullet, "result_description": "", "responsibilities": [bullet], "achievements": [], "bullets": [bullet], "projects": []})
@@ -473,18 +466,6 @@ def normalize_resume_data_for_product(resume_data: dict[str, Any], *, raw_text: 
             data[section] = []
     if not data["experience"]:
         data["experience"] = _extract_experience(raw_text)
-    # Filter out student/lab entries misclassified as work experience:
-    # no company + academic/research role → not employment.
-    _STUDENT_ROLES = frozenset({
-        "研究生", "研究助理", "科研实习", "学生", "硕士生", "博士生",
-        "intern", "research assistant", "research intern",
-    })
-    data["experience"] = [
-        e for e in data["experience"]
-        if isinstance(e, dict)
-        and (str(e.get("company", "")).strip()
-             or str(e.get("role", "")).strip().lower() not in _STUDENT_ROLES)
-    ]
     if not data["education"]:
         data["education"] = _extract_education(raw_text)
     if not isinstance(data.get("skills"), dict):
@@ -572,18 +553,7 @@ def normalize_resume_data_for_product(resume_data: dict[str, Any], *, raw_text: 
         # _collect_bullets() to count the same content 3-4x and dilute expression scores.
         record["responsibilities"] = deduped[:2]
         record["achievements"] = deduped[2:4]
-    # Filter out student/lab entries misclassified as experience:
-    # no company + student academic role = lab work, not employment.
-    _STUDENT_ROLES = frozenset({
-        "研究生", "研究助理", "科研实习", "学生", "硕士生", "博士生",
-        "intern", "research assistant", "research intern",
-    })
-    data["experience"] = [
-        e for e in data["experience"]
-        if isinstance(e, dict)
-        and (str(e.get("company", "")).strip() or str(e.get("role", "")).strip().lower() not in _STUDENT_ROLES)
-    ]
-    data["experience"] = sorted(data["experience"], key=_date_key, reverse=True)
+    data["experience"] = sorted([e for e in data["experience"] if isinstance(e, dict)], key=_date_key, reverse=True)
     _AWARD_KEYWORDS = re.compile(
         r"(一等奖|二等奖|三等奖|奖学金|优秀学生|优秀干部|优秀志愿者|"
         r"创新创业大赛|创新大赛|创业大赛|校级|院级|国家级奖学金|"

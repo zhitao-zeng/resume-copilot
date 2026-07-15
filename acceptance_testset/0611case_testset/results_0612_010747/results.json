@@ -1,0 +1,3557 @@
+{
+  "summary": {
+    "case_count": 12,
+    "success_count": 12,
+    "failure_count": 0,
+    "failure_rate": 0.0,
+    "usable_count": 0,
+    "usable_rate": 0.0,
+    "validation_failure_count": 11,
+    "average_score": 24.18,
+    "average_readability": 3.12,
+    "average_completeness": 12.67,
+    "average_expression": 5.56,
+    "average_response": 2.83,
+    "average_elapsed_s": 36.351
+  },
+  "rows": [
+    {
+      "id": "S1-FIN-JD-001",
+      "ok": true,
+      "status": 200,
+      "elapsed_s": 25.412,
+      "score": 0.0,
+      "score_breakdown": {
+        "fabrication": 0,
+        "readability": 0.0,
+        "completeness": 0.0,
+        "expression": 0.0,
+        "response": 0.0,
+        "total": 0.0
+      },
+      "scenario": "scenario1",
+      "industry": "finance",
+      "user_stage": "student",
+      "missing_count": 2,
+      "conflict_count": 3,
+      "docx": "/mnt/disk1/zengzhitao/resume-copilot-server-acceptance/output/简历_丁若虚_优化版.docx",
+      "reply_text": "已按“原始简历与目标 JD 优化”完成一版可编辑 DOCX，识别方向为金融，用户阶段为student。\n根据您提供的个人描述，建议投递金融分析师相关岗位\n当前自动评分为 0.0/100。\n需要补充：教育经历第1段的学位为必填项；教育经历第1段的专业名称为必填项\n需要确认：教育经历时间冲突：加拿大英属哥伦比亚大学尚德商学院(06-2016 - 07-2016) 与 香港中文大学（深圳）(09-2014 - 06-2018) 时间段有重叠；工作经历与教育经历时间可能重叠：南方基金管理有限公司（06-2017 - 12-2017）与 香港中文大学（深圳）（09-2014 - 06-2018）；工作经历与教育经历时间可能重叠：安永华明会计师事务所深圳分所（11-2016 - 02-2017）与 香港中文大学（深圳）（09-2014 - 06-2018）\n建议优先补齐联系方式、教育时间、经历成果和可量化结果，再用于正式投递。",
+      "validation_failures": [],
+      "raw": {
+        "files": {
+          "docx": "/mnt/disk1/zengzhitao/resume-copilot-server-acceptance/output/简历_丁若虚_优化版.docx",
+          "pdf": null
+        },
+        "reply_text": "已按“原始简历与目标 JD 优化”完成一版可编辑 DOCX，识别方向为金融，用户阶段为student。\n根据您提供的个人描述，建议投递金融分析师相关岗位\n当前自动评分为 0.0/100。\n需要补充：教育经历第1段的学位为必填项；教育经历第1段的专业名称为必填项\n需要确认：教育经历时间冲突：加拿大英属哥伦比亚大学尚德商学院(06-2016 - 07-2016) 与 香港中文大学（深圳）(09-2014 - 06-2018) 时间段有重叠；工作经历与教育经历时间可能重叠：南方基金管理有限公司（06-2017 - 12-2017）与 香港中文大学（深圳）（09-2014 - 06-2018）；工作经历与教育经历时间可能重叠：安永华明会计师事务所深圳分所（11-2016 - 02-2017）与 香港中文大学（深圳）（09-2014 - 06-2018）\n建议优先补齐联系方式、教育时间、经历成果和可量化结果，再用于正式投递。",
+        "score": {
+          "fabrication": 0,
+          "readability": 0.0,
+          "completeness": 0.0,
+          "expression": 0.0,
+          "response": 0.0,
+          "total": 0.0
+        },
+        "missing_fields": [
+          {
+            "field": "education[0].degree",
+            "label": "学位",
+            "reason": "教育经历第1段的学位为必填项"
+          },
+          {
+            "field": "education[0].major",
+            "label": "专业名称",
+            "reason": "教育经历第1段的专业名称为必填项"
+          }
+        ],
+        "conflicts": [
+          {
+            "field": "education",
+            "description": "教育经历时间冲突：加拿大英属哥伦比亚大学尚德商学院(06-2016 - 07-2016) 与 香港中文大学（深圳）(09-2014 - 06-2018) 时间段有重叠"
+          },
+          {
+            "field": "cross_check",
+            "description": "工作经历与教育经历时间可能重叠：南方基金管理有限公司（06-2017 - 12-2017）与 香港中文大学（深圳）（09-2014 - 06-2018）"
+          },
+          {
+            "field": "cross_check",
+            "description": "工作经历与教育经历时间可能重叠：安永华明会计师事务所深圳分所（11-2016 - 02-2017）与 香港中文大学（深圳）（09-2014 - 06-2018）"
+          }
+        ],
+        "scenario": "scenario1",
+        "industry": "finance",
+        "user_stage": "student",
+        "perf": {
+          "cv_extract_s": 0.033,
+          "jd_resolve_s": 0.0,
+          "classify_s": 2.008,
+          "structured_resume_s": 7.417,
+          "_classify_fix_user_stage_s": 9.425,
+          "optimize_s": 15.828,
+          "validation_s": 0.012,
+          "export_files_s": 0.1,
+          "draft_s": 0.0,
+          "total_s": 25.399
+        },
+        "score_breakdown": {
+          "fabrication": 0,
+          "readability": 0.0,
+          "completeness": 0.0,
+          "expression": 0.0,
+          "response": 0.0,
+          "total": 0.0
+        },
+        "ocr_warnings": [],
+        "user_report": {
+          "generation_direction": "根据您提供的个人描述，建议投递金融分析师相关岗位",
+          "missing_field_suggestions": [
+            {
+              "field": "education[0].degree",
+              "label": "学位",
+              "reason": "教育经历第1段的学位为必填项"
+            },
+            {
+              "field": "education[0].major",
+              "label": "专业名称",
+              "reason": "教育经历第1段的专业名称为必填项"
+            }
+          ],
+          "conflict_confirmations": [
+            {
+              "field": "education",
+              "description": "教育经历时间冲突：加拿大英属哥伦比亚大学尚德商学院(06-2016 - 07-2016) 与 香港中文大学（深圳）(09-2014 - 06-2018) 时间段有重叠"
+            },
+            {
+              "field": "cross_check",
+              "description": "工作经历与教育经历时间可能重叠：南方基金管理有限公司（06-2017 - 12-2017）与 香港中文大学（深圳）（09-2014 - 06-2018）"
+            },
+            {
+              "field": "cross_check",
+              "description": "工作经历与教育经历时间可能重叠：安永华明会计师事务所深圳分所（11-2016 - 02-2017）与 香港中文大学（深圳）（09-2014 - 06-2018）"
+            }
+          ],
+          "ocr_warnings": [],
+          "template_notes": [],
+          "fabrication_details": [
+            {
+              "type": "date",
+              "content": "06-2017 - 12-2017",
+              "reason": "南方基金管理有限公司时间未能在用户原始输入中找到对应依据"
+            },
+            {
+              "type": "date",
+              "content": "11-2016 - 02-2017",
+              "reason": "安永华明会计师事务所深圳分所时间未能在用户原始输入中找到对应依据"
+            }
+          ]
+        },
+        "resume_data": {
+          "meta": {
+            "name": "丁若虚",
+            "age": "",
+            "gender": "",
+            "email": "123456789@link.cuhk.edu.cn",
+            "phone": "130-0000-0000",
+            "wechat": "",
+            "github": "",
+            "linkedin": "",
+            "website": "",
+            "education_level": "本科",
+            "work_experience": "1年",
+            "political_status": "",
+            "expected_city": "",
+            "target_role": "金融分析师",
+            "job_intention": "金融分析师"
+          },
+          "summary": "1年金融方向候选人，目标投递金融分析师，具备数据分析、MS Office、会声会影能力，可围绕过往经历补充量化成果。",
+          "experience": [
+            {
+              "company": "南方基金管理有限公司",
+              "role": "实习分析师",
+              "team": "",
+              "period": "06-2017 - 12-2017",
+              "function_description": "负责行业研究、公司调研及财务模型构建，撰写深度研究报告与公司点评。",
+              "result_description": "所在团队荣获2017年最佳分析师团队第二名，完成2篇行业深度报告。",
+              "bullets": [
+                "负责行业研究、公司调研及财务模型构建，撰写深度研究报告与公司点评。",
+                "所在团队荣获2017年最佳分析师团队第二名，完成2篇行业深度报告。",
+                "搜集研究数据及信息，构建财务模型撰写公司点评，并完成2篇行业深度报告",
+                "负责团队日报推送，更新上市公司公告，点评军工行业新闻，加深对行业了解"
+              ],
+              "responsibilities": [
+                "搜集研究数据及信息，构建财务模型撰写公司点评，并完成2篇行业深度报告",
+                "负责团队日报推送，更新上市公司公告，点评军工行业新闻，加深对行业了解"
+              ],
+              "achievements": [
+                "所在团队荣获2017年最佳分析师团队第二名"
+              ],
+              "projects": [],
+              "start_date": "06-2017",
+              "end_date": "12-2017"
+            },
+            {
+              "company": "安永华明会计师事务所深圳分所",
+              "role": "实习审计师",
+              "team": "",
+              "period": "11-2016 - 02-2017",
+              "function_description": "参与中石油国际石油勘探开发有限公司的审计项目，负责工作底稿编制、报表分析及凭证核对。",
+              "result_description": "团队在9天内高效完成7个事业部的审计工作，协助编制3家子公司工作底稿及报表，整理装订案卷近35册。",
+              "bullets": [
+                "参与中石油国际石油勘探开发有限公司的审计项目，负责工作底稿编制、报表分析及凭证核对。",
+                "团队在9天内高效完成7个事业部的审计工作，协助编制3家子公司工作底稿及报表，整理装订案卷近35册。",
+                "参与中石油国际石油勘探开发有限公司的审计项目，团队在9天内高效完成7个事业部的审计工作",
+                "协助编制3家子公司的工作底稿及报表，独立完成4册底稿的抽凭检查核对报表附注，并整理装订案卷近35册"
+              ],
+              "responsibilities": [
+                "参与中石油国际石油勘探开发有限公司的审计项目，团队在9天内高效完成7个事业部的审计工作",
+                "协助编制3家子公司的工作底稿及报表，独立完成4册底稿的抽凭检查核对报表附注，并整理装订案卷近35册"
+              ],
+              "achievements": [],
+              "projects": [],
+              "start_date": "11-2016",
+              "end_date": "02-2017"
+            }
+          ],
+          "projects": [
+            {
+              "name": "香港中文大学（深圳）金融统计本科",
+              "company": "香港中文大学（深圳）",
+              "role": "",
+              "period": "2014.09-2018.06",
+              "description": "GPA排名：3.54/4.0（学院前10%），连续三年获校级奖学金。",
+              "function_description": "核心课程涵盖会计、财务报表分析、线性回归分析、计量经济学、统计推断等。",
+              "result_description": "2016年6月-7月于加拿大英属哥伦比亚大学尚德商学院进行暑期交流。",
+              "bullets": [
+                "核心课程：会计、财务报表分析、线性回归分析，计量经济学、统计推断等",
+                "2016年6月-7月于加拿大英属哥伦比亚大学尚德商学院进行暑期交流"
+              ],
+              "tech_stack": []
+            },
+            {
+              "name": "巴厘岛义工支教志愿服务团队志愿者",
+              "company": "志愿服务团队",
+              "role": "志愿者",
+              "period": "2016.05-2016.07",
+              "description": "为120名当地1至6年级学生提供为期10周的英语口语教学。",
+              "function_description": "组织筹备校园运动会和迎新会，参与人数达到155人。",
+              "result_description": "向来自世界各地的15名志愿者分享个人志愿者经历，帮助他们更快适应当地生活和提供教学建议。",
+              "bullets": [
+                "向来自世界各地的15名志愿者分享个人志愿者经历，帮助他们更快适应当地生活和提供教学建议"
+              ],
+              "tech_stack": []
+            },
+            {
+              "name": "职业发展协会会长",
+              "company": "职业发展协会",
+              "role": "会长",
+              "period": "2015.05-2016.05",
+              "description": "创办并管理职业发展协会团队共5个部门的60人团队。",
+              "function_description": "协助就业服务中心举办5场活动，负责前期规划、现场协调和后期反馈，参与人数达625人。",
+              "result_description": "微信公众号关注量突破1000，最高单篇阅读量达500，关注者由校内拓展到广东地区。",
+              "bullets": [
+                "微信公众号关注量突破1000，最高单篇阅读量达500，关注者由校内拓展到广东地区"
+              ],
+              "tech_stack": []
+            }
+          ],
+          "education": [
+            {
+              "school": "加拿大英属哥伦比亚大学尚德商学院",
+              "degree": "",
+              "major": "",
+              "period": "06-2016 - 07-2016",
+              "highlights": [
+                "暑期交流"
+              ],
+              "start_date": "06-2016",
+              "end_date": "07-2016"
+            },
+            {
+              "school": "香港中文大学（深圳）",
+              "degree": "本科",
+              "major": "金融统计",
+              "period": "09-2014 - 06-2018",
+              "highlights": [
+                "GPA排名：3.54/4.0（学院前10%）",
+                "连续三年获校级奖学金（每年学院1%学生获此殊荣）",
+                "核心课程：会计、财务报表分析、线性回归分析、计量经济学、统计推断等",
+                "2016年6月-7月于加拿大英属哥伦比亚大学尚德商学院进行暑期交流"
+              ],
+              "start_date": "09-2014",
+              "end_date": "06-2018"
+            }
+          ],
+          "skills": {
+            "languages": [],
+            "frameworks": [],
+            "tools": [
+              "MS Office",
+              "会声会影",
+              "Goldwave",
+              "SPSS",
+              "Stata",
+              "VBA",
+              "SQL",
+              "RapidMiner",
+              "MAMP"
+            ],
+            "domains": [
+              "数据分析"
+            ]
+          },
+          "publications": [],
+          "honors": [
+            "2017 年中国工商银行校园商战大赛暨暑期实习生选拔计划一等奖",
+            "2016年香港中文大学（深圳）The Voice 第三名",
+            "2015年“万人之上”中国大学生金融挑战赛全国总决赛第三名（团体）",
+            "2014 年经管学院案例比赛第一名"
+          ],
+          "awards": [],
+          "certifications": [],
+          "personal_skills": [
+            "钢琴（十级）",
+            "数独",
+            "拉丁舞"
+          ],
+          "additional_sections": {
+            "推荐人": [
+              "张小明 安永华明会计师事务所深圳分所合伙人 abcdefg@cn.ey.com 136-0000-0000",
+              "徐扬生 香港中文大学（深圳）校长 abcd@cuhk.edu.cn 0755-84270000"
+            ]
+          },
+          "fact_sources": {
+            "raw_input": "query/cv",
+            "jd_usage": "JD only used for direction; facts must come from query/cv."
+          }
+        },
+        "draft_id": "80da790d99",
+        "version": 1
+      }
+    },
+    {
+      "id": "S1-AI-JD-DOCX-002",
+      "ok": true,
+      "status": 200,
+      "elapsed_s": 35.515,
+      "score": 0.0,
+      "score_breakdown": {
+        "fabrication": 0,
+        "readability": 0.0,
+        "completeness": 0.0,
+        "expression": 0.0,
+        "response": 0.0,
+        "total": 0.0
+      },
+      "scenario": "scenario1",
+      "industry": "other",
+      "user_stage": "student",
+      "missing_count": 2,
+      "conflict_count": 0,
+      "docx": "/mnt/disk1/zengzhitao/resume-copilot-server-acceptance/output/简历_靳宏博_优化版.docx",
+      "reply_text": "已按“原始简历与目标 JD 优化”完成一版可编辑 DOCX，识别方向为综合，用户阶段为student。\n根据您提供的个人描述，建议投递AI Researcher相关岗位\n当前自动评分为 0.0/100。\n需要补充：联系电话为必填项，请在简历中补充；邮箱为必填项，请在简历中补充\n建议优先补齐联系方式、教育时间、经历成果和可量化结果，再用于正式投递。",
+      "validation_failures": [
+        "industry_mismatch:other!=internet"
+      ],
+      "raw": {
+        "files": {
+          "docx": "/mnt/disk1/zengzhitao/resume-copilot-server-acceptance/output/简历_靳宏博_优化版.docx",
+          "pdf": null
+        },
+        "reply_text": "已按“原始简历与目标 JD 优化”完成一版可编辑 DOCX，识别方向为综合，用户阶段为student。\n根据您提供的个人描述，建议投递AI Researcher相关岗位\n当前自动评分为 0.0/100。\n需要补充：联系电话为必填项，请在简历中补充；邮箱为必填项，请在简历中补充\n建议优先补齐联系方式、教育时间、经历成果和可量化结果，再用于正式投递。",
+        "score": {
+          "fabrication": 0,
+          "readability": 0.0,
+          "completeness": 0.0,
+          "expression": 0.0,
+          "response": 0.0,
+          "total": 0.0
+        },
+        "missing_fields": [
+          {
+            "field": "meta.phone",
+            "label": "联系电话",
+            "reason": "联系电话为必填项，请在简历中补充"
+          },
+          {
+            "field": "meta.email",
+            "label": "邮箱",
+            "reason": "邮箱为必填项，请在简历中补充"
+          }
+        ],
+        "conflicts": [],
+        "scenario": "scenario1",
+        "industry": "other",
+        "user_stage": "student",
+        "perf": {
+          "cv_extract_s": 0.01,
+          "target_jd_extract_s": 0.009,
+          "jd_resolve_s": 0.009,
+          "classify_s": 3.22,
+          "structured_resume_s": 11.413,
+          "_classify_fix_user_stage_s": 14.634,
+          "optimize_s": 20.785,
+          "validation_s": 0.003,
+          "export_files_s": 0.071,
+          "draft_s": 0.0,
+          "total_s": 35.513
+        },
+        "score_breakdown": {
+          "fabrication": 0,
+          "readability": 0.0,
+          "completeness": 0.0,
+          "expression": 0.0,
+          "response": 0.0,
+          "total": 0.0
+        },
+        "ocr_warnings": [],
+        "user_report": {
+          "generation_direction": "根据您提供的个人描述，建议投递AI Researcher相关岗位",
+          "missing_field_suggestions": [
+            {
+              "field": "meta.phone",
+              "label": "联系电话",
+              "reason": "联系电话为必填项，请在简历中补充"
+            },
+            {
+              "field": "meta.email",
+              "label": "邮箱",
+              "reason": "邮箱为必填项，请在简历中补充"
+            }
+          ],
+          "conflict_confirmations": [],
+          "ocr_warnings": [],
+          "template_notes": [],
+          "fabrication_details": [
+            {
+              "type": "date",
+              "content": "07-2023 - 08-2024",
+              "reason": "北大王选计算技术研究所时间未能在用户原始输入中找到对应依据"
+            }
+          ]
+        },
+        "resume_data": {
+          "meta": {
+            "name": "靳宏博",
+            "age": "",
+            "gender": "",
+            "email": "",
+            "phone": "",
+            "wechat": "",
+            "github": "",
+            "linkedin": "",
+            "website": "",
+            "education_level": "博士",
+            "work_experience": "2年",
+            "political_status": "",
+            "expected_city": "",
+            "target_role": "AI 算法研究员",
+            "job_intention": "AI 算法研究员"
+          },
+          "summary": "2年综合方向候选人，目标投递AI Researcher，具备大模型训练、计算机视觉、Git能力，可围绕过往经历补充量化成果。",
+          "experience": [
+            {
+              "company": "浙江大学滨江研究院",
+              "role": "科研实习",
+              "team": "",
+              "period": "03-2025 - 至今",
+              "function_description": "负责 3D 大模型相关科研，针对复杂场景理解问题，改进现有模型方法及相关评测标准，负责三维视觉前沿算法，模型架构设计，自主设计模型算法，推进自动驾驶感知研究",
+              "result_description": "首次提出三维场景复杂推理评测集，并提出了一个新的 3D 思维链多跳标注方法。结合 GRPO 等相关强化学习算法，改进 3D LLM 训练效果，提升模型对三维场景的深度思考能力。目前论文已投稿 AAAI2026",
+              "bullets": [
+                "负责 3D 大模型相关科研，针对复杂场景理解问题，改进现有模型方法及相关评测标准，负责三维视觉前沿算法，模型架构设计，自主设计模型算法，推进自动驾驶感知研究",
+                "首次提出三维场景复杂推理评测集，并提出了一个新的 3D 思维链多跳标注方法。结合 GRPO 等相关强化学习算法，改进 3D LLM 训练效果，提升模型对三维场景的深度思考能力。目前论文已投稿 AAAI2026",
+                "负责 3D 大模型相关科研",
+                "负责三维视觉前沿算法，模型架构设计"
+              ],
+              "responsibilities": [
+                "负责 3D 大模型相关科研",
+                "负责三维视觉前沿算法，模型架构设计",
+                "自主设计模型算法，推进自动驾驶感知研究"
+              ],
+              "achievements": [
+                "首次提出三维场景复杂推理评测集",
+                "提出了一个新的 3D 思维链多跳标注方法",
+                "结合 GRPO 等相关强化学习算法，改进 3D LLM 训练效果",
+                "提升模型对三维场景的深度思考能力",
+                "目前论文已投稿 AAAI2026"
+              ],
+              "projects": [
+                {
+                  "name": "3D 大模型复杂环境理解及深度推理研究",
+                  "company": "",
+                  "role": "",
+                  "period": "2025.03-至今",
+                  "description": "针对复杂场景理解问题，改进现有模型方法及相关评测标准，负责三维视觉前沿算法，模型架构设计，自主设计模型算法，推进自动驾驶感知研究",
+                  "function_description": "",
+                  "result_description": "",
+                  "bullets": [
+                    "针对复杂场景理解问题，改进现有模型方法及相关评测标准，负责三维视觉前沿算法，模型架构设计，自主设计模型算法，推进自动驾驶感知研究"
+                  ],
+                  "tech_stack": [
+                    "三维视觉",
+                    "自动驾驶感知",
+                    "GRPO",
+                    "强化学习",
+                    "Researcher"
+                  ]
+                }
+              ],
+              "start_date": "03-2025",
+              "end_date": "至今"
+            },
+            {
+              "company": "北大王选计算技术研究所",
+              "role": "科研实习",
+              "team": "",
+              "period": "07-2023 - 08-2024",
+              "function_description": "基于现有视频大模型和思维链技术，提出了首个非训练式视频复杂问题推理框架，实现了对于视频问题的多步拆解和推理验证",
+              "result_description": "在 Egoschema、MVBench、VideoMMMU、VideoEspresso、PerceptionTest 五个视频数据集上刷新 sota，取得明显效果。目前论文已投 AAAI 2026，论文名 CoT-Vid: Dynamic Chain-of-Thought Routing with Self Verification for Training-Free Video Reasoning。利用场景定位帧组增强长视频细节感知能力，在多个视频数据集上取得明显效果。目前论文已投稿 AAAI 2026，论文名：Enhancing Long Video Detail Perception with Scene-Localized Frame Grouping。基于 Occupancy 场景表征的时序增强网络（自动驾驶感知），刷新了现有方法精度，推进自动驾驶感知领域发展。论文成果已发表在 ECAI2024，论文名 TEOcc：Multimodal Occupancy Prediction via Temporal Enhancement",
+              "bullets": [
+                "基于现有视频大模型和思维链技术，提出了首个非训练式视频复杂问题推理框架，实现了对于视频问题的多步拆解和推理验证",
+                "在 Egoschema、MVBench、VideoMMMU、VideoEspresso、PerceptionTest 五个视频数据集上刷新 sota，取得明显效果。目前论文已投 AAAI 2026，论文名 CoT-Vid: Dynamic Chain-of-Thought Routing with Self Verification for Training-Free Video Reasoning。利用场景定位帧组增强长视频细节感知能力，在多个视频数据集上取得明显效果。目前论文已投稿 AAAI 2026，论文名：Enhancing Long Video Detail Perception with Scene-Localized Frame Grouping。基于 Occupancy 场景表征的时序增强网络（自动驾驶感知），刷新了现有方法精度，推进自动驾驶感知领域发展。论文成果已发表在 ECAI2024，论文名 TEOcc：Multimodal Occupancy Prediction via Temporal Enhancement",
+                "基于现有视频大模型和思维链技术，提出了首个非训练式视频复杂问题推理框架",
+                "实现了对于视频问题的多步拆解和推理验证"
+              ],
+              "responsibilities": [
+                "基于现有视频大模型和思维链技术，提出了首个非训练式视频复杂问题推理框架",
+                "实现了对于视频问题的多步拆解和推理验证",
+                "利用场景定位帧组增强长视频细节感知能力",
+                "基于 Occupancy 场景表征的时序增强网络（自动驾驶感知）"
+              ],
+              "achievements": [
+                "在 Egoschema、MVBench、VideoMMMU、VideoEspresso、PerceptionTest 五个视频数据集上刷新 sota",
+                "目前论文已投 AAAI 2026，论文名 CoT-Vid: Dynamic Chain-of-Thought Routing with Self Verification for Training-Free Video Reasoning",
+                "目前论文已投稿 AAAI 2026，论文名：Enhancing Long Video Detail Perception with Scene-Localized Frame Grouping",
+                "论文成果已发表在 ECAI2024，论文名 TEOcc：Multimodal Occupancy Prediction via Temporal Enhancement"
+              ],
+              "projects": [
+                {
+                  "name": "视频大模型复杂问题智能推理研究",
+                  "company": "",
+                  "role": "",
+                  "period": "2023.07-2024.08",
+                  "description": "基于现有视频大模型和思维链技术，提出了首个非训练式视频复杂问题推理框架，实现了对于视频问题的多步拆解和推理验证",
+                  "function_description": "",
+                  "result_description": "",
+                  "bullets": [
+                    "基于现有视频大模型和思维链技术，提出了首个非训练式视频复杂问题推理框架",
+                    "实现了对于视频问题的多步拆解和推理验证",
+                    "在Egoschema、MVBench、VideoMMMU、VideoEspresso、PerceptionTest五个视频数据集上刷新sota",
+                    "目前论文已投AAAI 2026，论文名 CoT-Vid: Dynamic Chain-of-Thought Routing with Self Verification for Training-Free Video Reasoning"
+                  ],
+                  "tech_stack": [
+                    "视频大模型",
+                    "思维链技术",
+                    "非训练式推理框架"
+                  ]
+                },
+                {
+                  "name": "利用场景定位帧组增强长视频细节感知能力",
+                  "company": "",
+                  "role": "",
+                  "period": "2023.07-2024.08",
+                  "description": "受人类感知和理解视频方式的启发，提出了 SLFG（Scene-Localized Frame Grouping），它将单个帧分组为具有凝聚力的场景帧，通过更高层次的语义表征来减少帧冗余，在多个视频数据集上取得明显效果",
+                  "function_description": "",
+                  "result_description": "",
+                  "bullets": [
+                    "受人类感知和理解视频方式的启发，提出了 SLFG（Scene-Localized Frame Grouping）",
+                    "它将单个帧分组为具有凝聚力的场景帧，通过更高层次的语义表征来减少帧冗余",
+                    "在多个视频数据集上取得明显效果",
+                    "目前论文已投稿AAAI 2026，论文名：Enhancing Long Video Detail Perception with Scene-Localized Frame Grouping"
+                  ],
+                  "tech_stack": [
+                    "SLFG",
+                    "场景定位帧组",
+                    "视频细节感知"
+                  ]
+                },
+                {
+                  "name": "基于 Occupancy 场景表征的时序增强网络（自动驾驶感知）",
+                  "company": "",
+                  "role": "",
+                  "period": "2023.07-2024.08",
+                  "description": "在自动驾驶感知领域，重点研究分析了基于 Occupancy 网格表征的时序增强方法，刷新了现有方法精度，推进自动驾驶感知领域发展",
+                  "function_description": "",
+                  "result_description": "",
+                  "bullets": [
+                    "在自动驾驶感知领域，重点研究分析了基于Occupancy网格表征的时序增强方法",
+                    "刷新了现有方法精度，推进自动驾驶感知领域发展",
+                    "论文成果已发表在ECAI2024，论文名 TEOcc：Multimodal Occupancy Prediction via Temporal Enhancement"
+                  ],
+                  "tech_stack": [
+                    "Occupancy网格表征",
+                    "时序增强",
+                    "自动驾驶感知"
+                  ]
+                }
+              ],
+              "start_date": "07-2023",
+              "end_date": "08-2024"
+            }
+          ],
+          "projects": [],
+          "education": [
+            {
+              "school": "北京大学",
+              "degree": "博士",
+              "major": "计算机科学与技术",
+              "period": "01-2025",
+              "highlights": [],
+              "start_date": "01-2025"
+            },
+            {
+              "school": "华中科技大学",
+              "degree": "本科",
+              "major": "计算机科学与技术",
+              "period": "01-2021",
+              "highlights": [],
+              "start_date": "01-2021"
+            }
+          ],
+          "skills": {
+            "languages": [
+              "Python",
+              "C++"
+            ],
+            "frameworks": [
+              "PyTorch",
+              "TensorFlow"
+            ],
+            "tools": [
+              "Git",
+              "Docker",
+              "Jupyter Notebook",
+              "Pytorch",
+              "TensorFlow"
+            ],
+            "domains": [
+              "大模型训练",
+              "计算机视觉",
+              "自动驾驶感知",
+              "视频处理"
+            ]
+          },
+          "publications": [
+            "CoT-Vid: Dynamic Chain-of-Thought Routing with Self Verification for Training-Free Video Reasoning",
+            "Enhancing Long Video Detail Perception with Scene-Localized Frame Grouping",
+            "TEOcc：Multimodal Occupancy Prediction via Temporal Enhancement"
+          ],
+          "honors": [],
+          "awards": [],
+          "certifications": [],
+          "personal_skills": [],
+          "additional_sections": {
+            "学术论文 PUBLICATIONS": [
+              "CoT-Vid: Dynamic Chain-of-Thought Routing with Self Verification for Training-Free Video Reasoning",
+              "Enhancing Long Video Detail Perception with Scene-Localized Frame Grouping",
+              "TEOcc：Multimodal Occupancy Prediction via Temporal Enhancement"
+            ]
+          },
+          "fact_sources": {
+            "raw_input": "query/cv",
+            "jd_usage": "JD only used for direction; facts must come from query/cv."
+          }
+        },
+        "draft_id": "e3416711a3",
+        "version": 1
+      }
+    },
+    {
+      "id": "S1-DATA-JD-PDF-003",
+      "ok": true,
+      "status": 200,
+      "elapsed_s": 52.916,
+      "score": 0.0,
+      "score_breakdown": {
+        "fabrication": 0,
+        "readability": 0.0,
+        "completeness": 0.0,
+        "expression": 0.0,
+        "response": 0.0,
+        "total": 0.0
+      },
+      "scenario": "scenario1",
+      "industry": "other",
+      "user_stage": "student",
+      "missing_count": 9,
+      "conflict_count": 0,
+      "docx": "/mnt/disk1/zengzhitao/resume-copilot-server-acceptance/output/简历_林嘉楠_优化版.docx",
+      "reply_text": "已按“原始简历与目标 JD 优化”完成一版可编辑 DOCX，识别方向为综合，用户阶段为student。\n根据您提供的个人描述，建议投递data_engineer相关岗位\n当前自动评分为 0.0/100。\n需要补充：教育经历第2段的学位为必填项；教育经历第2段的专业名称为必填项；教育经历第2段的时间为必填项；如提供了项目经历，则所有信息必填（项目名称/时间），请补充缺失信息；项目经历第8段缺少所属公司/学校/组织，请补充\n建议优先补齐联系方式、教育时间、经历成果和可量化结果，再用于正式投递。",
+      "validation_failures": [
+        "industry_mismatch:other!=internet"
+      ],
+      "raw": {
+        "files": {
+          "docx": "/mnt/disk1/zengzhitao/resume-copilot-server-acceptance/output/简历_林嘉楠_优化版.docx",
+          "pdf": null
+        },
+        "reply_text": "已按“原始简历与目标 JD 优化”完成一版可编辑 DOCX，识别方向为综合，用户阶段为student。\n根据您提供的个人描述，建议投递data_engineer相关岗位\n当前自动评分为 0.0/100。\n需要补充：教育经历第2段的学位为必填项；教育经历第2段的专业名称为必填项；教育经历第2段的时间为必填项；如提供了项目经历，则所有信息必填（项目名称/时间），请补充缺失信息；项目经历第8段缺少所属公司/学校/组织，请补充\n建议优先补齐联系方式、教育时间、经历成果和可量化结果，再用于正式投递。",
+        "score": {
+          "fabrication": 0,
+          "readability": 0.0,
+          "completeness": 0.0,
+          "expression": 0.0,
+          "response": 0.0,
+          "total": 0.0
+        },
+        "missing_fields": [
+          {
+            "field": "education[1].degree",
+            "label": "学位",
+            "reason": "教育经历第2段的学位为必填项"
+          },
+          {
+            "field": "education[1].major",
+            "label": "专业名称",
+            "reason": "教育经历第2段的专业名称为必填项"
+          },
+          {
+            "field": "education[1].period",
+            "label": "时间",
+            "reason": "教育经历第2段的时间为必填项"
+          },
+          {
+            "field": "projects[7]",
+            "label": "项目经历",
+            "reason": "如提供了项目经历，则所有信息必填（项目名称/时间），请补充缺失信息"
+          },
+          {
+            "field": "projects[7].company",
+            "label": "项目归属",
+            "reason": "项目经历第8段缺少所属公司/学校/组织，请补充"
+          },
+          {
+            "field": "projects[7].description",
+            "label": "项目描述",
+            "reason": "项目经历第8段缺少项目描述，请补充项目背景和目标"
+          },
+          {
+            "field": "projects[8]",
+            "label": "项目经历",
+            "reason": "如提供了项目经历，则所有信息必填（项目名称/时间），请补充缺失信息"
+          },
+          {
+            "field": "projects[8].company",
+            "label": "项目归属",
+            "reason": "项目经历第9段缺少所属公司/学校/组织，请补充"
+          },
+          {
+            "field": "projects[8].description",
+            "label": "项目描述",
+            "reason": "项目经历第9段缺少项目描述，请补充项目背景和目标"
+          }
+        ],
+        "conflicts": [],
+        "scenario": "scenario1",
+        "industry": "other",
+        "user_stage": "student",
+        "perf": {
+          "cv_extract_s": 0.022,
+          "target_jd_extract_s": 0.008,
+          "jd_resolve_s": 0.008,
+          "classify_s": 1.906,
+          "structured_resume_s": 24.615,
+          "_classify_fix_user_stage_s": 26.522,
+          "optimize_s": 26.288,
+          "validation_s": 0.005,
+          "export_files_s": 0.069,
+          "draft_s": 0.0,
+          "total_s": 52.914
+        },
+        "score_breakdown": {
+          "fabrication": 0,
+          "readability": 0.0,
+          "completeness": 0.0,
+          "expression": 0.0,
+          "response": 0.0,
+          "total": 0.0
+        },
+        "ocr_warnings": [],
+        "user_report": {
+          "generation_direction": "根据您提供的个人描述，建议投递data_engineer相关岗位",
+          "missing_field_suggestions": [
+            {
+              "field": "education[1].degree",
+              "label": "学位",
+              "reason": "教育经历第2段的学位为必填项"
+            },
+            {
+              "field": "education[1].major",
+              "label": "专业名称",
+              "reason": "教育经历第2段的专业名称为必填项"
+            },
+            {
+              "field": "education[1].period",
+              "label": "时间",
+              "reason": "教育经历第2段的时间为必填项"
+            },
+            {
+              "field": "projects[7]",
+              "label": "项目经历",
+              "reason": "如提供了项目经历，则所有信息必填（项目名称/时间），请补充缺失信息"
+            },
+            {
+              "field": "projects[7].company",
+              "label": "项目归属",
+              "reason": "项目经历第8段缺少所属公司/学校/组织，请补充"
+            },
+            {
+              "field": "projects[7].description",
+              "label": "项目描述",
+              "reason": "项目经历第8段缺少项目描述，请补充项目背景和目标"
+            },
+            {
+              "field": "projects[8]",
+              "label": "项目经历",
+              "reason": "如提供了项目经历，则所有信息必填（项目名称/时间），请补充缺失信息"
+            },
+            {
+              "field": "projects[8].company",
+              "label": "项目归属",
+              "reason": "项目经历第9段缺少所属公司/学校/组织，请补充"
+            },
+            {
+              "field": "projects[8].description",
+              "label": "项目描述",
+              "reason": "项目经历第9段缺少项目描述，请补充项目背景和目标"
+            }
+          ],
+          "conflict_confirmations": [],
+          "ocr_warnings": [],
+          "template_notes": [],
+          "fabrication_details": [
+            {
+              "type": "date",
+              "content": "05-2025 - 至今",
+              "reason": "布里斯托大学时间未能在用户原始输入中找到对应依据"
+            },
+            {
+              "type": "date",
+              "content": "11-2024 - 03-2025",
+              "reason": "布里斯托大学时间未能在用户原始输入中找到对应依据"
+            },
+            {
+              "type": "date",
+              "content": "07/2024 – 10/2024",
+              "reason": "城市交通流量预测系统时间未能在用户原始输入中找到对应依据"
+            },
+            {
+              "type": "date",
+              "content": "05/2025 – 至今",
+              "reason": "基于卫星图像的儿童贫困估测时间未能在用户原始输入中找到对应依据"
+            }
+          ]
+        },
+        "resume_data": {
+          "meta": {
+            "name": "林嘉楠",
+            "age": "",
+            "gender": "",
+            "email": "ljn010303@gmail.com",
+            "phone": "15980067585",
+            "wechat": "",
+            "github": "",
+            "linkedin": "",
+            "website": "",
+            "education_level": "本科",
+            "work_experience": "2年",
+            "political_status": "",
+            "expected_city": "全国各地",
+            "target_role": "数据 AI 相关",
+            "job_intention": "数据 AI 相关"
+          },
+          "summary": "2年综合方向候选人，目标投递data_engineer，具备数据分析、Excel、SQL能力，可围绕过往经历补充量化成果。",
+          "experience": [
+            {
+              "company": "布里斯托大学",
+              "role": "科研实习",
+              "team": "KidSat 项目",
+              "period": "05-2025 - 至今",
+              "function_description": "基于卫星图像的儿童贫困估测",
+              "result_description": "成功搭建了从数据下载到模型训练的完整技术框架，并撰写详细技术文档供团队与后续研究者参考。获得高质量、可用于机器学习建模的图像数据。",
+              "bullets": [
+                "基于卫星图像的儿童贫困估测",
+                "成功搭建了从数据下载到模型训练的完整技术框架，并撰写详细技术文档供团队与后续研究者参考。获得高质量、可用于机器学习建模的图像数据。",
+                "深入研究并理解利用卫星遥感数据结合人口与健康调查（DHS）数据，通过机器学习估测非洲地区儿童多维贫困水平。学习并掌握了多维贫困框架，包含住房、卫生、水源、营养、教育和健康等六个维度。",
+                "建立并优化高性能计算（HPC）环境，熟练掌握 SLURM 任务调度系统与 GPU 资源分配，处理和分析大规模卫星图像数据，成功搭建了从数据下载到模型训练的完整技术框架，并撰写详细技术文档供团队与后续研究者参考。"
+              ],
+              "responsibilities": [
+                "深入研究并理解利用卫星遥感数据结合人口与健康调查（DHS）数据，通过机器学习估测非洲地区儿童多维贫困水平。学习并掌握了多维贫困框架，包含住房、卫生、水源、营养、教育和健康等六个维度。",
+                "建立并优化高性能计算（HPC）环境，熟练掌握 SLURM 任务调度系统与 GPU 资源分配，处理和分析大规模卫星图像数据，成功搭建了从数据下载到模型训练的完整技术框架，并撰写详细技术文档供团队与后续研究者参考。",
+                "实施数据处理管道，熟悉 Google Earth Engine（GEE）API，整合 Sentinel-2 和 Landsat 卫星图像数据，完成云层遮挡去除、影像拼接及数据预处理步骤，获得高质量、可用于机器学习建模的图像数据。",
+                "复现并测试多个前沿深度学习模型，包括 SatMAE、DINOv2、Swin Transformer，进行空间交叉验证，严格对比模型预测性能，分析模型在空间预测和时间预测任务中的表现。"
+              ],
+              "achievements": [
+                "成功搭建了从数据下载到模型训练的完整技术框架，并撰写详细技术文档供团队与后续研究者参考。",
+                "获得高质量、可用于机器学习建模的图像数据。"
+              ],
+              "projects": [
+                {
+                  "name": "基于卫星图像的儿童贫困估测",
+                  "company": "布里斯托大学",
+                  "role": "科研实习",
+                  "period": "05/2025 – 至今",
+                  "description": "基于卫星图像的儿童贫困估测",
+                  "function_description": "基于卫星图像的儿童贫困估测",
+                  "result_description": "成功搭建了从数据下载到模型训练的完整技术框架，并撰写详细技术文档供团队与后续研究者参考。获得高质量、可用于机器学习建模的图像数据。",
+                  "bullets": [
+                    "深入研究并理解利用卫星遥感数据结合人口与健康调查（DHS）数据，通过机器学习估测非洲地区儿童多维贫困水平。学习并掌握了多维贫困框架，包含住房、卫生、水源、营养、教育和健康等六个维度。",
+                    "建立并优化高性能计算（HPC）环境，熟练掌握SLURM任务调度系统与GPU资源分配，处理和分析大规模卫星图像数据，成功搭建了从数据下载到模型训练的完整技术框架，并撰写详细技术文档供团队与后续研究者参考。",
+                    "实施数据处理管道，熟悉Google Earth Engine（GEE）API，整合Sentinel-2和Landsat卫星图像数据，完成云层遮挡去除、影像拼接及数据预处理步骤，获得高质量、可用于机器学习建模的图像数据。",
+                    "复现并测试多个前沿深度学习模型，包括SatMAE、DINOv2、Swin Transformer，进行空间交叉验证，严格对比模型预测性能，分析模型在空间预测和时间预测任务中的表现。"
+                  ],
+                  "tech_stack": [
+                    "SLURM",
+                    "GPU",
+                    "Google Earth Engine (GEE)",
+                    "Sentinel-2",
+                    "Landsat",
+                    "SatMAE",
+                    "DINOv2",
+                    "Swin Transformer"
+                  ]
+                }
+              ],
+              "start_date": "05-2025",
+              "end_date": "至今"
+            },
+            {
+              "company": "布里斯托大学",
+              "role": "研究助理",
+              "team": "使用图论和 Shapley 值减少数据集中的索引冗余",
+              "period": "11-2024 - 03-2025",
+              "function_description": "使用图论和 Shapley 值减少数据集中的索引冗余",
+              "result_description": "通过实验验证，采用该方法后，在不降低模型准确率的前提下，减少数据量，显著降低计算成本并提高模型训练效率。",
+              "bullets": [
+                "使用图论和 Shapley 值减少数据集中的索引冗余",
+                "通过实验验证，采用该方法后，在不降低模型准确率的前提下，减少数据量，显著降低计算成本并提高模型训练效率。",
+                "研究如何减少机器学习数据集中重复或无用的信息，提高数据质量和模型训练效率。",
+                "采用图论方法，构建数据点网络，将数据点表示为图的顶点，并利用欧几里得距离、余弦相似度等度量方法识别数据集中的冗余数据。"
+              ],
+              "responsibilities": [
+                "研究如何减少机器学习数据集中重复或无用的信息，提高数据质量和模型训练效率。",
+                "采用图论方法，构建数据点网络，将数据点表示为图的顶点，并利用欧几里得距离、余弦相似度等度量方法识别数据集中的冗余数据。",
+                "使用 Shapley 值（合作博弈论方法）计算每个数据点的相对重要性，筛选出影响最小的样本，去除低贡献数据点，从而优化数据集规模。",
+                "通过实验验证，采用该方法后，在不降低模型准确率的前提下，减少数据量，显著降低计算成本并提高模型训练效率。",
+                "撰写技术文档，记录实验结果和方法论，供研究团队参考，并协助导师准备相关论文材料。"
+              ],
+              "achievements": [
+                "通过实验验证，采用该方法后，在不降低模型准确率的前提下，减少数据量，显著降低计算成本并提高模型训练效率。"
+              ],
+              "projects": [],
+              "start_date": "11-2024",
+              "end_date": "03-2025"
+            }
+          ],
+          "projects": [
+            {
+              "name": "城市交通流量预测系统",
+              "company": "牛津大学",
+              "role": "研究项目",
+              "period": "07/2024 – 10/2024",
+              "description": "研究并对比 Random Forest、XGBoost、LSTM 等机器学习与深度学习方法，探索其在城市交通流量预测中的适用性。",
+              "function_description": "研究并对比 Random Forest、XGBoost、LSTM 等机器学习与深度学习方法，探索其在城市交通流量预测中的适用性。",
+              "result_description": "研究成果在学术会议上展示，并撰写研究论文，该论文已通过审批，即将发表。",
+              "bullets": [
+                "负责数据预处理，包括数据清洗、特征工程、异常值检测、归一化等，确保输入数据质量，以提升模型的泛化能力。",
+                "设计实验方案，采用 MAE、RMSE 和 R² 评估不同模型的预测效果，针对表现较差的模型进行超参数优化，提高预测精度。",
+                "研究成果在学术会议上展示，并撰写研究论文，该论文已通过审批，即将发表。"
+              ],
+              "tech_stack": [
+                "Random Forest",
+                "XGBoost",
+                "LSTM"
+              ]
+            },
+            {
+              "name": "城市交通流量预测系统",
+              "company": "牛津大学",
+              "role": "研究项目",
+              "period": "07/2024 – 10/2024",
+              "description": "研究并对比 Random Forest、XGBoost、LSTM 等机器学习与深度学习方法，探索其在城市交通流量预测中的适用性。",
+              "function_description": "研究并对比 Random Forest、XGBoost、LSTM 等机器学习与深度学习方法，探索其在城市交通流量预测中的适用性。",
+              "result_description": "研究成果在学术会议上展示，并撰写研究论文，该论文已通过审批，即将发表。",
+              "bullets": [
+                "负责数据预处理，包括数据清洗、特征工程、异常值检测、归一化等，确保输入数据质量，以提升模型的泛化能力。",
+                "设计实验方案，采用 MAE、RMSE 和 R² 评估不同模型的预测效果，针对表现较差的模型进行超参数优化，提高预测精度。",
+                "研究成果在学术会议上展示，并撰写研究论文，该论文已通过审批，即将发表。"
+              ],
+              "tech_stack": [
+                "Random Forest",
+                "XGBoost",
+                "LSTM"
+              ]
+            },
+            {
+              "name": "基于卫星图像的儿童贫困估测",
+              "company": "布里斯托大学",
+              "role": "科研实习",
+              "period": "05/2025 – 至今",
+              "description": "基于卫星图像的儿童贫困估测",
+              "function_description": "基于卫星图像的儿童贫困估测",
+              "result_description": "成功搭建了从数据下载到模型训练的完整技术框架，并撰写详细技术文档供团队与后续研究者参考。获得高质量、可用于机器学习建模的图像数据。",
+              "bullets": [
+                "深入研究并理解利用卫星遥感数据结合人口与健康调查（DHS）数据，通过机器学习估测非洲地区儿童多维贫困水平。学习并掌握了多维贫困框架，包含住房、卫生、水源、营养、教育和健康等六个维度。",
+                "建立并优化高性能计算（HPC）环境，熟练掌握 SLURM 任务调度系统与 GPU 资源分配，处理和分析大规模卫星图像数据，成功搭建了从数据下载到模型训练的完整技术框架，并撰写详细技术文档供团队与后续研究者参考。",
+                "实施数据处理管道，熟悉 Google Earth Engine（GEE）API，整合 Sentinel-2 和 Landsat 卫星图像数据，完成云层遮挡去除、影像拼接及数据预处理步骤，获得高质量、可用于机器学习建模的图像数据。",
+                "复现并测试多个前沿深度学习模型，包括 SatMAE、DINOv2、Swin Transformer，进行空间交叉验证，严格对比模型预测性能，分析模型在空间预测和时间预测任务中的表现。"
+              ],
+              "tech_stack": [
+                "SLURM",
+                "GPU",
+                "Google Earth Engine (GEE)",
+                "Sentinel-2",
+                "Landsat",
+                "SatMAE",
+                "DINOv2",
+                "Swin Transformer"
+              ]
+            },
+            {
+              "name": "城市交通流量预测系统",
+              "company": "牛津大学",
+              "role": "研究项目",
+              "period": "07/2024 – 10/2024",
+              "description": "研究并对比 Random Forest、XGBoost、LSTM 等机器学习与深度学习方法，探索其在城市交通流量预测中的适用性。",
+              "function_description": "研究并对比 Random Forest、XGBoost、LSTM 等机器学习与深度学习方法，探索其在城市交通流量预测中的适用性。",
+              "result_description": "研究成果在学术会议上展示，并撰写研究论文，该论文已通过审批，即将发表。",
+              "bullets": [
+                "负责数据预处理，包括数据清洗、特征工程、异常值检测、归一化等，确保输入数据质量，以提升模型的泛化能力。",
+                "设计实验方案，采用 MAE、RMSE 和 R² 评估不同模型的预测效果，针对表现较差的模型进行超参数优化，提高预测精度。",
+                "研究成果在学术会议上展示，并撰写研究论文，该论文已通过审批，即将发表。"
+              ],
+              "tech_stack": [
+                "Random Forest",
+                "XGBoost",
+                "LSTM"
+              ]
+            },
+            {
+              "name": "研究项目",
+              "period": "",
+              "description": "",
+              "bullets": [
+                "城市交通流量预测系统指导老师：牛津大学教授 Patrick Rebeshini",
+                "研究并对比 Random Forest、XGBoost、LSTM 等机器学习与深度学习方法，探索其在城市交通流量预测中的适用性。 07/2024 – 10/2024",
+                "负责数据预处理，包括数据清洗、特征工程、异常值检测、归一化等，确保输入数据质量，以提升模型的泛化能力。",
+                "设计实验方案，采用 MAE、RMSE 和 R² 评估不同模型的预测效果，针对表现较差的模型进行超参数优化，提高预测精度。",
+                "研究成果在学术会议上展示，并撰写研究论文，该论文已通过审批，即将发表。"
+              ],
+              "tech_stack": [
+                "SLURM",
+                "GPU",
+                "Google Earth Engine (GEE)",
+                "Sentinel-2",
+                "Landsat",
+                "SatMAE",
+                "DINOv2",
+                "Swin Transformer"
+              ]
+            },
+            {
+              "name": "”俄罗斯方块“移动游戏开发",
+              "period": "",
+              "description": "",
+              "bullets": [
+                "构思并开发面向用户的安卓俄罗斯方块游戏，重点关注其核心游戏机制。 03/2021 – 05/2021",
+                "应对 UI 设计挑战：设置游戏边界、旋转不同的方块、消除填满的行列以及确定游戏结束条件场景。"
+              ],
+              "tech_stack": [
+                "图论",
+                "Shapley 值",
+                "欧几里得距离",
+                "余弦相似度"
+              ]
+            }
+          ],
+          "education": [
+            {
+              "school": "布里斯托大学",
+              "degree": "BSc Data Science",
+              "major": "数据科学",
+              "period": "本科",
+              "highlights": []
+            },
+            {
+              "school": "牛津大学",
+              "degree": "",
+              "major": "",
+              "period": "",
+              "highlights": []
+            }
+          ],
+          "skills": {
+            "languages": [
+              "Python",
+              "Java",
+              "C++"
+            ],
+            "frameworks": [
+              "Pytorch",
+              "TensorFlow"
+            ],
+            "tools": [
+              "Excel",
+              "SQL",
+              "PowerPoint",
+              "Word",
+              "Pytorch",
+              "TensorFlow"
+            ],
+            "domains": [
+              "数据分析"
+            ]
+          },
+          "publications": [
+            {
+              "title": "scikit-learn、TensorFlow、PyTorch 等 (R C++ Java Pascal)",
+              "venue": "",
+              "year": "",
+              "authors": ""
+            },
+            {
+              "title": "布里斯托大学/University of Bristol, 数据科学/BSc Data Science",
+              "venue": "",
+              "year": "",
+              "authors": ""
+            }
+          ],
+          "honors": [
+            "- 实施数据处理管道，熟悉 Google Earth Engine（GEE）API，整合 Sentinel-2 和 Landsat 卫星图像数据，完成云层遮挡去除、影像拼接及数据预处理步骤，获得高质量、可用于机器学习建模的图像数据。"
+          ],
+          "awards": [],
+          "certifications": [],
+          "personal_skills": [],
+          "additional_sections": {},
+          "fact_sources": {
+            "raw_input": "query/cv",
+            "jd_usage": "JD only used for direction; facts must come from query/cv."
+          }
+        },
+        "draft_id": "46ecf8948c",
+        "version": 1
+      }
+    },
+    {
+      "id": "S2-QUERY-AI-004",
+      "ok": true,
+      "status": 200,
+      "elapsed_s": 12.123,
+      "score": 42.0,
+      "score_breakdown": {
+        "fabrication": 100,
+        "readability": 5.0,
+        "completeness": 26.0,
+        "expression": 5.0,
+        "response": 6.0,
+        "total": 42.0
+      },
+      "scenario": "scenario2",
+      "industry": "other",
+      "user_stage": "student",
+      "missing_count": 1,
+      "conflict_count": 0,
+      "docx": "/mnt/disk1/zengzhitao/resume-copilot-server-acceptance/output/简历_陈星野_优化版.docx",
+      "reply_text": "已按“个人信息生成标准简历”完成一版可编辑 DOCX，识别方向为综合，用户阶段为student。\n根据您提供的个人描述，建议投递AI 算法研究相关岗位\n当前自动评分为 42.0/100。\n需要补充：工作经历/实习经历/项目经历不可全部为空，请至少补充一项经历\n建议优先补齐联系方式、教育时间、经历成果和可量化结果，再用于正式投递。",
+      "validation_failures": [
+        "industry_mismatch:other!=internet"
+      ],
+      "raw": {
+        "files": {
+          "docx": "/mnt/disk1/zengzhitao/resume-copilot-server-acceptance/output/简历_陈星野_优化版.docx",
+          "pdf": null
+        },
+        "reply_text": "已按“个人信息生成标准简历”完成一版可编辑 DOCX，识别方向为综合，用户阶段为student。\n根据您提供的个人描述，建议投递AI 算法研究相关岗位\n当前自动评分为 42.0/100。\n需要补充：工作经历/实习经历/项目经历不可全部为空，请至少补充一项经历\n建议优先补齐联系方式、教育时间、经历成果和可量化结果，再用于正式投递。",
+        "score": {
+          "fabrication": 100,
+          "readability": 5.0,
+          "completeness": 26.0,
+          "expression": 5.0,
+          "response": 6.0,
+          "total": 42.0
+        },
+        "missing_fields": [
+          {
+            "field": "experience/projects",
+            "label": "经历",
+            "reason": "工作经历/实习经历/项目经历不可全部为空，请至少补充一项经历"
+          }
+        ],
+        "conflicts": [],
+        "scenario": "scenario2",
+        "industry": "other",
+        "user_stage": "student",
+        "perf": {
+          "jd_resolve_s": 0.0,
+          "classify_s": 1.148,
+          "structured_resume_s": 1.112,
+          "_classify_fix_user_stage_s": 2.261,
+          "validation_s": 0.0,
+          "export_files_s": 0.053,
+          "draft_s": 0.0,
+          "total_s": 12.121
+        },
+        "score_breakdown": {
+          "fabrication": 100,
+          "readability": 5.0,
+          "completeness": 26.0,
+          "expression": 5.0,
+          "response": 6.0,
+          "total": 42.0
+        },
+        "ocr_warnings": [],
+        "user_report": {
+          "generation_direction": "根据您提供的个人描述，建议投递AI 算法研究相关岗位",
+          "missing_field_suggestions": [
+            {
+              "field": "experience/projects",
+              "label": "经历",
+              "reason": "工作经历/实习经历/项目经历不可全部为空，请至少补充一项经历"
+            }
+          ],
+          "conflict_confirmations": [],
+          "ocr_warnings": [],
+          "template_notes": []
+        },
+        "resume_data": {
+          "meta": {
+            "name": "陈星野",
+            "age": "",
+            "gender": "",
+            "email": "chenxingye@example.com",
+            "phone": "13500001001",
+            "wechat": "",
+            "github": "",
+            "linkedin": "",
+            "website": "",
+            "education_level": "硕士",
+            "work_experience": "在校生",
+            "political_status": "",
+            "expected_city": "",
+            "target_role": "AI 算法研究",
+            "job_intention": "希望做AI算法研究"
+          },
+          "summary": "北京大学计算机硕士，专注大语言模型研究，具备RLHF与Prompt Engineering项目经验，掌握PyTorch与Python，致力于AI算法研究。",
+          "experience": [],
+          "projects": [],
+          "education": [
+            {
+              "school": "北京大学",
+              "degree": "硕士",
+              "major": "计算机科学与技术",
+              "period": "09-2023 - 06-2025",
+              "highlights": [
+                "研究方向为大语言模型"
+              ],
+              "start_date": "09-2023",
+              "end_date": "06-2025"
+            }
+          ],
+          "skills": {
+            "languages": [
+              "Python"
+            ],
+            "frameworks": [],
+            "tools": [
+              "Pytorch"
+            ],
+            "domains": []
+          },
+          "publications": [],
+          "honors": [],
+          "awards": [],
+          "certifications": [],
+          "personal_skills": [],
+          "additional_sections": {},
+          "fact_sources": {
+            "raw_input": "query/cv",
+            "jd_usage": "JD only used for direction; facts must come from query/cv."
+          }
+        },
+        "draft_id": "760b9a5841",
+        "version": 1
+      }
+    },
+    {
+      "id": "S2-QUERY-SPR-005",
+      "ok": true,
+      "status": 200,
+      "elapsed_s": 12.23,
+      "score": 58.2,
+      "score_breakdown": {
+        "fabrication": 100,
+        "readability": 7.5,
+        "completeness": 30.0,
+        "expression": 16.7,
+        "response": 4.0,
+        "total": 58.2
+      },
+      "scenario": "scenario2",
+      "industry": "other",
+      "user_stage": "experienced",
+      "missing_count": 0,
+      "conflict_count": 0,
+      "docx": "/mnt/disk1/zengzhitao/resume-copilot-server-acceptance/output/简历_李明远_优化版.docx",
+      "reply_text": "已按“个人信息生成标准简历”完成一版可编辑 DOCX，识别方向为综合，用户阶段为experienced。\n根据您提供的个人描述，建议投递语音算法工程师相关岗位\n当前自动评分为 58.2/100。\n建议优先补齐联系方式、教育时间、经历成果和可量化结果，再用于正式投递。",
+      "validation_failures": [
+        "industry_mismatch:other!=internet"
+      ],
+      "raw": {
+        "files": {
+          "docx": "/mnt/disk1/zengzhitao/resume-copilot-server-acceptance/output/简历_李明远_优化版.docx",
+          "pdf": null
+        },
+        "reply_text": "已按“个人信息生成标准简历”完成一版可编辑 DOCX，识别方向为综合，用户阶段为experienced。\n根据您提供的个人描述，建议投递语音算法工程师相关岗位\n当前自动评分为 58.2/100。\n建议优先补齐联系方式、教育时间、经历成果和可量化结果，再用于正式投递。",
+        "score": {
+          "fabrication": 100,
+          "readability": 7.5,
+          "completeness": 30.0,
+          "expression": 16.7,
+          "response": 4.0,
+          "total": 58.2
+        },
+        "missing_fields": [],
+        "conflicts": [],
+        "scenario": "scenario2",
+        "industry": "other",
+        "user_stage": "experienced",
+        "perf": {
+          "jd_resolve_s": 0.0,
+          "classify_s": 1.263,
+          "structured_resume_s": 2.231,
+          "_classify_fix_user_stage_s": 3.494,
+          "validation_s": 0.001,
+          "export_files_s": 0.034,
+          "draft_s": 0.0,
+          "total_s": 12.228
+        },
+        "score_breakdown": {
+          "fabrication": 100,
+          "readability": 7.5,
+          "completeness": 30.0,
+          "expression": 16.7,
+          "response": 4.0,
+          "total": 58.2
+        },
+        "ocr_warnings": [],
+        "user_report": {
+          "generation_direction": "根据您提供的个人描述，建议投递语音算法工程师相关岗位",
+          "missing_field_suggestions": [],
+          "conflict_confirmations": [],
+          "ocr_warnings": [],
+          "template_notes": []
+        },
+        "resume_data": {
+          "meta": {
+            "name": "李明远",
+            "age": "",
+            "gender": "",
+            "email": "limingyuan@example.com",
+            "phone": "13800002002",
+            "wechat": "",
+            "github": "",
+            "linkedin": "",
+            "website": "",
+            "education_level": "博士",
+            "work_experience": "1 年",
+            "political_status": "",
+            "expected_city": "",
+            "target_role": "语音算法工程师",
+            "job_intention": "语音算法工程师"
+          },
+          "summary": "华中科技大学博士，专注语音识别研究。具备端侧ASR模型优化经验，熟悉C++、Python、TensorRT。致力于在语音算法领域深耕，推动技术落地。",
+          "experience": [
+            {
+              "company": "科大讯飞",
+              "role": "",
+              "team": "",
+              "period": "01-2023",
+              "function_description": "负责端侧ASR模型优化",
+              "result_description": "",
+              "bullets": [
+                "负责端侧ASR模型优化"
+              ],
+              "responsibilities": [
+                "负责端侧ASR模型优化"
+              ],
+              "achievements": [],
+              "projects": [],
+              "start_date": "01-2023"
+            }
+          ],
+          "projects": [],
+          "education": [
+            {
+              "school": "华中科技大学",
+              "degree": "博士",
+              "major": "计算机",
+              "period": "01-2019",
+              "highlights": [
+                "2019年至2024年做语音识别研究"
+              ],
+              "start_date": "01-2019"
+            }
+          ],
+          "skills": {
+            "languages": [
+              "C++",
+              "Python"
+            ],
+            "frameworks": [
+              "TensorRT"
+            ],
+            "tools": [],
+            "domains": []
+          },
+          "publications": [],
+          "honors": [],
+          "awards": [],
+          "certifications": [],
+          "personal_skills": [
+            "语音识别研究",
+            "端侧ASR模型优化"
+          ],
+          "additional_sections": {},
+          "fact_sources": {
+            "raw_input": "query/cv",
+            "jd_usage": "JD only used for direction; facts must come from query/cv."
+          }
+        },
+        "draft_id": "e2e8629484",
+        "version": 1
+      }
+    },
+    {
+      "id": "S2-QUERY-GEO-006",
+      "ok": true,
+      "status": 200,
+      "elapsed_s": 28.361,
+      "score": 38.5,
+      "score_breakdown": {
+        "fabrication": 100,
+        "readability": 6.5,
+        "completeness": 16.0,
+        "expression": 10.0,
+        "response": 6.0,
+        "total": 38.5
+      },
+      "scenario": "scenario2",
+      "industry": "other",
+      "user_stage": "experienced",
+      "missing_count": 4,
+      "conflict_count": 0,
+      "docx": "/mnt/disk1/zengzhitao/resume-copilot-server-acceptance/output/简历__优化版.docx",
+      "reply_text": "已按“个人信息生成标准简历”完成一版可编辑 DOCX，识别方向为综合，用户阶段为experienced。\n建议明确目标岗位方向以优化简历\n当前自动评分为 38.5/100。\n需要补充：姓名为必填项，请在简历中补充；联系电话为必填项，请在简历中补充；邮箱为必填项，请在简历中补充；工作经历第1段缺少必填信息（公司名称/岗位/时间），请补充\n建议优先补齐联系方式、教育时间、经历成果和可量化结果，再用于正式投递。",
+      "validation_failures": [
+        "missing_field_not_reported:education.school",
+        "missing_field_not_reported:education.period"
+      ],
+      "raw": {
+        "files": {
+          "docx": "/mnt/disk1/zengzhitao/resume-copilot-server-acceptance/output/简历__优化版.docx",
+          "pdf": null
+        },
+        "reply_text": "已按“个人信息生成标准简历”完成一版可编辑 DOCX，识别方向为综合，用户阶段为experienced。\n建议明确目标岗位方向以优化简历\n当前自动评分为 38.5/100。\n需要补充：姓名为必填项，请在简历中补充；联系电话为必填项，请在简历中补充；邮箱为必填项，请在简历中补充；工作经历第1段缺少必填信息（公司名称/岗位/时间），请补充\n建议优先补齐联系方式、教育时间、经历成果和可量化结果，再用于正式投递。",
+        "score": {
+          "fabrication": 100,
+          "readability": 6.5,
+          "completeness": 16.0,
+          "expression": 10.0,
+          "response": 6.0,
+          "total": 38.5
+        },
+        "missing_fields": [
+          {
+            "field": "meta.name",
+            "label": "姓名",
+            "reason": "姓名为必填项，请在简历中补充"
+          },
+          {
+            "field": "meta.phone",
+            "label": "联系电话",
+            "reason": "联系电话为必填项，请在简历中补充"
+          },
+          {
+            "field": "meta.email",
+            "label": "邮箱",
+            "reason": "邮箱为必填项，请在简历中补充"
+          },
+          {
+            "field": "experience[0]",
+            "label": "工作经历",
+            "reason": "工作经历第1段缺少必填信息（公司名称/岗位/时间），请补充"
+          }
+        ],
+        "conflicts": [],
+        "scenario": "scenario2",
+        "industry": "other",
+        "user_stage": "experienced",
+        "perf": {
+          "jd_resolve_s": 0.0,
+          "classify_s": 1.004,
+          "structured_resume_s": 2.283,
+          "_classify_fix_user_stage_s": 3.288,
+          "validation_s": 0.0,
+          "export_files_s": 0.036,
+          "draft_s": 0.0,
+          "total_s": 28.358
+        },
+        "score_breakdown": {
+          "fabrication": 100,
+          "readability": 6.5,
+          "completeness": 16.0,
+          "expression": 10.0,
+          "response": 6.0,
+          "total": 38.5
+        },
+        "ocr_warnings": [],
+        "user_report": {
+          "generation_direction": "建议明确目标岗位方向以优化简历",
+          "missing_field_suggestions": [
+            {
+              "field": "meta.name",
+              "label": "姓名",
+              "reason": "姓名为必填项，请在简历中补充"
+            },
+            {
+              "field": "meta.phone",
+              "label": "联系电话",
+              "reason": "联系电话为必填项，请在简历中补充"
+            },
+            {
+              "field": "meta.email",
+              "label": "邮箱",
+              "reason": "邮箱为必填项，请在简历中补充"
+            },
+            {
+              "field": "experience[0]",
+              "label": "工作经历",
+              "reason": "工作经历第1段缺少必填信息（公司名称/岗位/时间），请补充"
+            }
+          ],
+          "conflict_confirmations": [],
+          "ocr_warnings": [],
+          "template_notes": []
+        },
+        "resume_data": {
+          "meta": {
+            "name": "",
+            "age": "",
+            "gender": "",
+            "email": "",
+            "phone": "",
+            "wechat": "",
+            "github": "",
+            "linkedin": "",
+            "website": "",
+            "education_level": "博士",
+            "work_experience": "有",
+            "political_status": "",
+            "expected_city": "",
+            "target_role": "地理空间分析",
+            "job_intention": "想做地理空间分析"
+          },
+          "summary": "自然地理学博士，擅长地理空间分析与数据统计。具备ArcGIS、SPSS、Origin等工具使用能力，有中文核心论文发表及环保部项目经验，致力于地理空间分析领域发展。",
+          "experience": [
+            {
+              "company": "",
+              "role": "",
+              "team": "",
+              "period": "01-2015",
+              "function_description": "研究植硅体和植被动态",
+              "result_description": "发表过中文核心论文，在环保部项目做过数据统计",
+              "bullets": [
+                "研究植硅体和植被动态",
+                "发表过中文核心论文，在环保部项目做过数据统计",
+                "在环保部项目做数据统计",
+                "发表过中文核心论文"
+              ],
+              "responsibilities": [
+                "研究植硅体和植被动态",
+                "在环保部项目做数据统计"
+              ],
+              "achievements": [
+                "发表过中文核心论文"
+              ],
+              "projects": [],
+              "start_date": "01-2015"
+            }
+          ],
+          "projects": [],
+          "education": [
+            {
+              "school": "东北师范大学",
+              "degree": "博士",
+              "major": "自然地理学",
+              "period": "01-2015",
+              "highlights": [
+                "研究植硅体和植被动态"
+              ],
+              "start_date": "01-2015"
+            }
+          ],
+          "skills": {
+            "languages": [],
+            "frameworks": [],
+            "tools": [
+              "ArcGIS",
+              "SPSS",
+              "Origin"
+            ],
+            "domains": [
+              "地理空间分析",
+              "自然地理学"
+            ]
+          },
+          "publications": [],
+          "honors": [],
+          "awards": [],
+          "certifications": [],
+          "personal_skills": [
+            "地理空间分析",
+            "数据统计",
+            "植硅体研究",
+            "植被动态研究"
+          ],
+          "additional_sections": {},
+          "fact_sources": {
+            "raw_input": "query/cv",
+            "jd_usage": "JD only used for direction; facts must come from query/cv."
+          }
+        },
+        "draft_id": "6c568b7d4d",
+        "version": 1
+      }
+    },
+    {
+      "id": "S3-AI-CV-DOCX-007",
+      "ok": true,
+      "status": 200,
+      "elapsed_s": 113.502,
+      "score": 0.0,
+      "score_breakdown": {
+        "fabrication": 0,
+        "readability": 0.0,
+        "completeness": 0.0,
+        "expression": 0.0,
+        "response": 0.0,
+        "total": 0.0
+      },
+      "scenario": "scenario3",
+      "industry": "other",
+      "user_stage": "student",
+      "missing_count": 7,
+      "conflict_count": 1,
+      "docx": "/mnt/disk1/zengzhitao/resume-copilot-server-acceptance/output/简历_靳宏博_优化版.docx",
+      "reply_text": "已按“原始简历按目标岗位优化”完成一版可编辑 DOCX，识别方向为综合，用户阶段为student。\n根据您提供的个人描述，建议投递AI大模型研究相关岗位\n当前自动评分为 0.0/100。\n需要补充：联系电话为必填项，请在简历中补充；邮箱为必填项，请在简历中补充；项目经历第1段缺少所属公司/学校/组织，请补充；项目经历第2段缺少所属公司/学校/组织，请补充；项目经历第3段缺少所属公司/学校/组织，请补充\n需要确认：工作经历时间可能冲突：北大王选计算技术研究所（科研实习）(07-2023 - 08-2024) 与 北大王选计算技术研究所（科研实习）(07-2023 - 08-2024) 时间段有重叠，请确认是否为并行兼职/实习或时间填写有误\n建议优先补齐联系方式、教育时间、经历成果和可量化结果，再用于正式投递。",
+      "validation_failures": [
+        "industry_mismatch:other!=internet"
+      ],
+      "raw": {
+        "files": {
+          "docx": "/mnt/disk1/zengzhitao/resume-copilot-server-acceptance/output/简历_靳宏博_优化版.docx",
+          "pdf": null
+        },
+        "reply_text": "已按“原始简历按目标岗位优化”完成一版可编辑 DOCX，识别方向为综合，用户阶段为student。\n根据您提供的个人描述，建议投递AI大模型研究相关岗位\n当前自动评分为 0.0/100。\n需要补充：联系电话为必填项，请在简历中补充；邮箱为必填项，请在简历中补充；项目经历第1段缺少所属公司/学校/组织，请补充；项目经历第2段缺少所属公司/学校/组织，请补充；项目经历第3段缺少所属公司/学校/组织，请补充\n需要确认：工作经历时间可能冲突：北大王选计算技术研究所（科研实习）(07-2023 - 08-2024) 与 北大王选计算技术研究所（科研实习）(07-2023 - 08-2024) 时间段有重叠，请确认是否为并行兼职/实习或时间填写有误\n建议优先补齐联系方式、教育时间、经历成果和可量化结果，再用于正式投递。",
+        "score": {
+          "fabrication": 0,
+          "readability": 0.0,
+          "completeness": 0.0,
+          "expression": 0.0,
+          "response": 0.0,
+          "total": 0.0
+        },
+        "missing_fields": [
+          {
+            "field": "meta.phone",
+            "label": "联系电话",
+            "reason": "联系电话为必填项，请在简历中补充"
+          },
+          {
+            "field": "meta.email",
+            "label": "邮箱",
+            "reason": "邮箱为必填项，请在简历中补充"
+          },
+          {
+            "field": "projects[0].company",
+            "label": "项目归属",
+            "reason": "项目经历第1段缺少所属公司/学校/组织，请补充"
+          },
+          {
+            "field": "projects[1].company",
+            "label": "项目归属",
+            "reason": "项目经历第2段缺少所属公司/学校/组织，请补充"
+          },
+          {
+            "field": "projects[2].company",
+            "label": "项目归属",
+            "reason": "项目经历第3段缺少所属公司/学校/组织，请补充"
+          },
+          {
+            "field": "projects[3].company",
+            "label": "项目归属",
+            "reason": "项目经历第4段缺少所属公司/学校/组织，请补充"
+          },
+          {
+            "field": "projects[4].company",
+            "label": "项目归属",
+            "reason": "项目经历第5段缺少所属公司/学校/组织，请补充"
+          }
+        ],
+        "conflicts": [
+          {
+            "field": "experience",
+            "description": "工作经历时间可能冲突：北大王选计算技术研究所（科研实习）(07-2023 - 08-2024) 与 北大王选计算技术研究所（科研实习）(07-2023 - 08-2024) 时间段有重叠，请确认是否为并行兼职/实习或时间填写有误"
+          }
+        ],
+        "scenario": "scenario3",
+        "industry": "other",
+        "user_stage": "student",
+        "perf": {
+          "cv_extract_s": 0.008,
+          "jd_resolve_s": 0.0,
+          "classify_s": 1.26,
+          "structured_resume_s": 14.874,
+          "_classify_fix_user_stage_s": 16.134,
+          "optimize_s": 97.248,
+          "validation_s": 0.008,
+          "export_files_s": 0.1,
+          "draft_s": 0.0,
+          "total_s": 113.499
+        },
+        "score_breakdown": {
+          "fabrication": 0,
+          "readability": 0.0,
+          "completeness": 0.0,
+          "expression": 0.0,
+          "response": 0.0,
+          "total": 0.0
+        },
+        "ocr_warnings": [],
+        "user_report": {
+          "generation_direction": "根据您提供的个人描述，建议投递AI大模型研究相关岗位",
+          "missing_field_suggestions": [
+            {
+              "field": "meta.phone",
+              "label": "联系电话",
+              "reason": "联系电话为必填项，请在简历中补充"
+            },
+            {
+              "field": "meta.email",
+              "label": "邮箱",
+              "reason": "邮箱为必填项，请在简历中补充"
+            },
+            {
+              "field": "projects[0].company",
+              "label": "项目归属",
+              "reason": "项目经历第1段缺少所属公司/学校/组织，请补充"
+            },
+            {
+              "field": "projects[1].company",
+              "label": "项目归属",
+              "reason": "项目经历第2段缺少所属公司/学校/组织，请补充"
+            },
+            {
+              "field": "projects[2].company",
+              "label": "项目归属",
+              "reason": "项目经历第3段缺少所属公司/学校/组织，请补充"
+            },
+            {
+              "field": "projects[3].company",
+              "label": "项目归属",
+              "reason": "项目经历第4段缺少所属公司/学校/组织，请补充"
+            },
+            {
+              "field": "projects[4].company",
+              "label": "项目归属",
+              "reason": "项目经历第5段缺少所属公司/学校/组织，请补充"
+            }
+          ],
+          "conflict_confirmations": [
+            {
+              "field": "experience",
+              "description": "工作经历时间可能冲突：北大王选计算技术研究所（科研实习）(07-2023 - 08-2024) 与 北大王选计算技术研究所（科研实习）(07-2023 - 08-2024) 时间段有重叠，请确认是否为并行兼职/实习或时间填写有误"
+            }
+          ],
+          "ocr_warnings": [],
+          "template_notes": [],
+          "fabrication_details": [
+            {
+              "type": "date",
+              "content": "07-2023 - 08-2024",
+              "reason": "北大王选计算技术研究所时间未能在用户原始输入中找到对应依据"
+            },
+            {
+              "type": "date",
+              "content": "2023.07-2024.08",
+              "reason": "视频大模型复杂问题智能推理研究时间未能在用户原始输入中找到对应依据"
+            }
+          ]
+        },
+        "resume_data": {
+          "meta": {
+            "name": "靳宏博",
+            "age": "",
+            "gender": "",
+            "email": "",
+            "phone": "",
+            "wechat": "",
+            "github": "",
+            "linkedin": "",
+            "website": "",
+            "education_level": "博士",
+            "work_experience": "2年",
+            "political_status": "",
+            "expected_city": "",
+            "target_role": "AI大模型研究岗位",
+            "job_intention": "AI大模型研究岗位"
+          },
+          "summary": "2年综合方向候选人，目标投递AI大模型研究，具备大模型训练、计算机视觉、Git能力，可围绕过往经历补充量化成果。",
+          "experience": [
+            {
+              "company": "浙江大学滨江研究院",
+              "role": "科研实习",
+              "team": "",
+              "period": "03-2025 - 至今",
+              "function_description": "负责 3D 大模型相关科研，针对复杂场景理解问题，改进现有模型方法及相关评测标准，负责三维视觉前沿算法，模型架构设计，自主设计模型算法，推进自动驾驶感知研究。",
+              "result_description": "首次提出三维场景复杂推理评测集，并提出了一个新的 3D 思维链多跳标注方法。结合 GRPO 等相关强化学习算法，改进 3D LLM 训练效果，提升模型对三维场景的深度思考能力。目前论文已投稿 AAAI2026。",
+              "bullets": [
+                "负责 3D 大模型相关科研，针对复杂场景理解问题，改进现有模型方法及相关评测标准，负责三维视觉前沿算法，模型架构设计，自主设计模型算法，推进自动驾驶感知研究。",
+                "首次提出三维场景复杂推理评测集，并提出了一个新的 3D 思维链多跳标注方法。结合 GRPO 等相关强化学习算法，改进 3D LLM 训练效果，提升模型对三维场景的深度思考能力。目前论文已投稿 AAAI2026。",
+                "负责 3D 大模型相关科研",
+                "负责三维视觉前沿算法，模型架构设计"
+              ],
+              "responsibilities": [
+                "负责 3D 大模型相关科研",
+                "负责三维视觉前沿算法，模型架构设计",
+                "自主设计模型算法，推进自动驾驶感知研究"
+              ],
+              "achievements": [
+                "首次提出三维场景复杂推理评测集",
+                "提出了一个新的 3D 思维链多跳标注方法",
+                "结合 GRPO 等相关强化学习算法，改进 3D LLM 训练效果",
+                "提升模型对三维场景的深度思考能力"
+              ],
+              "projects": [
+                {
+                  "name": "3D 大模型复杂环境理解及深度推理研究",
+                  "company": "",
+                  "role": "",
+                  "period": "2025.03-至今",
+                  "description": "针对复杂场景理解问题，改进现有模型方法及相关评测标准，负责三维视觉前沿算法，模型架构设计，自主设计模型算法，推进自动驾驶感知研究。",
+                  "function_description": "",
+                  "result_description": "",
+                  "bullets": [
+                    "首次提出三维场景复杂推理评测集",
+                    "提出了一个新的3D思维链多跳标注方法",
+                    "结合GRPO等相关强化学习算法，改进3D LLM训练效果",
+                    "提升模型对三维场景的深度思考能力"
+                  ],
+                  "tech_stack": [
+                    "三维视觉",
+                    "自动驾驶感知",
+                    "GRPO",
+                    "强化学习"
+                  ]
+                }
+              ],
+              "start_date": "03-2025",
+              "end_date": "至今"
+            },
+            {
+              "company": "北大王选计算技术研究所",
+              "role": "科研实习",
+              "team": "",
+              "period": "07-2023 - 08-2024",
+              "function_description": "基于现有视频大模型和思维链技术，提出了首个非训练式视频复杂问题推理框架，实现了对于视频问题的多步拆解和推理验证。",
+              "result_description": "在 Egoschema、MVBench、VideoMMMU、VideoEspresso、PerceptionTest 五个视频数据集上刷新 sota，取得明显效果。目前论文已投 AAAI 2026，论文名 CoT-Vid: Dynamic Chain-of-Thought Routing with Self Verification for Training-Free Video Reasoning。",
+              "bullets": [
+                "基于现有视频大模型和思维链技术，提出了首个非训练式视频复杂问题推理框架，实现了对于视频问题的多步拆解和推理验证。",
+                "在 Egoschema、MVBench、VideoMMMU、VideoEspresso、PerceptionTest 五个视频数据集上刷新 sota，取得明显效果。目前论文已投 AAAI 2026，论文名 CoT-Vid: Dynamic Chain-of-Thought Routing with Self Verification for Training-Free Video Reasoning。",
+                "基于现有视频大模型和思维链技术，提出了首个非训练式视频复杂问题推理框架",
+                "实现了对于视频问题的多步拆解和推理验证"
+              ],
+              "responsibilities": [
+                "基于现有视频大模型和思维链技术，提出了首个非训练式视频复杂问题推理框架",
+                "实现了对于视频问题的多步拆解和推理验证"
+              ],
+              "achievements": [
+                "在 Egoschema、MVBench、VideoMMMU、VideoEspresso、PerceptionTest 五个视频数据集上刷新 sota",
+                "目前论文已投 AAAI 2026，论文名 CoT-Vid: Dynamic Chain-of-Thought Routing with Self Verification for Training-Free Video Reasoning"
+              ],
+              "projects": [
+                {
+                  "name": "视频大模型复杂问题智能推理研究",
+                  "company": "",
+                  "role": "",
+                  "period": "2023.07-2024.08",
+                  "description": "基于现有视频大模型和思维链技术，提出了首个非训练式视频复杂问题推理框架，实现了对于视频问题的多步拆解和推理验证。",
+                  "function_description": "",
+                  "result_description": "",
+                  "bullets": [
+                    "在Egoschema、MVBench、VideoMMMU、VideoEspresso、PerceptionTest五个视频数据集上刷新sota",
+                    "目前论文已投AAAI 2026，论文名 CoT-Vid: Dynamic Chain-of-Thought Routing with Self Verification for Training-Free Video Reasoning"
+                  ],
+                  "tech_stack": [
+                    "视频大模型",
+                    "思维链技术",
+                    "非训练式推理框架"
+                  ]
+                },
+                {
+                  "name": "利用场景定位帧组增强长视频细节感知能力",
+                  "company": "",
+                  "role": "",
+                  "period": "2023.07-2024.08",
+                  "description": "受人类感知和理解视频方式的启发，提出了 SLFG（Scene-Localized Frame Grouping），它将单个帧分组为具有凝聚力的场景帧，通过更高层次的语义表征来减少帧冗余，在多个视频数据集上取得明显效果。目前论文已投稿 AAAI 2026，论文名：Enhancing Long Video Detail Perception with Scene-Localized Frame Grouping。",
+                  "function_description": "",
+                  "result_description": "",
+                  "bullets": [
+                    "受人类感知和理解视频方式的启发，提出了 SLFG（Scene-Localized Frame Grouping）",
+                    "它将单个帧分组为具有凝聚力的场景帧，通过更高层次的语义表征来减少帧冗余",
+                    "在多个视频数据集上取得明显效果",
+                    "目前论文已投稿AAAI 2026，论文名：Enhancing Long Video Detail Perception with Scene-Localized Frame Grouping"
+                  ],
+                  "tech_stack": [
+                    "SLFG",
+                    "场景定位帧组",
+                    "视频细节感知"
+                  ]
+                },
+                {
+                  "name": "基于 Occupancy 场景表征的时序增强网络（自动驾驶感知）",
+                  "company": "",
+                  "role": "",
+                  "period": "2023.07-2024.08",
+                  "description": "在自动驾驶感知领域，重点研究分析了基于 Occupancy 网格表征的时序增强方法，刷新了现有方法精度，推进自动驾驶感知领域发展。",
+                  "function_description": "",
+                  "result_description": "",
+                  "bullets": [
+                    "在自动驾驶感知领域，重点研究分析了基于Occupancy网格表征的时序增强方法",
+                    "刷新了现有方法精度，推进自动驾驶感知领域发展"
+                  ],
+                  "tech_stack": [
+                    "Occupancy网格表征",
+                    "时序增强",
+                    "自动驾驶感知"
+                  ]
+                }
+              ],
+              "start_date": "07-2023",
+              "end_date": "08-2024"
+            },
+            {
+              "company": "北大王选计算技术研究所",
+              "role": "科研实习",
+              "team": "",
+              "period": "07-2023 - 08-2024",
+              "function_description": "在自动驾驶感知领域，重点研究分析了基于 Occupancy 网格表征的时序增强方法，刷新了现有方法精度，推进自动驾驶感知领域发展。",
+              "result_description": "论文成果已发表在 ECAI2024，论文名 TEOcc：Multimodal Occupancy Prediction via Temporal Enhancement。",
+              "bullets": [
+                "在自动驾驶感知领域，重点研究分析了基于 Occupancy 网格表征的时序增强方法，刷新了现有方法精度，推进自动驾驶感知领域发展。",
+                "论文成果已发表在 ECAI2024，论文名 TEOcc：Multimodal Occupancy Prediction via Temporal Enhancement。",
+                "在自动驾驶感知领域，重点研究分析了基于 Occupancy 网格表征的时序增强方法",
+                "刷新了现有方法精度，推进自动驾驶感知领域发展"
+              ],
+              "responsibilities": [
+                "在自动驾驶感知领域，重点研究分析了基于 Occupancy 网格表征的时序增强方法",
+                "刷新了现有方法精度，推进自动驾驶感知领域发展"
+              ],
+              "achievements": [
+                "论文成果已发表在 ECAI2024，论文名 TEOcc：Multimodal Occupancy Prediction via Temporal Enhancement"
+              ],
+              "projects": [],
+              "start_date": "07-2023",
+              "end_date": "08-2024"
+            }
+          ],
+          "projects": [
+            {
+              "name": "视频大模型复杂问题智能推理研究",
+              "company": "",
+              "role": "",
+              "period": "2023.07-2024.08",
+              "description": "基于现有视频大模型和思维链技术，提出了首个非训练式视频复杂问题推理框架，实现了对于视频问题的多步拆解和推理验证。",
+              "function_description": "",
+              "result_description": "",
+              "bullets": [
+                "在 Egoschema、MVBench、VideoMMMU、VideoEspresso、PerceptionTest 五个视频数据集上刷新 sota",
+                "目前论文已投 AAAI 2026，论文名 CoT-Vid: Dynamic Chain-of-Thought Routing with Self Verification for Training-Free Video Reasoning"
+              ],
+              "tech_stack": [
+                "视频大模型",
+                "思维链技术",
+                "非训练式推理框架"
+              ]
+            },
+            {
+              "name": "利用场景定位帧组增强长视频细节感知能力",
+              "company": "",
+              "role": "",
+              "period": "2023.07-2024.08",
+              "description": "受人类感知和理解视频方式的启发，提出了 SLFG（Scene-Localized Frame Grouping），它将单个帧分组为具有凝聚力的场景帧，通过更高层次的语义表征来减少帧冗余，在多个视频数据集上取得明显效果。目前论文已投稿 AAAI 2026，论文名：Enhancing Long Video Detail Perception with Scene-Localized Frame Grouping。",
+              "function_description": "",
+              "result_description": "",
+              "bullets": [
+                "受人类感知和理解视频方式的启发，提出了 SLFG（Scene-Localized Frame Grouping）",
+                "它将单个帧分组为具有凝聚力的场景帧，通过更高层次的语义表征来减少帧冗余",
+                "在多个视频数据集上取得明显效果",
+                "目前论文已投稿 AAAI 2026，论文名：Enhancing Long Video Detail Perception with Scene-Localized Frame Grouping"
+              ],
+              "tech_stack": [
+                "SLFG",
+                "场景定位帧组",
+                "视频细节感知"
+              ]
+            },
+            {
+              "name": "TEOcc：Multimodal Occupancy Prediction via Temporal Enhancement",
+              "company": "",
+              "role": "",
+              "period": "2024",
+              "description": "论文成果已发表在 ECAI2024，论文名 TEOcc：Multimodal Occupancy Prediction via Temporal Enhancement。",
+              "function_description": "",
+              "result_description": "",
+              "bullets": [
+                "论文成果已发表在 ECAI2024"
+              ],
+              "tech_stack": []
+            }
+          ],
+          "education": [
+            {
+              "school": "北京大学",
+              "degree": "博士",
+              "major": "计算机科学与技术",
+              "period": "01-2025",
+              "highlights": [],
+              "start_date": "01-2025"
+            },
+            {
+              "school": "华中科技大学",
+              "degree": "本科",
+              "major": "计算机科学与技术",
+              "period": "01-2021",
+              "highlights": [],
+              "start_date": "01-2021"
+            }
+          ],
+          "skills": {
+            "languages": [
+              "Python",
+              "C++"
+            ],
+            "frameworks": [
+              "PyTorch",
+              "TensorFlow"
+            ],
+            "tools": [
+              "Git",
+              "Docker",
+              "Jupyter Notebook",
+              "Pytorch",
+              "TensorFlow"
+            ],
+            "domains": [
+              "大模型训练",
+              "计算机视觉",
+              "自动驾驶感知",
+              "视频处理"
+            ]
+          },
+          "publications": [
+            "CoT-Vid: Dynamic Chain-of-Thought Routing with Self Verification for Training-Free Video Reasoning",
+            "Enhancing Long Video Detail Perception with Scene-Localized Frame Grouping",
+            "TEOcc：Multimodal Occupancy Prediction via Temporal Enhancement"
+          ],
+          "honors": [],
+          "awards": [],
+          "certifications": [],
+          "personal_skills": [],
+          "additional_sections": {
+            "学术论文 PUBLICATIONS": [
+              "CoT-Vid: Dynamic Chain-of-Thought Routing with Self Verification for Training-Free Video Reasoning",
+              "Enhancing Long Video Detail Perception with Scene-Localized Frame Grouping",
+              "TEOcc：Multimodal Occupancy Prediction via Temporal Enhancement"
+            ]
+          },
+          "fact_sources": {
+            "raw_input": "query/cv",
+            "jd_usage": "JD only used for direction; facts must come from query/cv."
+          }
+        },
+        "draft_id": "340addb6d4",
+        "version": 1
+      }
+    },
+    {
+      "id": "S3-FIN-CV-PDF-008",
+      "ok": true,
+      "status": 200,
+      "elapsed_s": 52.804,
+      "score": 0.0,
+      "score_breakdown": {
+        "fabrication": 0,
+        "readability": 0.0,
+        "completeness": 0.0,
+        "expression": 0.0,
+        "response": 0.0,
+        "total": 0.0
+      },
+      "scenario": "scenario3",
+      "industry": "other",
+      "user_stage": "student",
+      "missing_count": 6,
+      "conflict_count": 0,
+      "docx": "/mnt/disk1/zengzhitao/resume-copilot-server-acceptance/output/简历_林嘉楠_优化版.docx",
+      "reply_text": "已按“原始简历按目标岗位优化”完成一版可编辑 DOCX，识别方向为综合，用户阶段为student。\n根据您提供的个人描述，建议投递data_ai相关岗位\n当前自动评分为 0.0/100。\n需要补充：教育经历第1段的时间为必填项；教育经历第2段的学位为必填项；教育经历第2段的专业名称为必填项；教育经历第2段的时间为必填项；项目经历第1段缺少所属公司/学校/组织，请补充\n建议优先补齐联系方式、教育时间、经历成果和可量化结果，再用于正式投递。",
+      "validation_failures": [
+        "industry_mismatch:other!=finance"
+      ],
+      "raw": {
+        "files": {
+          "docx": "/mnt/disk1/zengzhitao/resume-copilot-server-acceptance/output/简历_林嘉楠_优化版.docx",
+          "pdf": null
+        },
+        "reply_text": "已按“原始简历按目标岗位优化”完成一版可编辑 DOCX，识别方向为综合，用户阶段为student。\n根据您提供的个人描述，建议投递data_ai相关岗位\n当前自动评分为 0.0/100。\n需要补充：教育经历第1段的时间为必填项；教育经历第2段的学位为必填项；教育经历第2段的专业名称为必填项；教育经历第2段的时间为必填项；项目经历第1段缺少所属公司/学校/组织，请补充\n建议优先补齐联系方式、教育时间、经历成果和可量化结果，再用于正式投递。",
+        "score": {
+          "fabrication": 0,
+          "readability": 0.0,
+          "completeness": 0.0,
+          "expression": 0.0,
+          "response": 0.0,
+          "total": 0.0
+        },
+        "missing_fields": [
+          {
+            "field": "education[0].period",
+            "label": "时间",
+            "reason": "教育经历第1段的时间为必填项"
+          },
+          {
+            "field": "education[1].degree",
+            "label": "学位",
+            "reason": "教育经历第2段的学位为必填项"
+          },
+          {
+            "field": "education[1].major",
+            "label": "专业名称",
+            "reason": "教育经历第2段的专业名称为必填项"
+          },
+          {
+            "field": "education[1].period",
+            "label": "时间",
+            "reason": "教育经历第2段的时间为必填项"
+          },
+          {
+            "field": "projects[0].company",
+            "label": "项目归属",
+            "reason": "项目经历第1段缺少所属公司/学校/组织，请补充"
+          },
+          {
+            "field": "projects[1].company",
+            "label": "项目归属",
+            "reason": "项目经历第2段缺少所属公司/学校/组织，请补充"
+          }
+        ],
+        "conflicts": [],
+        "scenario": "scenario3",
+        "industry": "other",
+        "user_stage": "student",
+        "perf": {
+          "cv_extract_s": 0.02,
+          "jd_resolve_s": 0.0,
+          "classify_s": 1.994,
+          "structured_resume_s": 24.609,
+          "_classify_fix_user_stage_s": 26.605,
+          "optimize_s": 26.108,
+          "validation_s": 0.003,
+          "export_files_s": 0.064,
+          "draft_s": 0.0,
+          "total_s": 52.8
+        },
+        "score_breakdown": {
+          "fabrication": 0,
+          "readability": 0.0,
+          "completeness": 0.0,
+          "expression": 0.0,
+          "response": 0.0,
+          "total": 0.0
+        },
+        "ocr_warnings": [],
+        "user_report": {
+          "generation_direction": "根据您提供的个人描述，建议投递data_ai相关岗位",
+          "missing_field_suggestions": [
+            {
+              "field": "education[0].period",
+              "label": "时间",
+              "reason": "教育经历第1段的时间为必填项"
+            },
+            {
+              "field": "education[1].degree",
+              "label": "学位",
+              "reason": "教育经历第2段的学位为必填项"
+            },
+            {
+              "field": "education[1].major",
+              "label": "专业名称",
+              "reason": "教育经历第2段的专业名称为必填项"
+            },
+            {
+              "field": "education[1].period",
+              "label": "时间",
+              "reason": "教育经历第2段的时间为必填项"
+            },
+            {
+              "field": "projects[0].company",
+              "label": "项目归属",
+              "reason": "项目经历第1段缺少所属公司/学校/组织，请补充"
+            },
+            {
+              "field": "projects[1].company",
+              "label": "项目归属",
+              "reason": "项目经历第2段缺少所属公司/学校/组织，请补充"
+            }
+          ],
+          "conflict_confirmations": [],
+          "ocr_warnings": [],
+          "template_notes": [],
+          "fabrication_details": [
+            {
+              "type": "date",
+              "content": "05-2025 - 至今",
+              "reason": "布里斯托大学时间未能在用户原始输入中找到对应依据"
+            },
+            {
+              "type": "date",
+              "content": "11-2024 - 03-2025",
+              "reason": "布里斯托大学时间未能在用户原始输入中找到对应依据"
+            },
+            {
+              "type": "date",
+              "content": "07/2024 – 10/2024",
+              "reason": "城市交通流量预测系统时间未能在用户原始输入中找到对应依据"
+            }
+          ]
+        },
+        "resume_data": {
+          "meta": {
+            "name": "林嘉楠",
+            "age": "",
+            "gender": "",
+            "email": "ljn010303@gmail.com",
+            "phone": "15980067585",
+            "wechat": "",
+            "github": "",
+            "linkedin": "",
+            "website": "",
+            "education_level": "本科",
+            "work_experience": "2年",
+            "political_status": "",
+            "expected_city": "全国各地",
+            "target_role": "数据 AI 相关",
+            "job_intention": "数据 AI 相关"
+          },
+          "summary": "2年综合方向候选人，目标投递data_ai，具备数据分析、Excel、SQL能力，可围绕过往经历补充量化成果。",
+          "experience": [
+            {
+              "company": "布里斯托大学",
+              "role": "科研实习",
+              "team": "KidSat 项目",
+              "period": "05-2025 - 至今",
+              "function_description": "基于卫星图像与 DHS 数据构建非洲儿童多维贫困估测框架",
+              "result_description": "搭建数据下载至模型训练全流程，复现 SatMAE/DINOv2/Swin Transformer 等模型，产出高质量遥感数据。",
+              "bullets": [
+                "基于卫星图像与 DHS 数据构建非洲儿童多维贫困估测框架",
+                "搭建数据下载至模型训练全流程，复现 SatMAE/DINOv2/Swin Transformer 等模型，产出高质量遥感数据。",
+                "深入研究并理解利用卫星遥感数据结合人口与健康调查（DHS）数据，通过机器学习估测非洲地区儿童多维贫困水平。学习并掌握了多维贫困框架，包含住房、卫生、水源、营养、教育和健康等六个维度。",
+                "建立并优化高性能计算（HPC）环境，熟练掌握 SLURM 任务调度系统与 GPU 资源分配，处理和分析大规模卫星图像数据，成功搭建了从数据下载到模型训练的完整技术框架，并撰写详细技术文档供团队与后续研究者参考。"
+              ],
+              "responsibilities": [
+                "深入研究并理解利用卫星遥感数据结合人口与健康调查（DHS）数据，通过机器学习估测非洲地区儿童多维贫困水平。学习并掌握了多维贫困框架，包含住房、卫生、水源、营养、教育和健康等六个维度。",
+                "建立并优化高性能计算（HPC）环境，熟练掌握 SLURM 任务调度系统与 GPU 资源分配，处理和分析大规模卫星图像数据，成功搭建了从数据下载到模型训练的完整技术框架，并撰写详细技术文档供团队与后续研究者参考。",
+                "实施数据处理管道，熟悉 Google Earth Engine（GEE）API，整合 Sentinel-2 和 Landsat 卫星图像数据，完成云层遮挡去除、影像拼接及数据预处理步骤，获得高质量、可用于机器学习建模的图像数据。",
+                "复现并测试多个前沿深度学习模型，包括 SatMAE、DINOv2、Swin Transformer，进行空间交叉验证，严格对比模型预测性能，分析模型在空间预测和时间预测任务中的表现。"
+              ],
+              "achievements": [
+                "成功搭建了从数据下载到模型训练的完整技术框架，并撰写详细技术文档供团队与后续研究者参考。",
+                "获得高质量、可用于机器学习建模的图像数据。",
+                "复现并测试多个前沿深度学习模型，包括 SatMAE、DINOv2、Swin Transformer，进行空间交叉验证，严格对比模型预测性能，分析模型在空间预测和时间预测任务中的表现。"
+              ],
+              "projects": [],
+              "start_date": "05-2025",
+              "end_date": "至今"
+            },
+            {
+              "company": "布里斯托大学",
+              "role": "研究助理",
+              "team": "",
+              "period": "11-2024 - 03-2025",
+              "function_description": "基于图论与 Shapley 值优化机器学习数据集规模与训练效率",
+              "result_description": "构建数据点网络识别冗余，利用 Shapley 值筛选低贡献样本，在保持模型准确率前提下显著降低计算成本。",
+              "bullets": [
+                "基于图论与 Shapley 值优化机器学习数据集规模与训练效率",
+                "构建数据点网络识别冗余，利用 Shapley 值筛选低贡献样本，在保持模型准确率前提下显著降低计算成本。",
+                "研究如何减少机器学习数据集中重复或无用的信息，提高数据质量和模型训练效率。",
+                "采用图论方法，构建数据点网络，将数据点表示为图的顶点，并利用欧几里得距离、余弦相似度等度量方法识别数据集中的冗余数据。"
+              ],
+              "responsibilities": [
+                "研究如何减少机器学习数据集中重复或无用的信息，提高数据质量和模型训练效率。",
+                "采用图论方法，构建数据点网络，将数据点表示为图的顶点，并利用欧几里得距离、余弦相似度等度量方法识别数据集中的冗余数据。",
+                "使用 Shapley 值（合作博弈论方法）计算每个数据点的相对重要性，筛选出影响最小的样本，去除低贡献数据点，从而优化数据集规模。",
+                "通过实验验证，采用该方法后，在不降低模型准确率的前提下，减少数据量，显著降低计算成本并提高模型训练效率。",
+                "撰写技术文档，记录实验结果和方法论，供研究团队参考，并协助导师准备相关论文材料。"
+              ],
+              "achievements": [
+                "在不降低模型准确率的前提下，减少数据量，显著降低计算成本并提高模型训练效率。"
+              ],
+              "projects": [],
+              "start_date": "11-2024",
+              "end_date": "03-2025"
+            }
+          ],
+          "projects": [
+            {
+              "name": "城市交通流量预测系统",
+              "period": "07/2024 – 10/2024",
+              "description": "研究并对比 Random Forest、XGBoost、LSTM 等机器学习与深度学习方法在城市交通流量预测中的适用性，探索特征工程对模型泛化能力的影响。",
+              "bullets": [
+                "负责数据预处理全流程，包括数据清洗、特征工程、异常值检测及归一化，确保输入数据质量以提升模型泛化能力。",
+                "设计实验方案，采用 MAE、RMSE 和 R² 评估不同模型预测效果，针对表现较差的模型进行超参数优化，提高预测精度。",
+                "研究并对比 Random Forest、XGBoost、LSTM 等算法，分析其在城市交通流量预测任务中的表现差异，探索不同模型架构的适用场景。",
+                "研究成果在学术会议上展示，并撰写研究论文，该论文已通过审批，即将发表。"
+              ],
+              "tech_stack": [
+                "Random Forest",
+                "XGBoost",
+                "LSTM",
+                "Python",
+                "Pytorch"
+              ]
+            }
+          ],
+          "education": [
+            {
+              "school": "布里斯托大学",
+              "degree": "BSc Data Science",
+              "major": "数据科学",
+              "period": "",
+              "highlights": []
+            },
+            {
+              "school": "牛津大学",
+              "degree": "",
+              "major": "",
+              "period": "",
+              "highlights": []
+            }
+          ],
+          "skills": {
+            "languages": [
+              "Python",
+              "Java",
+              "C++"
+            ],
+            "frameworks": [
+              "Pytorch",
+              "TensorFlow"
+            ],
+            "tools": [
+              "Excel",
+              "SQL",
+              "PowerPoint",
+              "Word",
+              "Pytorch",
+              "TensorFlow"
+            ],
+            "domains": [
+              "数据分析"
+            ]
+          },
+          "publications": [
+            {
+              "title": "城市交通流量预测系统研究",
+              "venue": "学术会议",
+              "year": "",
+              "authors": "林嘉楠"
+            },
+            {
+              "title": "基于图论与 Shapley 值的数据集优化方法",
+              "venue": "布里斯托大学",
+              "year": "",
+              "authors": "林嘉楠"
+            }
+          ],
+          "honors": [
+            "实施数据处理管道，熟悉 Google Earth Engine（GEE）API，整合 Sentinel-2 和 Landsat 卫星图像数据，完成云层遮挡去除、影像拼接及数据预处理步骤，获得高质量、可用于机器学习建模的图像数据。"
+          ],
+          "awards": [],
+          "certifications": [],
+          "personal_skills": [],
+          "additional_sections": {},
+          "fact_sources": {
+            "raw_input": "query/cv",
+            "jd_usage": "JD only used for direction; facts must come from query/cv."
+          }
+        },
+        "draft_id": "dd8f7593ae",
+        "version": 1
+      }
+    },
+    {
+      "id": "S3-DATA-CV-009",
+      "ok": true,
+      "status": 200,
+      "elapsed_s": 52.666,
+      "score": 0.0,
+      "score_breakdown": {
+        "fabrication": 0,
+        "readability": 0.0,
+        "completeness": 0.0,
+        "expression": 0.0,
+        "response": 0.0,
+        "total": 0.0
+      },
+      "scenario": "scenario3",
+      "industry": "other",
+      "user_stage": "student",
+      "missing_count": 12,
+      "conflict_count": 0,
+      "docx": "/mnt/disk1/zengzhitao/resume-copilot-server-acceptance/output/简历_林嘉楠_优化版.docx",
+      "reply_text": "已按“原始简历按目标岗位优化”完成一版可编辑 DOCX，识别方向为综合，用户阶段为student。\n根据您提供的个人描述，建议投递数据 AI 相关相关岗位\n当前自动评分为 0.0/100。\n需要补充：教育经历第2段的学位为必填项；教育经历第2段的专业名称为必填项；教育经历第2段的时间为必填项；如提供了项目经历，则所有信息必填（项目名称/时间），请补充缺失信息；项目经历第11段缺少所属公司/学校/组织，请补充\n建议优先补齐联系方式、教育时间、经历成果和可量化结果，再用于正式投递。",
+      "validation_failures": [
+        "industry_mismatch:other!=internet"
+      ],
+      "raw": {
+        "files": {
+          "docx": "/mnt/disk1/zengzhitao/resume-copilot-server-acceptance/output/简历_林嘉楠_优化版.docx",
+          "pdf": null
+        },
+        "reply_text": "已按“原始简历按目标岗位优化”完成一版可编辑 DOCX，识别方向为综合，用户阶段为student。\n根据您提供的个人描述，建议投递数据 AI 相关相关岗位\n当前自动评分为 0.0/100。\n需要补充：教育经历第2段的学位为必填项；教育经历第2段的专业名称为必填项；教育经历第2段的时间为必填项；如提供了项目经历，则所有信息必填（项目名称/时间），请补充缺失信息；项目经历第11段缺少所属公司/学校/组织，请补充\n建议优先补齐联系方式、教育时间、经历成果和可量化结果，再用于正式投递。",
+        "score": {
+          "fabrication": 0,
+          "readability": 0.0,
+          "completeness": 0.0,
+          "expression": 0.0,
+          "response": 0.0,
+          "total": 0.0
+        },
+        "missing_fields": [
+          {
+            "field": "education[1].degree",
+            "label": "学位",
+            "reason": "教育经历第2段的学位为必填项"
+          },
+          {
+            "field": "education[1].major",
+            "label": "专业名称",
+            "reason": "教育经历第2段的专业名称为必填项"
+          },
+          {
+            "field": "education[1].period",
+            "label": "时间",
+            "reason": "教育经历第2段的时间为必填项"
+          },
+          {
+            "field": "projects[10]",
+            "label": "项目经历",
+            "reason": "如提供了项目经历，则所有信息必填（项目名称/时间），请补充缺失信息"
+          },
+          {
+            "field": "projects[10].company",
+            "label": "项目归属",
+            "reason": "项目经历第11段缺少所属公司/学校/组织，请补充"
+          },
+          {
+            "field": "projects[10].description",
+            "label": "项目描述",
+            "reason": "项目经历第11段缺少项目描述，请补充项目背景和目标"
+          },
+          {
+            "field": "projects[11]",
+            "label": "项目经历",
+            "reason": "如提供了项目经历，则所有信息必填（项目名称/时间），请补充缺失信息"
+          },
+          {
+            "field": "projects[11].company",
+            "label": "项目归属",
+            "reason": "项目经历第12段缺少所属公司/学校/组织，请补充"
+          },
+          {
+            "field": "projects[11].description",
+            "label": "项目描述",
+            "reason": "项目经历第12段缺少项目描述，请补充项目背景和目标"
+          },
+          {
+            "field": "projects[12]",
+            "label": "项目经历",
+            "reason": "如提供了项目经历，则所有信息必填（项目名称/时间），请补充缺失信息"
+          },
+          {
+            "field": "projects[12].company",
+            "label": "项目归属",
+            "reason": "项目经历第13段缺少所属公司/学校/组织，请补充"
+          },
+          {
+            "field": "projects[12].description",
+            "label": "项目描述",
+            "reason": "项目经历第13段缺少项目描述，请补充项目背景和目标"
+          }
+        ],
+        "conflicts": [],
+        "scenario": "scenario3",
+        "industry": "other",
+        "user_stage": "student",
+        "perf": {
+          "cv_extract_s": 0.01,
+          "jd_resolve_s": 0.0,
+          "classify_s": 1.672,
+          "structured_resume_s": 24.677,
+          "_classify_fix_user_stage_s": 26.349,
+          "optimize_s": 26.243,
+          "validation_s": 0.004,
+          "export_files_s": 0.054,
+          "draft_s": 0.0,
+          "total_s": 52.661
+        },
+        "score_breakdown": {
+          "fabrication": 0,
+          "readability": 0.0,
+          "completeness": 0.0,
+          "expression": 0.0,
+          "response": 0.0,
+          "total": 0.0
+        },
+        "ocr_warnings": [],
+        "user_report": {
+          "generation_direction": "根据您提供的个人描述，建议投递数据 AI 相关相关岗位",
+          "missing_field_suggestions": [
+            {
+              "field": "education[1].degree",
+              "label": "学位",
+              "reason": "教育经历第2段的学位为必填项"
+            },
+            {
+              "field": "education[1].major",
+              "label": "专业名称",
+              "reason": "教育经历第2段的专业名称为必填项"
+            },
+            {
+              "field": "education[1].period",
+              "label": "时间",
+              "reason": "教育经历第2段的时间为必填项"
+            },
+            {
+              "field": "projects[10]",
+              "label": "项目经历",
+              "reason": "如提供了项目经历，则所有信息必填（项目名称/时间），请补充缺失信息"
+            },
+            {
+              "field": "projects[10].company",
+              "label": "项目归属",
+              "reason": "项目经历第11段缺少所属公司/学校/组织，请补充"
+            },
+            {
+              "field": "projects[10].description",
+              "label": "项目描述",
+              "reason": "项目经历第11段缺少项目描述，请补充项目背景和目标"
+            },
+            {
+              "field": "projects[11]",
+              "label": "项目经历",
+              "reason": "如提供了项目经历，则所有信息必填（项目名称/时间），请补充缺失信息"
+            },
+            {
+              "field": "projects[11].company",
+              "label": "项目归属",
+              "reason": "项目经历第12段缺少所属公司/学校/组织，请补充"
+            },
+            {
+              "field": "projects[11].description",
+              "label": "项目描述",
+              "reason": "项目经历第12段缺少项目描述，请补充项目背景和目标"
+            },
+            {
+              "field": "projects[12]",
+              "label": "项目经历",
+              "reason": "如提供了项目经历，则所有信息必填（项目名称/时间），请补充缺失信息"
+            },
+            {
+              "field": "projects[12].company",
+              "label": "项目归属",
+              "reason": "项目经历第13段缺少所属公司/学校/组织，请补充"
+            },
+            {
+              "field": "projects[12].description",
+              "label": "项目描述",
+              "reason": "项目经历第13段缺少项目描述，请补充项目背景和目标"
+            }
+          ],
+          "conflict_confirmations": [],
+          "ocr_warnings": [],
+          "template_notes": [],
+          "fabrication_details": [
+            {
+              "type": "date",
+              "content": "05-2025 - 至今",
+              "reason": "布里斯托大学时间未能在用户原始输入中找到对应依据"
+            },
+            {
+              "type": "date",
+              "content": "11-2024 - 03-2025",
+              "reason": "布里斯托大学时间未能在用户原始输入中找到对应依据"
+            },
+            {
+              "type": "date",
+              "content": "07/2024 – 10/2024",
+              "reason": "城市交通流量预测系统时间未能在用户原始输入中找到对应依据"
+            },
+            {
+              "type": "date",
+              "content": "03/2021 – 05/2021",
+              "reason": "俄罗斯方块移动游戏开发时间未能在用户原始输入中找到对应依据"
+            }
+          ]
+        },
+        "resume_data": {
+          "meta": {
+            "name": "林嘉楠",
+            "age": "",
+            "gender": "",
+            "email": "ljn010303@gmail.com",
+            "phone": "15980067585",
+            "wechat": "",
+            "github": "",
+            "linkedin": "",
+            "website": "",
+            "education_level": "本科",
+            "work_experience": "2年",
+            "political_status": "",
+            "expected_city": "全国各地",
+            "target_role": "数据 AI 相关",
+            "job_intention": "数据 AI 相关"
+          },
+          "summary": "2年综合方向候选人，目标投递数据 AI 相关，具备Excel、SQL、Python能力，可围绕过往经历补充量化成果。",
+          "experience": [
+            {
+              "company": "布里斯托大学",
+              "role": "",
+              "team": "KidSat 项目（基于卫星图像的儿童贫困估测）",
+              "period": "05-2025 - 至今",
+              "function_description": "利用卫星遥感数据结合人口与健康调查（DHS）数据，通过机器学习估测非洲地区儿童多维贫困水平。掌握多维贫困框架（住房、卫生、水源、营养、教育和健康），搭建从数据下载到模型训练的完整技术框架，撰写技术文档。",
+              "result_description": "成功获得高质量、可用于机器学习建模的图像数据。通过实验验证，在不降低模型准确率的前提下，减少数据量，显著降低计算成本并提高模型训练效率。研究成果在学术会议上展示，并撰写研究论文，该论文已通过审批，即将发表。",
+              "bullets": [
+                "利用卫星遥感数据结合人口与健康调查（DHS）数据，通过机器学习估测非洲地区儿童多维贫困水平。掌握多维贫困框架（住房、卫生、水源、营养、教育和健康），搭建从数据下载到模型训练的完整技术框架，撰写技术文档。",
+                "成功获得高质量、可用于机器学习建模的图像数据。通过实验验证，在不降低模型准确率的前提下，减少数据量，显著降低计算成本并提高模型训练效率。研究成果在学术会议上展示，并撰写研究论文，该论文已通过审批，即将发表。",
+                "建立并优化高性能计算（HPC）环境，熟练掌握SLURM任务调度系统与GPU资源分配。",
+                "实施数据处理管道，熟悉Google Earth Engine（GEE）API，整合Sentinel-2和Landsat卫星图像数据。"
+              ],
+              "responsibilities": [
+                "建立并优化高性能计算（HPC）环境，熟练掌握SLURM任务调度系统与GPU资源分配。",
+                "实施数据处理管道，熟悉Google Earth Engine（GEE）API，整合Sentinel-2和Landsat卫星图像数据。",
+                "复现并测试多个前沿深度学习模型，包括SatMAE、DINOv2、Swin Transformer。",
+                "采用图论方法，构建数据点网络，利用欧几里得距离、余弦相似度等度量方法识别数据集中的冗余数据。",
+                "使用Shapley 值计算每个数据点的相对重要性，筛选出影响最小的样本，去除低贡献数据点。",
+                "撰写技术文档，记录实验结果和方法论，供研究团队参考，并协助导师准备相关论文材料。"
+              ],
+              "achievements": [
+                "成功搭建了从数据下载到模型训练的完整技术框架，并撰写详细技术文档供团队与后续研究者参考。",
+                "获得高质量、可用于机器学习建模的图像数据。",
+                "通过实验验证，在不降低模型准确率的前提下，减少数据量，显著降低计算成本并提高模型训练效率。",
+                "研究成果在学术会议上展示，并撰写研究论文，该论文已通过审批，即将发表。"
+              ],
+              "projects": [
+                {
+                  "name": "城市交通流量预测系统",
+                  "company": "牛津大学",
+                  "role": "",
+                  "period": "07/2024 – 10/2024",
+                  "description": "研究并对比 Random Forest、XGBoost、LSTM 等机器学习与深度学习方法，探索其在城市交通流量预测中的适用性。",
+                  "function_description": "负责数据预处理，包括数据清洗、特征工程、异常值检测、归一化等，确保输入数据质量，以提升模型的泛化能力。设计实验方案，采用 MAE、RMSE 和 R² 评估不同模型的预测效果，针对表现较差的模型进行超参数优化，提高预测精度。",
+                  "result_description": "研究成果在学术会议上展示，并撰写研究论文，该论文已通过审批，即将发表。",
+                  "bullets": [
+                    "使用Random Forest、XGBoost、LSTM等模型进行城市交通流量预测，通过Z-score标准化处理异常值，使用PCA进行特征降维，提升模型泛化能力。",
+                    "负责数据预处理，包括数据清洗、特征工程、异常值检测、归一化等，确保输入数据质量，以提升模型的泛化能力。",
+                    "设计实验方案，采用 MAE、RMSE 和 R² 评估不同模型的预测效果，针对表现较差的模型进行超参数优化，提高预测精度。"
+                  ],
+                  "tech_stack": [
+                    "Random Forest",
+                    "XGBoost",
+                    "LSTM",
+                    "Z-score标准化",
+                    "PCA",
+                    "Grid Search",
+                    "Early Stopping"
+                  ]
+                },
+                {
+                  "name": "俄罗斯方块移动游戏开发",
+                  "company": "Samsung IT School",
+                  "role": "",
+                  "period": "03/2021 – 05/2021",
+                  "description": "构思并开发面向用户的安卓俄罗斯方块游戏，重点关注其核心游戏机制。",
+                  "function_description": "应对UI设计挑战：设置游戏边界、旋转不同的方块、消除填满的行列以及确定游戏结束条件场景。",
+                  "result_description": "具体实现方法包括使用Canvas绘制游戏界面，使用Matrix类处理方块的旋转，使用ArrayList管理游戏状态。",
+                  "bullets": [
+                    "使用Canvas绘制游戏界面，使用Matrix类处理方块的旋转，使用ArrayList管理游戏状态，开发面向用户的安卓俄罗斯方块游戏。",
+                    "设置游戏边界、旋转不同的方块、消除填满的行列以及确定游戏结束条件场景，应对UI设计挑战。"
+                  ],
+                  "tech_stack": [
+                    "Canvas",
+                    "Matrix类",
+                    "ArrayList"
+                  ]
+                }
+              ],
+              "start_date": "05-2025",
+              "end_date": "至今"
+            },
+            {
+              "company": "布里斯托大学",
+              "role": "研究助理",
+              "team": "使用图论和Shapley值减少数据集中的索引冗余",
+              "period": "11-2024 - 03-2025",
+              "function_description": "研究如何减少机器学习数据集中重复或无用的信息，提高数据质量和模型训练效率。",
+              "result_description": "通过实验验证，采用该方法后，在不降低模型准确率的前提下，减少数据量，显著降低计算成本并提高模型训练效率。具体实验设计包括使用K折交叉验证和AUC作为评价指标。",
+              "bullets": [
+                "研究如何减少机器学习数据集中重复或无用的信息，提高数据质量和模型训练效率。",
+                "通过实验验证，采用该方法后，在不降低模型准确率的前提下，减少数据量，显著降低计算成本并提高模型训练效率。具体实验设计包括使用K折交叉验证和AUC作为评价指标。",
+                "采用图论方法，构建数据点网络，将数据点表示为图的顶点，并利用欧几里得距离、余弦相似度等度量方法识别数据集中的冗余数据。",
+                "使用Shapley 值（合作博弈论方法）计算每个数据点的相对重要性，筛选出影响最小的样本，去除低贡献数据点，从而优化数据集规模。"
+              ],
+              "responsibilities": [
+                "采用图论方法，构建数据点网络，将数据点表示为图的顶点，并利用欧几里得距离、余弦相似度等度量方法识别数据集中的冗余数据。",
+                "使用Shapley 值（合作博弈论方法）计算每个数据点的相对重要性，筛选出影响最小的样本，去除低贡献数据点，从而优化数据集规模。",
+                "通过实验验证，采用该方法后，在不降低模型准确率的前提下，减少数据量，显著降低计算成本并提高模型训练效率。",
+                "撰写技术文档，记录实验结果和方法论，供研究团队参考，并协助导师准备相关论文材料。"
+              ],
+              "achievements": [
+                "通过实验验证，采用该方法后，在不降低模型准确率的前提下，减少数据量，显著降低计算成本并提高模型训练效率。",
+                "具体实验设计包括使用K折交叉验证和AUC作为评价指标。"
+              ],
+              "projects": [],
+              "start_date": "11-2024",
+              "end_date": "03-2025"
+            }
+          ],
+          "education": [
+            {
+              "school": "布里斯托大学",
+              "degree": "BSc Data Science",
+              "major": "数据科学",
+              "period": "2023 – 至今",
+              "highlights": []
+            },
+            {
+              "school": "牛津大学",
+              "degree": "",
+              "major": "",
+              "period": "",
+              "highlights": []
+            }
+          ],
+          "skills": {
+            "languages": [
+              "Python",
+              "Java",
+              "C++"
+            ],
+            "frameworks": [
+              "Pytorch",
+              "TensorFlow"
+            ],
+            "tools": [
+              "Excel",
+              "SQL",
+              "PowerPoint",
+              "Word",
+              "Pytorch",
+              "TensorFlow"
+            ],
+            "domains": []
+          },
+          "publications": [
+            {
+              "title": "布里斯托大学/University of Bristol | BSc Data Science · 数据科学 2023 – 至今",
+              "venue": "",
+              "year": "",
+              "authors": ""
+            },
+            {
+              "title": "框架工具：numpy · pandas · matplotlib · seaborn · scikit-learn · TensorFlow · PyTorch",
+              "venue": "",
+              "year": "",
+              "authors": ""
+            }
+          ],
+          "honors": [
+            "实施数据处理管道，熟悉Google Earth Engine（GEE）API，整合Sentinel-2和Landsat卫星图像数据，完成云层遮挡去除、影像拼接及数据预处理步骤，获得高质量、可用于机器学习建模的图像数据。具体步骤包括使用GEE API进行云层检测与去除，使用GDAL工具进行影像拼接，以及使用OpenCV进行图像增强。"
+          ],
+          "awards": [],
+          "certifications": [],
+          "personal_skills": [],
+          "additional_sections": {},
+          "projects": [
+            {
+              "name": "城市交通流量预测系统",
+              "company": "牛津大学",
+              "role": "",
+              "period": "07/2024 – 10/2024",
+              "description": "研究并对比 Random Forest、XGBoost、LSTM 等机器学习与深度学习方法，探索其在城市交通流量预测中的适用性。",
+              "function_description": "负责数据预处理，包括数据清洗、特征工程、异常值检测、归一化等，确保输入数据质量，以提升模型的泛化能力。设计实验方案，采用 MAE、RMSE 和 R² 评估不同模型的预测效果，针对表现较差的模型进行超参数优化，提高预测精度。",
+              "result_description": "研究成果在学术会议上展示，并撰写研究论文，该论文已通过审批，即将发表。",
+              "bullets": [
+                "研究并对比 Random Forest、XGBoost、LSTM 等机器学习与深度学习方法，探索其在城市交通流量预测中的适用性。",
+                "负责数据预处理，包括数据清洗、特征工程、异常值检测、归一化等，确保输入数据质量，以提升模型的泛化能力。",
+                "设计实验方案，采用 MAE、RMSE 和 R² 评估不同模型的预测效果，针对表现较差的模型进行超参数优化，提高预测精度。",
+                "研究成果在学术会议上展示，并撰写研究论文，该论文已通过审批，即将发表。"
+              ],
+              "tech_stack": [
+                "Random Forest",
+                "XGBoost",
+                "LSTM",
+                "Z-score标准化",
+                "PCA",
+                "Grid Search",
+                "Early Stopping"
+              ]
+            },
+            {
+              "name": "俄罗斯方块移动游戏开发",
+              "company": "Samsung IT School",
+              "role": "",
+              "period": "03/2021 – 05/2021",
+              "description": "构思并开发面向用户的安卓俄罗斯方块游戏，重点关注其核心游戏机制。",
+              "function_description": "应对UI设计挑战：设置游戏边界、旋转不同的方块、消除填满的行列以及确定游戏结束条件场景。",
+              "result_description": "具体实现方法包括使用Canvas绘制游戏界面，使用Matrix类处理方块的旋转，使用ArrayList管理游戏状态。",
+              "bullets": [
+                "构思并开发面向用户的安卓俄罗斯方块游戏，重点关注其核心游戏机制。",
+                "应对UI设计挑战：设置游戏边界、旋转不同的方块、消除填满的行列以及确定游戏结束条件场景。",
+                "具体实现方法包括使用Canvas绘制游戏界面，使用Matrix类处理方块的旋转，使用ArrayList管理游戏状态。"
+              ],
+              "tech_stack": [
+                "Canvas",
+                "Matrix类",
+                "ArrayList"
+              ]
+            },
+            {
+              "name": "城市交通流量预测系统",
+              "company": "牛津大学",
+              "role": "",
+              "period": "07/2024 – 10/2024",
+              "description": "研究并对比 Random Forest、XGBoost、LSTM 等机器学习与深度学习方法，探索其在城市交通流量预测中的适用性。",
+              "function_description": "负责数据预处理，包括数据清洗、特征工程、异常值检测、归一化等，确保输入数据质量，以提升模型的泛化能力。设计实验方案，采用 MAE、RMSE 和 R² 评估不同模型的预测效果，针对表现较差的模型进行超参数优化，提高预测精度。",
+              "result_description": "研究成果在学术会议上展示，并撰写研究论文，该论文已通过审批，即将发表。",
+              "bullets": [
+                "研究并对比 Random Forest、XGBoost、LSTM 等机器学习与深度学习方法，探索其在城市交通流量预测中的适用性。",
+                "负责数据预处理，包括数据清洗、特征工程、异常值检测、归一化等，确保输入数据质量，以提升模型的泛化能力。",
+                "设计实验方案，采用 MAE、RMSE 和 R² 评估不同模型的预测效果，针对表现较差的模型进行超参数优化，提高预测精度。",
+                "研究成果在学术会议上展示，并撰写研究论文，该论文已通过审批，即将发表。"
+              ],
+              "tech_stack": [
+                "Random Forest",
+                "XGBoost",
+                "LSTM",
+                "Z-score标准化",
+                "PCA",
+                "Grid Search",
+                "Early Stopping"
+              ]
+            },
+            {
+              "name": "俄罗斯方块移动游戏开发",
+              "company": "Samsung IT School",
+              "role": "",
+              "period": "03/2021 – 05/2021",
+              "description": "构思并开发面向用户的安卓俄罗斯方块游戏，重点关注其核心游戏机制。",
+              "function_description": "应对UI设计挑战：设置游戏边界、旋转不同的方块、消除填满的行列以及确定游戏结束条件场景。",
+              "result_description": "具体实现方法包括使用Canvas绘制游戏界面，使用Matrix类处理方块的旋转，使用ArrayList管理游戏状态。",
+              "bullets": [
+                "构思并开发面向用户的安卓俄罗斯方块游戏，重点关注其核心游戏机制。",
+                "应对UI设计挑战：设置游戏边界、旋转不同的方块、消除填满的行列以及确定游戏结束条件场景。",
+                "具体实现方法包括使用Canvas绘制游戏界面，使用Matrix类处理方块的旋转，使用ArrayList管理游戏状态。"
+              ],
+              "tech_stack": [
+                "Canvas",
+                "Matrix类",
+                "ArrayList"
+              ]
+            },
+            {
+              "name": "城市交通流量预测系统",
+              "company": "牛津大学",
+              "role": "",
+              "period": "07/2024 – 10/2024",
+              "description": "研究并对比 Random Forest、XGBoost、LSTM 等机器学习与深度学习方法，探索其在城市交通流量预测中的适用性。",
+              "function_description": "负责数据预处理，包括数据清洗、特征工程、异常值检测、归一化等，确保输入数据质量，以提升模型的泛化能力。设计实验方案，采用 MAE、RMSE 和 R² 评估不同模型的预测效果，针对表现较差的模型进行超参数优化，提高预测精度。",
+              "result_description": "研究成果在学术会议上展示，并撰写研究论文，该论文已通过审批，即将发表。",
+              "bullets": [
+                "研究并对比 Random Forest、XGBoost、LSTM 等机器学习与深度学习方法，探索其在城市交通流量预测中的适用性。",
+                "负责数据预处理，包括数据清洗、特征工程、异常值检测、归一化等，确保输入数据质量，以提升模型的泛化能力。",
+                "设计实验方案，采用 MAE、RMSE 和 R² 评估不同模型的预测效果，针对表现较差的模型进行超参数优化，提高预测精度。",
+                "研究成果在学术会议上展示，并撰写研究论文，该论文已通过审批，即将发表。"
+              ],
+              "tech_stack": [
+                "Random Forest",
+                "XGBoost",
+                "LSTM",
+                "Z-score标准化",
+                "PCA",
+                "Grid Search",
+                "Early Stopping"
+              ]
+            },
+            {
+              "name": "俄罗斯方块移动游戏开发",
+              "company": "Samsung IT School",
+              "role": "",
+              "period": "03/2021 – 05/2021",
+              "description": "构思并开发面向用户的安卓俄罗斯方块游戏，重点关注其核心游戏机制。",
+              "function_description": "应对UI设计挑战：设置游戏边界、旋转不同的方块、消除填满的行列以及确定游戏结束条件场景。",
+              "result_description": "具体实现方法包括使用Canvas绘制游戏界面，使用Matrix类处理方块的旋转，使用ArrayList管理游戏状态。",
+              "bullets": [
+                "构思并开发面向用户的安卓俄罗斯方块游戏，重点关注其核心游戏机制。",
+                "应对UI设计挑战：设置游戏边界、旋转不同的方块、消除填满的行列以及确定游戏结束条件场景。",
+                "具体实现方法包括使用Canvas绘制游戏界面，使用Matrix类处理方块的旋转，使用ArrayList管理游戏状态。"
+              ],
+              "tech_stack": [
+                "Canvas",
+                "Matrix类",
+                "ArrayList"
+              ]
+            },
+            {
+              "name": "城市交通流量预测系统",
+              "company": "牛津大学",
+              "role": "",
+              "period": "07/2024 – 10/2024",
+              "description": "研究并对比 Random Forest、XGBoost、LSTM 等机器学习与深度学习方法，探索其在城市交通流量预测中的适用性。",
+              "function_description": "负责数据预处理，包括数据清洗、特征工程、异常值检测、归一化等，确保输入数据质量，以提升模型的泛化能力。设计实验方案，采用 MAE、RMSE 和 R² 评估不同模型的预测效果，针对表现较差的模型进行超参数优化，提高预测精度。",
+              "result_description": "研究成果在学术会议上展示，并撰写研究论文，该论文已通过审批，即将发表。",
+              "bullets": [
+                "研究并对比 Random Forest、XGBoost、LSTM 等机器学习与深度学习方法，探索其在城市交通流量预测中的适用性。",
+                "负责数据预处理，包括数据清洗、特征工程、异常值检测、归一化等，确保输入数据质量，以提升模型的泛化能力。",
+                "设计实验方案，采用 MAE、RMSE 和 R² 评估不同模型的预测效果，针对表现较差的模型进行超参数优化，提高预测精度。",
+                "研究成果在学术会议上展示，并撰写研究论文，该论文已通过审批，即将发表。"
+              ],
+              "tech_stack": [
+                "Random Forest",
+                "XGBoost",
+                "LSTM",
+                "Z-score标准化",
+                "PCA",
+                "Grid Search",
+                "Early Stopping"
+              ]
+            },
+            {
+              "name": "俄罗斯方块移动游戏开发",
+              "company": "Samsung IT School",
+              "role": "",
+              "period": "03/2021 – 05/2021",
+              "description": "构思并开发面向用户的安卓俄罗斯方块游戏，重点关注其核心游戏机制。",
+              "function_description": "应对UI设计挑战：设置游戏边界、旋转不同的方块、消除填满的行列以及确定游戏结束条件场景。",
+              "result_description": "具体实现方法包括使用Canvas绘制游戏界面，使用Matrix类处理方块的旋转，使用ArrayList管理游戏状态。",
+              "bullets": [
+                "构思并开发面向用户的安卓俄罗斯方块游戏，重点关注其核心游戏机制。",
+                "应对UI设计挑战：设置游戏边界、旋转不同的方块、消除填满的行列以及确定游戏结束条件场景。",
+                "具体实现方法包括使用Canvas绘制游戏界面，使用Matrix类处理方块的旋转，使用ArrayList管理游戏状态。"
+              ],
+              "tech_stack": [
+                "Canvas",
+                "Matrix类",
+                "ArrayList"
+              ]
+            },
+            {
+              "name": "城市交通流量预测系统",
+              "company": "牛津大学",
+              "role": "",
+              "period": "07/2024 – 10/2024",
+              "description": "研究并对比 Random Forest、XGBoost、LSTM 等机器学习与深度学习方法，探索其在城市交通流量预测中的适用性。",
+              "function_description": "负责数据预处理，包括数据清洗、特征工程、异常值检测、归一化等，确保输入数据质量，以提升模型的泛化能力。设计实验方案，采用 MAE、RMSE 和 R² 评估不同模型的预测效果，针对表现较差的模型进行超参数优化，提高预测精度。",
+              "result_description": "研究成果在学术会议上展示，并撰写研究论文，该论文已通过审批，即将发表。",
+              "bullets": [
+                "研究并对比 Random Forest、XGBoost、LSTM 等机器学习与深度学习方法，探索其在城市交通流量预测中的适用性。",
+                "负责数据预处理，包括数据清洗、特征工程、异常值检测、归一化等，确保输入数据质量，以提升模型的泛化能力。",
+                "设计实验方案，采用 MAE、RMSE 和 R² 评估不同模型的预测效果，针对表现较差的模型进行超参数优化，提高预测精度。",
+                "研究成果在学术会议上展示，并撰写研究论文，该论文已通过审批，即将发表。"
+              ],
+              "tech_stack": [
+                "Random Forest",
+                "XGBoost",
+                "LSTM",
+                "Z-score标准化",
+                "PCA",
+                "Grid Search",
+                "Early Stopping"
+              ]
+            },
+            {
+              "name": "俄罗斯方块移动游戏开发",
+              "company": "Samsung IT School",
+              "role": "",
+              "period": "03/2021 – 05/2021",
+              "description": "构思并开发面向用户的安卓俄罗斯方块游戏，重点关注其核心游戏机制。",
+              "function_description": "应对UI设计挑战：设置游戏边界、旋转不同的方块、消除填满的行列以及确定游戏结束条件场景。",
+              "result_description": "具体实现方法包括使用Canvas绘制游戏界面，使用Matrix类处理方块的旋转，使用ArrayList管理游戏状态。",
+              "bullets": [
+                "构思并开发面向用户的安卓俄罗斯方块游戏，重点关注其核心游戏机制。",
+                "应对UI设计挑战：设置游戏边界、旋转不同的方块、消除填满的行列以及确定游戏结束条件场景。",
+                "具体实现方法包括使用Canvas绘制游戏界面，使用Matrix类处理方块的旋转，使用ArrayList管理游戏状态。"
+              ],
+              "tech_stack": [
+                "Canvas",
+                "Matrix类",
+                "ArrayList"
+              ]
+            },
+            {
+              "name": "研究项目",
+              "period": "",
+              "description": "",
+              "bullets": [
+                "城市交通流量预测系统 07/2024 – 10/2024 指导老师：牛津大学教授 Patrick Rebeshini 研究并对比 Random Forest、XGBoost、LSTM 等机器学习与深度学习方法，探索其在城市交通流量预测中的适用性。 负责数据预处理，包括数据清洗、特征工程、异常值检测、归一化等，确保输入数据质量，以提升模型的泛化能力。具体方法包括使用Z-score标准化处理异常值，使用PCA进行特征降维。 设计实验方案，采用 MAE、RMSE 和 R² 评估不同模型的预测效果，针对表现较差的模型进行超参数优化，提高预测精度。具体优化方法包括使用Grid Search进行超参数搜索，使用Early Stopping防止过拟合。 研究成果在学术会议上展示，并撰写研究论文，该论文已通过审批，即将发表。",
+                "Samsung IT School Java 开发项目 - 俄罗斯方块移动游戏开发 03/2021 – 05/2021 构思并开发面向用户的安卓俄罗斯方块游戏，重点关注其核心游戏机制。 应对UI设计挑战：设置游戏边界、旋转不同的方块、消除填满的行列以及确定游戏结束条件场景。具体实现方法包括使用Canvas绘制游戏界面，使用Matrix类处理方块的旋转，使用ArrayList管理游戏状态。"
+              ],
+              "tech_stack": []
+            },
+            {
+              "name": "研究项目",
+              "period": "",
+              "description": "",
+              "bullets": [
+                "城市交通流量预测系统 - 指导老师：牛津大学教授 Patrick Rebeshini"
+              ],
+              "tech_stack": []
+            },
+            {
+              "name": "研究并对比 Random Forest、XGBoost、LSTM 等机器学习与深度学习方法，探索其在城市交通",
+              "period": "",
+              "description": "",
+              "bullets": [
+                "流量预测中的适用性。 - 07/2024 – 10/2024 负责数据预处理，包括数据清洗、特征工程、异常值检测、归一化等，确保输入数据质量，以提",
+                "升模型的泛化能力。 设计实验方案，采用 MAE、RMSE 和 R² 评估不同模型的预测效果，针对表现较差的模型进行超",
+                "参数优化，提高预测精度。"
+              ],
+              "tech_stack": []
+            }
+          ],
+          "fact_sources": {
+            "raw_input": "query/cv",
+            "jd_usage": "JD only used for direction; facts must come from query/cv."
+          }
+        },
+        "draft_id": "e6d76ea532",
+        "version": 1
+      }
+    },
+    {
+      "id": "S4-QUERY-JD-AI-010",
+      "ok": true,
+      "status": 200,
+      "elapsed_s": 27.142,
+      "score": 40.5,
+      "score_breakdown": {
+        "fabrication": 100,
+        "readability": 5.5,
+        "completeness": 24.0,
+        "expression": 5.0,
+        "response": 6.0,
+        "total": 40.5
+      },
+      "scenario": "scenario4",
+      "industry": "other",
+      "user_stage": "student",
+      "missing_count": 3,
+      "conflict_count": 0,
+      "docx": "/mnt/disk1/zengzhitao/resume-copilot-server-acceptance/output/简历_赵清禾_优化版.docx",
+      "reply_text": "已按“个人信息结合目标 JD 生成简历”完成一版可编辑 DOCX，识别方向为综合，用户阶段为student。\n根据您提供的个人描述，建议投递AI算法研究员相关岗位\n当前自动评分为 40.5/100。\n需要补充：如提供了项目经历，则所有信息必填（项目名称/时间），请补充缺失信息；项目经历第1段缺少所属公司/学校/组织，请补充；项目经历第1段缺少项目成果，请补充结果、影响或验证口径\n建议优先补齐联系方式、教育时间、经历成果和可量化结果，再用于正式投递。",
+      "validation_failures": [
+        "industry_mismatch:other!=internet",
+        "missing_field_not_reported:education.period"
+      ],
+      "raw": {
+        "files": {
+          "docx": "/mnt/disk1/zengzhitao/resume-copilot-server-acceptance/output/简历_赵清禾_优化版.docx",
+          "pdf": null
+        },
+        "reply_text": "已按“个人信息结合目标 JD 生成简历”完成一版可编辑 DOCX，识别方向为综合，用户阶段为student。\n根据您提供的个人描述，建议投递AI算法研究员相关岗位\n当前自动评分为 40.5/100。\n需要补充：如提供了项目经历，则所有信息必填（项目名称/时间），请补充缺失信息；项目经历第1段缺少所属公司/学校/组织，请补充；项目经历第1段缺少项目成果，请补充结果、影响或验证口径\n建议优先补齐联系方式、教育时间、经历成果和可量化结果，再用于正式投递。",
+        "score": {
+          "fabrication": 100,
+          "readability": 5.5,
+          "completeness": 24.0,
+          "expression": 5.0,
+          "response": 6.0,
+          "total": 40.5
+        },
+        "missing_fields": [
+          {
+            "field": "projects[0]",
+            "label": "项目经历",
+            "reason": "如提供了项目经历，则所有信息必填（项目名称/时间），请补充缺失信息"
+          },
+          {
+            "field": "projects[0].company",
+            "label": "项目归属",
+            "reason": "项目经历第1段缺少所属公司/学校/组织，请补充"
+          },
+          {
+            "field": "projects[0].result_description",
+            "label": "项目工作成果",
+            "reason": "项目经历第1段缺少项目成果，请补充结果、影响或验证口径"
+          }
+        ],
+        "conflicts": [],
+        "scenario": "scenario4",
+        "industry": "other",
+        "user_stage": "student",
+        "perf": {
+          "jd_resolve_s": 0.0,
+          "classify_s": 0.617,
+          "structured_resume_s": 1.479,
+          "_classify_fix_user_stage_s": 2.096,
+          "validation_s": 0.0,
+          "export_files_s": 0.033,
+          "draft_s": 0.0,
+          "total_s": 27.14
+        },
+        "score_breakdown": {
+          "fabrication": 100,
+          "readability": 5.5,
+          "completeness": 24.0,
+          "expression": 5.0,
+          "response": 6.0,
+          "total": 40.5
+        },
+        "ocr_warnings": [],
+        "user_report": {
+          "generation_direction": "根据您提供的个人描述，建议投递AI算法研究员相关岗位",
+          "missing_field_suggestions": [
+            {
+              "field": "projects[0]",
+              "label": "项目经历",
+              "reason": "如提供了项目经历，则所有信息必填（项目名称/时间），请补充缺失信息"
+            },
+            {
+              "field": "projects[0].company",
+              "label": "项目归属",
+              "reason": "项目经历第1段缺少所属公司/学校/组织，请补充"
+            },
+            {
+              "field": "projects[0].result_description",
+              "label": "项目工作成果",
+              "reason": "项目经历第1段缺少项目成果，请补充结果、影响或验证口径"
+            }
+          ],
+          "conflict_confirmations": [],
+          "ocr_warnings": [],
+          "template_notes": []
+        },
+        "resume_data": {
+          "meta": {
+            "name": "赵清禾",
+            "age": "",
+            "gender": "",
+            "email": "zhaoqinghe@example.com",
+            "phone": "13700003003",
+            "wechat": "",
+            "github": "",
+            "linkedin": "",
+            "website": "",
+            "education_level": "硕士",
+            "work_experience": "在校生",
+            "political_status": "",
+            "expected_city": "",
+            "target_role": "AI算法研究员",
+            "job_intention": "AI算法研究员"
+          },
+          "summary": "清华大学硕士在读，专注计算机视觉与扩散模型研究，具备图像生成项目经验，致力于大模型与多模态算法优化。",
+          "experience": [],
+          "projects": [
+            {
+              "name": "图像生成项目",
+              "company": "",
+              "role": "",
+              "period": "",
+              "description": "研究计算机视觉和扩散模型",
+              "function_description": "研究计算机视觉和扩散模型",
+              "result_description": "",
+              "bullets": [],
+              "tech_stack": []
+            }
+          ],
+          "education": [
+            {
+              "school": "清华大学",
+              "degree": "硕士",
+              "major": "人工智能",
+              "period": "09-2024 - 06-2026",
+              "highlights": [
+                "研究计算机视觉和扩散模型",
+                "做过图像生成项目"
+              ],
+              "start_date": "09-2024",
+              "end_date": "06-2026"
+            }
+          ],
+          "skills": {
+            "languages": [],
+            "frameworks": [],
+            "tools": [],
+            "domains": [
+              "计算机视觉",
+              "扩散模型"
+            ]
+          },
+          "publications": [],
+          "honors": [],
+          "awards": [],
+          "certifications": [],
+          "personal_skills": [
+            "计算机视觉",
+            "扩散模型"
+          ],
+          "additional_sections": {},
+          "fact_sources": {
+            "raw_input": "query/cv",
+            "jd_usage": "JD only used for direction; facts must come from query/cv."
+          }
+        },
+        "draft_id": "4644f39704",
+        "version": 1
+      }
+    },
+    {
+      "id": "S4-QUERY-JD-SPR-011",
+      "ok": true,
+      "status": 200,
+      "elapsed_s": 10.575,
+      "score": 57.2,
+      "score_breakdown": {
+        "fabrication": 100,
+        "readability": 6.5,
+        "completeness": 28.0,
+        "expression": 16.7,
+        "response": 6.0,
+        "total": 57.2
+      },
+      "scenario": "scenario4",
+      "industry": "other",
+      "user_stage": "experienced",
+      "missing_count": 1,
+      "conflict_count": 0,
+      "docx": "/mnt/disk1/zengzhitao/resume-copilot-server-acceptance/output/简历_周逸风_优化版.docx",
+      "reply_text": "已按“个人信息结合目标 JD 生成简历”完成一版可编辑 DOCX，识别方向为综合，用户阶段为experienced。\n根据您提供的个人描述，建议投递语音算法工程师相关岗位\n当前自动评分为 57.2/100。\n需要补充：建议补充技能信息以提升简历完整度\n建议优先补齐联系方式、教育时间、经历成果和可量化结果，再用于正式投递。",
+      "validation_failures": [
+        "industry_mismatch:other!=internet",
+        "missing_field_not_reported:education.school",
+        "missing_field_not_reported:education.period"
+      ],
+      "raw": {
+        "files": {
+          "docx": "/mnt/disk1/zengzhitao/resume-copilot-server-acceptance/output/简历_周逸风_优化版.docx",
+          "pdf": null
+        },
+        "reply_text": "已按“个人信息结合目标 JD 生成简历”完成一版可编辑 DOCX，识别方向为综合，用户阶段为experienced。\n根据您提供的个人描述，建议投递语音算法工程师相关岗位\n当前自动评分为 57.2/100。\n需要补充：建议补充技能信息以提升简历完整度\n建议优先补齐联系方式、教育时间、经历成果和可量化结果，再用于正式投递。",
+        "score": {
+          "fabrication": 100,
+          "readability": 6.5,
+          "completeness": 28.0,
+          "expression": 16.7,
+          "response": 6.0,
+          "total": 57.2
+        },
+        "missing_fields": [
+          {
+            "field": "skills",
+            "label": "技能",
+            "reason": "建议补充技能信息以提升简历完整度"
+          }
+        ],
+        "conflicts": [],
+        "scenario": "scenario4",
+        "industry": "other",
+        "user_stage": "experienced",
+        "perf": {
+          "jd_resolve_s": 0.0,
+          "classify_s": 0.837,
+          "structured_resume_s": 2.087,
+          "_classify_fix_user_stage_s": 2.924,
+          "validation_s": 0.0,
+          "export_files_s": 0.033,
+          "draft_s": 0.0,
+          "total_s": 10.573
+        },
+        "score_breakdown": {
+          "fabrication": 100,
+          "readability": 6.5,
+          "completeness": 28.0,
+          "expression": 16.7,
+          "response": 6.0,
+          "total": 57.2
+        },
+        "ocr_warnings": [],
+        "user_report": {
+          "generation_direction": "根据您提供的个人描述，建议投递语音算法工程师相关岗位",
+          "missing_field_suggestions": [
+            {
+              "field": "skills",
+              "label": "技能",
+              "reason": "建议补充技能信息以提升简历完整度"
+            }
+          ],
+          "conflict_confirmations": [],
+          "ocr_warnings": [],
+          "template_notes": []
+        },
+        "resume_data": {
+          "meta": {
+            "name": "周逸风",
+            "age": "",
+            "gender": "",
+            "email": "zhouyifeng@example.com",
+            "phone": "13900004004",
+            "wechat": "",
+            "github": "",
+            "linkedin": "",
+            "website": "",
+            "education_level": "博士",
+            "work_experience": "1年",
+            "political_status": "",
+            "expected_city": "",
+            "target_role": "语音算法工程师",
+            "job_intention": "语音算法工程师"
+          },
+          "summary": "华中科技大学博士，信号与系统专业，语音算法方向。拥有科大讯飞端侧ASR优化实习经验，具备扎实的语音处理与工程落地能力，致力于语音识别算法研究与优化。",
+          "experience": [
+            {
+              "company": "科大讯飞",
+              "role": "",
+              "team": "",
+              "period": "01-2023",
+              "function_description": "负责端侧ASR优化",
+              "result_description": "",
+              "bullets": [
+                "负责端侧ASR优化",
+                "端侧ASR优化"
+              ],
+              "responsibilities": [
+                "端侧ASR优化"
+              ],
+              "achievements": [],
+              "projects": [],
+              "start_date": "01-2023"
+            }
+          ],
+          "projects": [],
+          "education": [
+            {
+              "school": "华中科技大学",
+              "degree": "博士",
+              "major": "信号与系统",
+              "period": "01-2019",
+              "highlights": [
+                "语音算法方向"
+              ],
+              "start_date": "01-2019"
+            }
+          ],
+          "skills": {
+            "languages": [],
+            "frameworks": [],
+            "tools": [],
+            "domains": []
+          },
+          "publications": [],
+          "honors": [],
+          "awards": [],
+          "certifications": [],
+          "personal_skills": [
+            "语音算法",
+            "信号处理"
+          ],
+          "additional_sections": {},
+          "fact_sources": {
+            "raw_input": "query/cv",
+            "jd_usage": "JD only used for direction; facts must come from query/cv."
+          }
+        },
+        "draft_id": "80aac7b2da",
+        "version": 1
+      }
+    },
+    {
+      "id": "S4-QUERY-JD-CONFLICT-012",
+      "ok": true,
+      "status": 200,
+      "elapsed_s": 12.966,
+      "score": 53.8,
+      "score_breakdown": {
+        "fabrication": 100,
+        "readability": 6.5,
+        "completeness": 28.0,
+        "expression": 13.3,
+        "response": 6.0,
+        "total": 53.8
+      },
+      "scenario": "scenario4",
+      "industry": "finance",
+      "user_stage": "experienced",
+      "missing_count": 0,
+      "conflict_count": 1,
+      "docx": "/mnt/disk1/zengzhitao/resume-copilot-server-acceptance/output/简历_林思远_优化版.docx",
+      "reply_text": "已按“个人信息结合目标 JD 生成简历”完成一版可编辑 DOCX，识别方向为金融，用户阶段为experienced。\n根据您提供的个人描述，建议投递行业研究员相关岗位\n当前自动评分为 53.8/100。\n需要确认：工作经历时间可能冲突：中信证券（实习研究员）(03-2023 - 05-2025) 与 招商基金（投研分析）(07-2018 - 06-2025) 时间段有重叠，请确认是否为并行兼职/实习或时间填写有误\n建议优先补齐联系方式、教育时间、经历成果和可量化结果，再用于正式投递。",
+      "validation_failures": [
+        "missing_field_not_reported:skills"
+      ],
+      "raw": {
+        "files": {
+          "docx": "/mnt/disk1/zengzhitao/resume-copilot-server-acceptance/output/简历_林思远_优化版.docx",
+          "pdf": null
+        },
+        "reply_text": "已按“个人信息结合目标 JD 生成简历”完成一版可编辑 DOCX，识别方向为金融，用户阶段为experienced。\n根据您提供的个人描述，建议投递行业研究员相关岗位\n当前自动评分为 53.8/100。\n需要确认：工作经历时间可能冲突：中信证券（实习研究员）(03-2023 - 05-2025) 与 招商基金（投研分析）(07-2018 - 06-2025) 时间段有重叠，请确认是否为并行兼职/实习或时间填写有误\n建议优先补齐联系方式、教育时间、经历成果和可量化结果，再用于正式投递。",
+        "score": {
+          "fabrication": 100,
+          "readability": 6.5,
+          "completeness": 28.0,
+          "expression": 13.3,
+          "response": 6.0,
+          "total": 53.8
+        },
+        "missing_fields": [],
+        "conflicts": [
+          {
+            "field": "experience",
+            "description": "工作经历时间可能冲突：中信证券（实习研究员）(03-2023 - 05-2025) 与 招商基金（投研分析）(07-2018 - 06-2025) 时间段有重叠，请确认是否为并行兼职/实习或时间填写有误"
+          }
+        ],
+        "scenario": "scenario4",
+        "industry": "finance",
+        "user_stage": "experienced",
+        "perf": {
+          "jd_resolve_s": 0.0,
+          "classify_s": 1.321,
+          "structured_resume_s": 2.2,
+          "_classify_fix_user_stage_s": 3.521,
+          "validation_s": 0.001,
+          "export_files_s": 0.05,
+          "draft_s": 0.0,
+          "total_s": 12.963
+        },
+        "score_breakdown": {
+          "fabrication": 100,
+          "readability": 6.5,
+          "completeness": 28.0,
+          "expression": 13.3,
+          "response": 6.0,
+          "total": 53.8
+        },
+        "ocr_warnings": [],
+        "user_report": {
+          "generation_direction": "根据您提供的个人描述，建议投递行业研究员相关岗位",
+          "missing_field_suggestions": [],
+          "conflict_confirmations": [
+            {
+              "field": "experience",
+              "description": "工作经历时间可能冲突：中信证券（实习研究员）(03-2023 - 05-2025) 与 招商基金（投研分析）(07-2018 - 06-2025) 时间段有重叠，请确认是否为并行兼职/实习或时间填写有误"
+            }
+          ],
+          "ocr_warnings": [],
+          "template_notes": []
+        },
+        "resume_data": {
+          "meta": {
+            "name": "林思远",
+            "age": "",
+            "gender": "",
+            "email": "linsiyuan@example.com",
+            "phone": "13600005005",
+            "wechat": "",
+            "github": "",
+            "linkedin": "",
+            "website": "",
+            "education_level": "本科",
+            "work_experience": "7年",
+            "political_status": "",
+            "expected_city": "",
+            "target_role": "行业研究员",
+            "job_intention": "金融行业研究员岗位"
+          },
+          "summary": "拥有5年金融从业经验，具备扎实的投研分析能力。熟悉行业研究、公司调研及财务模型构建。擅长使用SQL、Excel、Python等工具进行数据分析，致力于通过深度研究为投资决策提供专业支持。",
+          "experience": [
+            {
+              "company": "中信证券",
+              "role": "实习研究员",
+              "team": "",
+              "period": "03-2023 - 05-2025",
+              "function_description": "从事实习研究员工作",
+              "result_description": "",
+              "bullets": [
+                "从事实习研究员工作"
+              ],
+              "responsibilities": [],
+              "achievements": [],
+              "projects": [],
+              "start_date": "03-2023",
+              "end_date": "05-2025"
+            },
+            {
+              "company": "招商基金",
+              "role": "投研分析",
+              "team": "",
+              "period": "07-2018 - 06-2025",
+              "function_description": "负责投研分析工作",
+              "result_description": "",
+              "bullets": [
+                "负责投研分析工作"
+              ],
+              "responsibilities": [],
+              "achievements": [],
+              "projects": [],
+              "start_date": "07-2018",
+              "end_date": "06-2025"
+            }
+          ],
+          "projects": [],
+          "education": [
+            {
+              "school": "武汉大学",
+              "degree": "本科",
+              "major": "金融学",
+              "period": "01-2014",
+              "highlights": [],
+              "start_date": "01-2014"
+            }
+          ],
+          "skills": {
+            "languages": [],
+            "frameworks": [],
+            "tools": [
+              "R"
+            ],
+            "domains": []
+          },
+          "publications": [],
+          "honors": [],
+          "awards": [],
+          "certifications": [],
+          "personal_skills": [
+            "行业研究",
+            "公司调研",
+            "财务模型构建",
+            "估值分析",
+            "投资逻辑梳理",
+            "数据分析"
+          ],
+          "additional_sections": {},
+          "fact_sources": {
+            "raw_input": "query/cv",
+            "jd_usage": "JD only used for direction; facts must come from query/cv."
+          }
+        },
+        "draft_id": "65afdf8399",
+        "version": 1
+      }
+    }
+  ]
+}

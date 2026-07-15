@@ -276,24 +276,18 @@ def check_required_fields(
     resume_data: dict[str, Any],
     user_stage: Optional[str] = None,
     source_text: str = "",
-    *,
-    has_cv: bool = False,
 ) -> list[MissingField]:
     """Check that all required fields are present in resume_data.
 
     When source_text is provided, fields missing in resume_data but present
-    in source_text are marked as extraction_lost (system failed to extract)
-    rather than not_provided (user didn't supply them).
-
-    When has_cv=True and source_text has content, standard identity fields
-    (name, phone, email) are assumed to exist in the original CV even if OCR
-    garbled them — they become extraction_lost, not not_provided.
+    in source_text (via regex) are marked as extraction_lost rather than
+    not_provided — the field exists in the original document but the system
+    failed to extract it cleanly.
 
     Args:
         resume_data: The structured resume data.
         user_stage: One of 'student', 'experienced', 'job_seeker'.
         source_text: Original CV/query text for extraction-loss detection.
-        has_cv: True when a CV file was uploaded and text was extracted.
     """
     if not isinstance(resume_data, dict):
         return [MissingField(field="root", label="简历数据", reason="简历数据为空，无法校验")]
@@ -311,16 +305,9 @@ def check_required_fields(
         if not value:
             field_source = "not_provided"
             reason = f"{label}为必填项，请在简历中补充"
-            if source_text:
-                found = _field_exists_in_source(key, source_text)
-                if found:
-                    field_source = "extraction_lost"
-                    reason = f"系统未能从原文中稳定识别{label}，请确认后补充"
-                elif has_cv and len(source_text.strip()) >= 50:
-                    # CV uploaded with content but specific field not found
-                    # by regex (OCR garbled it). Still signal extraction_lost.
-                    field_source = "extraction_lost"
-                    reason = f"系统未能从上传的简历中稳定识别{label}，请确认后补充"
+            if source_text and _field_exists_in_source(key, source_text):
+                field_source = "extraction_lost"
+                reason = f"系统未能从原文中稳定识别{label}，请确认后补充"
             missing.append(MissingField(
                 field=f"meta.{key}",
                 label=label,

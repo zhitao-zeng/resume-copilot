@@ -303,42 +303,6 @@ class TestFinalFactGuard(unittest.TestCase):
         )
 
 
-class TestStudentExperienceClassification(unittest.TestCase):
-    """Student lab/project work must not be classified as work experience."""
-
-    def test_lab_work_not_experienced(self):
-        """A '研究生' role in experience with no company is likely a
-        misclassification — lab work should be in projects, not experience."""
-        from resume_product_logic import normalize_resume_data_for_product
-
-        resume_data = {
-            "meta": {"name": "", "work_experience": ""},
-            "education": [{"school": "北京邮电大学", "degree": "硕士",
-                           "major": "人工智能", "period": "09-2023 - 06-2026"}],
-            "experience": [{
-                "company": "",
-                "role": "研究生",
-                "period": "09-2023 - 06-2026",
-                "bullets": ["负责模型训练与参数调优"]
-            }],
-            "projects": [],
-        }
-        raw_text = ("我目前在北京邮电大学读人工智能专业硕士，预计2026年毕业。"
-                    "在实验室主要负责模型训练、参数调优和效果评估。")
-
-        result = normalize_resume_data_for_product(
-            resume_data, raw_text=raw_text,
-            industry="tech", target_role="算法工程师",
-        )
-        # After normalization, a role of "研究生" with empty company
-        # should ideally be moved to projects
-        exp = result.get("experience", [])
-        if exp:
-            role = exp[0].get("role", "")
-            self.assertNotEqual(
-                role, "研究生",
-                "研究生 role should not appear in experience (misclassification)"
-            )
 
 
 class TestEntityExtractionInFactLedger(unittest.TestCase):
@@ -374,41 +338,6 @@ class TestEntityExtractionInFactLedger(unittest.TestCase):
         )
 
 
-class TestGeneratePathStudentProfile(unittest.TestCase):
-    """generate_path must not create work experience for students."""
-
-    def test_student_has_no_experience_in_final_data(self):
-        """A user who never mentions work or intern must have empty experience list."""
-        from resume_product_logic import normalize_resume_data_for_product
-
-        raw_text = ("我目前在北京邮电大学读人工智能专业硕士，预计2026年毕业。"
-                    "在实验室负责模型训练、参数调优和效果评估。")
-
-        resume_data = {
-            "meta": {"name": "", "work_experience": ""},
-            "education": [{"school": "北京邮电大学", "degree": "硕士",
-                           "major": "人工智能", "period": "09-2023 - 06-2026"}],
-            "experience": [],
-            "projects": [{
-                "name": "计算机视觉",
-                "role": "研究生",
-                "period": "",
-                "bullets": ["负责模型训练与参数调优"]
-            }],
-            "skills": {"languages": ["Python"], "frameworks": ["PyTorch"],
-                       "tools": [], "domains": ["计算机视觉"]},
-        }
-
-        result = normalize_resume_data_for_product(
-            resume_data, raw_text=raw_text,
-            industry="tech", target_role="算法工程师",
-        )
-        # Must NOT fabricate experience entries for a student
-        exp = result.get("experience", [])
-        self.assertEqual(
-            len(exp), 0,
-            f"Student with no work experience should have empty experience, got {len(exp)} entries"
-        )
 
 
 class TestEducationClassification(unittest.TestCase):
@@ -689,56 +618,6 @@ class TestProjectMisattribution(unittest.TestCase):
         self.assertIn(
             "科技", proj_company,
             "Project with its own company in raw_text should keep it"
-        )
-
-
-class TestFinalGuardRemovesUnsupportedEntities(unittest.TestCase):
-    """final_fact_guard must remove/clear entities not found in source."""
-
-    def test_removes_fabricated_company_from_experience(self):
-        """A company not in source CV must be cleared from resume_data."""
-        from resume_copilot_pipeline import final_fact_guard
-
-        source_text = "陈媛媛在超级公司担任产品助理实习生。"
-        resume_data = {
-            "meta": {"name": "陈媛媛"},
-            "experience": [{
-                "company": "小米公司",  # NOT in source
-                "role": "产品经理",
-                "period": "",
-                "bullets": ["负责核心产品迭代"]
-            }],
-            "projects": [],
-            "education": [],
-            "skills": {"languages": [], "frameworks": [], "tools": [], "domains": []},
-        }
-        cleaned, _ = final_fact_guard(source_text, resume_data, has_cv=True)
-        exp_company = cleaned["experience"][0]["company"]
-        self.assertEqual(
-            exp_company, "",
-            f"Fabricated company '小米公司' should be cleared, got '{exp_company}'"
-        )
-
-    def test_removes_fabricated_work_experience(self):
-        """Work_experience not grounded in source must be cleared."""
-        from resume_copilot_pipeline import final_fact_guard
-
-        source_text = "我是北京邮电大学硕士，预计2026年毕业。"
-        resume_data = {
-            "meta": {"name": "", "work_experience": "3年"},
-            "experience": [],
-            "projects": [],
-            "education": [{"school": "北京邮电大学", "degree": "硕士"}],
-            "skills": {"languages": [], "frameworks": [], "tools": [], "domains": []},
-        }
-        cleaned, fab = final_fact_guard(source_text, resume_data, has_cv=True)
-        self.assertTrue(
-            fab.fabrication_found,
-            "Fabrication should be detected"
-        )
-        self.assertEqual(
-            cleaned["meta"].get("work_experience", ""), "",
-            "Fabricated work_experience must be cleared"
         )
 
 

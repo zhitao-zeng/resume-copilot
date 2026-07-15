@@ -474,45 +474,7 @@ def final_fact_guard(
     if not has_cv:
         return resume_data, FabricationReport(fabrication_found=False, details=[])
     fab = check_fabrication_heuristic(source_truth_text, resume_data)
-    # Rollback: for each detected fabrication, clear the unsafe field.
-    # This ensures the output is never worse than the original CV.
-    for detail in fab.details:
-        _apply_fabrication_rollback(resume_data, detail)
     return resume_data, fab
-
-
-def _apply_fabrication_rollback(
-    resume_data: dict[str, Any], detail: FabricationDetail,
-) -> None:
-    """Clear a fabricated entity from resume_data in-place.
-
-    Only clears 'company', 'school', 'role', 'name', 'work_experience',
-    'education_level' — fields whose value originates from LLM parsing
-    rather than from user CV. Other fabrication types (skills, dates,
-    metrics) are reported but not cleared here since they may co-exist
-    with supported values in the same text field.
-    """
-    _ROLLBACK_FIELDS = {"company", "school", "work_experience", "education_level"}
-    if detail.type not in _ROLLBACK_FIELDS:
-        return
-
-    target = detail.content
-
-    # Clear from meta
-    if detail.type in ("work_experience", "education_level"):
-        if resume_data.get("meta", {}).get(detail.type) == target:
-            resume_data["meta"][detail.type] = ""
-        return
-
-    # Clear from experience[].company
-    for exp in resume_data.get("experience", []):
-        if isinstance(exp, dict) and exp.get("company") == target:
-            exp["company"] = ""
-
-    # Clear from education[].school
-    for edu in resume_data.get("education", []):
-        if isinstance(edu, dict) and edu.get("school") == target:
-            edu["school"] = ""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -687,20 +649,6 @@ async def rewrite_path(ctx: PipelineContext) -> PipelineContext:
     # Repair + user_stage fix
     from resume_copilot_service import _repair_common_parse_errors
     _repair_common_parse_errors(resume_data, ctx.generation_text)
-    # Re-normalize after repair — repair may replace projects/education from
-    # LLM output, re-introducing inherited companies and fabricated entities.
-    resume_data = product_logic.normalize_resume_data_for_product(
-        resume_data, raw_text=ctx.generation_text,
-        industry=ctx.industry, target_role=ctx.target_role,
-    )
-
-    # Clear nested projects inside experience entries — all projects must be
-    # at the top level.  LLM parsers often nest standalone projects under the
-    # nearest experience entry, which causes the renderer to show an inherited
-    # company/role affiliation that doesn't exist in the original CV.
-    for exp in resume_data.get("experience", []):
-        if isinstance(exp, dict):
-            exp.pop("projects", None)
 
     experience = resume_data.get("experience", [])
     education = resume_data.get("education", [])
@@ -845,7 +793,7 @@ async def rewrite_path(ctx: PipelineContext) -> PipelineContext:
             for _hint in _llm_details[:5]:
                 logger.info("  hint: %s", str(_hint)[:100])
 
-    ctx.missing_fields = check_required_fields(ctx.resume_data, user_stage=ctx.user_stage, source_text=ctx.source_truth_text, has_cv=ctx.has_cv)
+    ctx.missing_fields = check_required_fields(ctx.resume_data, user_stage=ctx.user_stage, source_text=ctx.source_truth_text)
     ctx.conflicts = check_time_conflicts(ctx.resume_data)
     ctx.conflicts.extend(check_sort_order(ctx.resume_data))
     ctx.conflicts.extend(check_summary_jd_alignment(
@@ -1023,7 +971,7 @@ async def generate_path(ctx: PipelineContext) -> PipelineContext:
         ctx.source_truth_text, ctx.resume_data, has_cv=False,
     )
 
-    ctx.missing_fields = check_required_fields(ctx.resume_data, user_stage=ctx.user_stage, source_text=ctx.source_truth_text, has_cv=ctx.has_cv)
+    ctx.missing_fields = check_required_fields(ctx.resume_data, user_stage=ctx.user_stage, source_text=ctx.source_truth_text)
 
     ctx.conflicts = check_time_conflicts(ctx.resume_data)
     ctx.conflicts.extend(check_sort_order(ctx.resume_data))
