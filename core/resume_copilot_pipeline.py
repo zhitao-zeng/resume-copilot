@@ -469,12 +469,129 @@ def final_fact_guard(
     source_truth_text: str,
     resume_data: dict[str, Any],
     has_cv: bool = True,
-    *, max_iterations: int = 1,
+    *,
+    max_iterations: int = 1,
+    ledger: Any = None,
 ) -> tuple[dict[str, Any], FabricationReport]:
-    if not has_cv:
+    """Fabrication check with entity-level field validation.
+
+    Guard condition: skips only when source_truth_text is truly empty.
+    ``has_cv`` is no longer the guard — user query is also a valid fact
+    source (e.g. generate_path with query text).
+
+    When a FactLedger is provided, ``company`` and ``role`` fields are
+    validated against ledger entities — unsupported values are cleared.
+    For ``company``, if the full value is unsupported but a known entity
+    (school/company) from the ledger is a substring of it, that entity
+    is used as a safe fallback.
+    """
+    if not source_truth_text.strip():
         return resume_data, FabricationReport(fabrication_found=False, details=[])
     fab = check_fabrication_heuristic(source_truth_text, resume_data)
+
+    # Entity-level validation with ledger
+    if ledger is not None:
+        _validate_experience_entities(resume_data, ledger, fab)
+        _validate_role_entities(resume_data, ledger, fab)
+
     return resume_data, fab
+
+
+def _validate_experience_entities(
+    resume_data: dict, ledger: Any, fab: FabricationReport,
+) -> None:
+    """Validate experience[].company against ledger entities.
+
+    If the full company value has no ledger support, attempt to fallback
+    to a known entity (school/organization) that IS in the ledger and is
+    contained within the company value.  This handles cases like
+    '北京邮电大学实验室' → fallback to '北京邮电大学' (known school).
+    """
+    from schemas import FabricationDetail
+
+    ledger_org_values: set[str] = set()
+    for (kind, val_lower), entity in ledger.entities.items():
+        if kind in ("company", "school", "organization"):
+            ledger_org_values.add(entity.value)
+
+    for exp in resume_data.get("experience", []):
+        if not isinstance(exp, dict):
+            continue
+        company = str(exp.get("company", "")).strip()
+        if not company:
+            continue
+        company_lower = company.lower()
+
+        # Check if company is directly supported
+        if any(entity.value.lower() == company_lower for entity in ledger.entities.values()):
+            continue  # fully supported, keep
+
+        # Check if company value appears as contiguous substring in raw_text
+        # (already done by check_fabrication_heuristic, but double-check)
+        if company_lower in ledger.raw_text.lower():
+            continue  # supported as-is
+
+        # Not fully supported — try fallback to a known entity
+        best_fallback = ""
+        for org_val in sorted(ledger_org_values, key=len, reverse=True):
+            if org_val.lower() in company_lower:
+                best_fallback = org_val
+                break
+
+        if best_fallback:
+            exp["company"] = best_fallback
+            fab.details.append(FabricationDetail(
+                type="company",
+                content=company,
+                reason=f"组织名'{company}'部分不受支持，已回退到已知实体'{best_fallback}'",
+            ))
+        else:
+            exp["company"] = ""
+            fab.details.append(FabricationDetail(
+                type="company",
+                content=company,
+                reason="该公司名未在用户原始输入中出现",
+            ))
+
+
+def _validate_role_entities(
+    resume_data: dict, ledger: Any, fab: FabricationReport,
+) -> None:
+    """Clear experience[].role if it has no support in the FactLedger.
+
+    Role is a strict field — it must have direct or normalized evidence
+    in the source text.  If not, it is cleared (not guessed).
+    """
+    from schemas import FabricationDetail
+
+    ledger_role_values: set[str] = set()
+    for (kind, val_lower), entity in ledger.entities.items():
+        if kind == "role":
+            ledger_role_values.add(entity.value.lower())
+
+    for exp in resume_data.get("experience", []):
+        if not isinstance(exp, dict):
+            continue
+        role = str(exp.get("role", "")).strip()
+        if not role:
+            continue
+        role_lower = role.lower()
+
+        # Direct substring match in raw_text
+        if role_lower in ledger.raw_text.lower():
+            continue
+
+        # Also check ledger entities
+        if role_lower in ledger_role_values:
+            continue
+
+        # Unsupported — clear
+        exp["role"] = ""
+        fab.details.append(FabricationDetail(
+            type="role",
+            content=role,
+            reason="该岗位名称未出现在用户原始输入中",
+        ))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -964,11 +1081,25 @@ async def generate_path(ctx: PipelineContext) -> PipelineContext:
             except Exception as exc:
                 logger.warning("generate_path enrichment failed: %s", exc)
 
-    # ── Validate (lite: no CV-based LLM enhance) ──
+    # ── Validate (with source-truth-based fact check) ──
     t_validate = time.perf_counter()
 
+    # Build FactLedger from user-provided source_truth_text (query),
+    # NOT from generated LLM output.  This gives us a trusted entity
+    # set for field-level validation.
+    _gen_ledger: Any = None
+    if ctx.source_truth_text.strip():
+        try:
+            from fact_ledger import build_ledger
+            _gen_ledger = build_ledger(
+                ctx.resume_data, ctx.source_truth_text, run_repair=False,
+            )
+        except Exception as exc:
+            logger.warning("generate_path FactLedger build failed, skip entity validation: %s", exc)
+
     ctx.resume_data, ctx.fabrication_report = final_fact_guard(
-        ctx.source_truth_text, ctx.resume_data, has_cv=False,
+        ctx.source_truth_text, ctx.resume_data, has_cv=ctx.has_cv,
+        ledger=_gen_ledger,
     )
 
     ctx.missing_fields = check_required_fields(ctx.resume_data, user_stage=ctx.user_stage, source_text=ctx.source_truth_text)

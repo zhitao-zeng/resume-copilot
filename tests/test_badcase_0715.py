@@ -893,5 +893,141 @@ class TestOcrReadingOrder(unittest.TestCase):
 
 
 
+
+class TestGeneratePathFactGuard(unittest.TestCase):
+    """generate_path must use source_truth_text for fact verification."""
+
+    def test_guard_uses_source_truth_not_has_cv(self):
+        """final_fact_guard must execute when source_truth_text is non-empty,
+        even when has_cv=False (generate_path)."""
+        from resume_copilot_pipeline import final_fact_guard
+        from schemas import FabricationReport
+
+        source_text = "我是北京邮电大学硕士，在实验室做模型训练。"
+        resume_data = {
+            "meta": {"name": "", "work_experience": ""},
+            "experience": [{
+                "company": "北京邮电大学实验室",
+                "role": "研究助理",
+                "period": "",
+                "bullets": ["负责模型训练"]
+            }],
+            "projects": [],
+            "education": [{"school": "北京邮电大学", "degree": "硕士"}],
+            "skills": {"languages": [], "frameworks": [], "tools": [], "domains": []},
+        }
+
+        cleaned, fab = final_fact_guard(source_text, resume_data, has_cv=False)
+        self.assertTrue(
+            fab.fabrication_found,
+            "guard should detect fabrication even with has_cv=False when source_truth is non-empty"
+        )
+
+    def test_guard_skips_when_no_source_truth(self):
+        """final_fact_guard must skip when source_truth_text is empty,
+        even when has_cv=True (should not happen in practice but defensively)."""
+        from resume_copilot_pipeline import final_fact_guard
+        from schemas import FabricationReport
+
+        resume_data = {
+            "meta": {},
+            "experience": [],
+            "projects": [],
+            "education": [],
+        }
+        _, fab = final_fact_guard("", resume_data, has_cv=True)
+        self.assertFalse(
+            fab.fabrication_found,
+            "guard should skip when source_truth_text is empty"
+        )
+
+    def test_unsupported_role_cleared(self):
+        """Role not in source_truth must be cleared, even in generate_path."""
+        from resume_copilot_pipeline import final_fact_guard
+        from fact_ledger import build_ledger
+
+        source_text = "我目前在北京邮电大学读人工智能专业硕士，在实验室负责模型训练。"
+        resume_data = {
+            "meta": {"name": "", "work_experience": "学生"},
+            "education": [{"school": "北京邮电大学", "degree": "硕士", "major": "人工智能"}],
+            "experience": [{
+                "company": "",
+                "role": "研究助理",
+                "period": "",
+                "bullets": ["负责模型训练"]
+            }],
+            "projects": [],
+            "skills": {"languages": ["Python"], "frameworks": ["PyTorch"],
+                       "tools": [], "domains": ["计算机视觉"]},
+        }
+        ledger = build_ledger(resume_data, source_text, run_repair=False)
+        cleaned, fab = final_fact_guard(source_text, resume_data, ledger=ledger)
+
+        role = cleaned["experience"][0]["role"]
+        self.assertEqual(role, "", f"Unsupported role should be cleared, got '{role}'")
+
+    def test_company_fallback_to_known_entity(self):
+        """Company partially supported should fallback to known entity."""
+        from resume_copilot_pipeline import final_fact_guard
+        from fact_ledger import build_ledger
+
+        source_text = "我目前在北京邮电大学读人工智能专业硕士，在实验室负责模型训练。"
+        resume_data = {
+            "meta": {"name": "", "work_experience": "学生"},
+            "education": [{"school": "北京邮电大学", "degree": "硕士", "major": "人工智能"}],
+            "experience": [{
+                "company": "北京邮电大学实验室",
+                "role": "",
+                "period": "",
+                "bullets": ["负责模型训练"]
+            }],
+            "projects": [],
+            "skills": {"languages": ["Python"], "frameworks": ["PyTorch"],
+                       "tools": [], "domains": ["计算机视觉"]},
+        }
+        ledger = build_ledger(resume_data, source_text, run_repair=False)
+        cleaned, fab = final_fact_guard(source_text, resume_data, ledger=ledger)
+
+        company = cleaned["experience"][0]["company"]
+        self.assertEqual(
+            company, "北京邮电大学",
+            f"Company should fallback to '北京邮电大学', got '{company}'"
+        )
+
+    def test_fully_supported_company_unchanged(self):
+        """Company with direct evidence must NOT be modified."""
+        from resume_copilot_pipeline import final_fact_guard
+        from fact_ledger import build_ledger
+
+        source_text = "我在超级公司担任产品经理，负责核心产品功能迭代。"
+        resume_data = {
+            "meta": {"name": "", "work_experience": ""},
+            "education": [],
+            "experience": [{
+                "company": "超级公司",
+                "role": "产品经理",
+                "period": "",
+                "bullets": ["负责核心产品功能迭代"]
+            }],
+            "projects": [],
+            "skills": {"languages": [], "frameworks": [], "tools": [], "domains": []},
+        }
+        ledger = build_ledger(resume_data, source_text, run_repair=False)
+        cleaned, fab = final_fact_guard(source_text, resume_data, ledger=ledger)
+
+        self.assertEqual(
+            cleaned["experience"][0]["company"], "超级公司",
+            "Fully supported company must not change"
+        )
+        self.assertEqual(
+            cleaned["experience"][0]["role"], "产品经理",
+            "Fully supported role must not change"
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
 if __name__ == "__main__":
     unittest.main()
