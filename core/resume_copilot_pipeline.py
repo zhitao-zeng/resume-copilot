@@ -199,6 +199,25 @@ class PipelineContext:
     draft_id: str = ""
     version: str = ""
 
+    # Debug output (only set when DEBUG_OUTPUT_DIR env is set)
+    _debug_dir: str = ""
+    _debug_prefix: str = ""
+
+    def _write_debug(self, name: str, data: Any) -> None:
+        if not self._debug_dir:
+            return
+        import json, os
+        path = os.path.join(self._debug_dir, f"{self._debug_prefix}_{name}")
+        try:
+            if isinstance(data, str):
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(data)
+            else:
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            logger.warning("Debug output failed for %s: %s", name, exc)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Shared helpers (moved from resume_copilot_service.py)
@@ -672,6 +691,21 @@ async def stage_ingest(
     ctx = PipelineContext()
     ctx.started = time.perf_counter()
     ctx.query_text = str(query or "").strip()
+    # Init debug output dir if configured
+    import os as _os
+    _debug_out = _os.environ.get("DEBUG_OUTPUT_DIR", "").strip()
+    if _debug_out:
+        ctx._debug_dir = _debug_out
+        case_tag = (str(query or "")[:30] if query else "no-query").replace("\n", " ").replace("/", "_")
+        ctx._debug_prefix = "00"
+        ctx._write_debug("01_query.txt", query or "")
+        ctx._write_debug("00_input_raw.txt", {
+            "query": query, "has_cv": cv is not None,
+            "has_jd": bool(target_jd or jd_text or target_jd_url or jd_url),
+            "has_template": cv_template is not None,
+        })
+        # Set prefix for next stage
+        ctx._debug_prefix = "01"
 
     # CV extraction + upload tracking
     ctx.cv_text = ""
@@ -680,6 +714,7 @@ async def stage_ingest(
         ctx.cv_text = await _extract_upload_text(cv, "cv", ctx.perf, ctx.ocr_warnings)
 
     # OCR quality gate
+    ctx._write_debug("02_cv_text.txt", ctx.cv_text)
     ctx._low_ocr_quality = False
     ctx.cv_extraction_failed = False
     ctx.ocr_quality = None
@@ -766,6 +801,9 @@ async def stage_classify(ctx: PipelineContext) -> PipelineContext:
     ctx.industry = classification.industry
     ctx.user_stage = classification.user_stage
     ctx.perf["classify_s"] = round(time.perf_counter() - t_classify, 3)
+    ctx._debug_prefix = "02"
+    ctx._write_debug("03_source_truth.txt", ctx.source_truth_text)
+    ctx._write_debug("03_generation_text.txt", ctx.generation_text)
 
     return ctx
 
@@ -947,6 +985,10 @@ async def rewrite_path(ctx: PipelineContext) -> PipelineContext:
             "message": "低质量OCR已跳过优化，仅基于 query 生成弱简历",
         })
 
+    # Debug: parse result
+    ctx._debug_prefix = "03"
+    ctx._write_debug("05_parsed_resume.json", ctx.resume_data)
+
     # ── Validate ──
     t_validate = time.perf_counter()
 
@@ -970,6 +1012,13 @@ async def rewrite_path(ctx: PipelineContext) -> PipelineContext:
                 logger.info("  hint: %s", str(_hint)[:100])
 
     ctx.missing_fields = check_required_fields(ctx.resume_data, user_stage=ctx.user_stage, source_text=ctx.source_truth_text)
+    ctx._debug_prefix = "04"
+    ctx._write_debug("06_after_fact_guard.json", {
+        "resume_data": ctx.resume_data,
+        "fabrication_report": ctx.fabrication_report.model_dump() if hasattr(ctx.fabrication_report, "model_dump") else {},
+    })
+    ctx._write_debug("08_missing_fields.json", [{"field": m.field, "label": m.label, "reason": m.reason, "source": m.source} for m in ctx.missing_fields] if ctx.missing_fields else [])
+
     ctx.conflicts = check_time_conflicts(ctx.resume_data)
     ctx.conflicts.extend(check_sort_order(ctx.resume_data))
     ctx.conflicts.extend(check_summary_jd_alignment(
@@ -1162,6 +1211,12 @@ async def generate_path(ctx: PipelineContext) -> PipelineContext:
     )
 
     ctx.missing_fields = check_required_fields(ctx.resume_data, user_stage=ctx.user_stage, source_text=ctx.source_truth_text)
+    ctx._debug_prefix = "04"
+    ctx._write_debug("06_after_fact_guard.json", {
+        "resume_data": ctx.resume_data,
+        "fabrication_report": ctx.fabrication_report.model_dump() if hasattr(ctx.fabrication_report, "model_dump") else {},
+    })
+    ctx._write_debug("08_missing_fields.json", [{"field": m.field, "label": m.label, "reason": m.reason, "source": m.source} for m in ctx.missing_fields] if ctx.missing_fields else [])
 
     ctx.conflicts = check_time_conflicts(ctx.resume_data)
     ctx.conflicts.extend(check_sort_order(ctx.resume_data))
@@ -1275,4 +1330,15 @@ async def stage_render(ctx: PipelineContext) -> PipelineContext:
     )
     ctx.perf["draft_s"] = round(time.perf_counter() - t_draft, 3)
     ctx.perf["total_s"] = round(time.perf_counter() - ctx.started, 3)
+    ctx._debug_prefix = "09"
+    ctx._write_debug("09_reply_context.json", {
+        "reply_text": ctx.reply_text,
+        "missing_fields": [{"field": m.field, "label": m.label, "reason": m.reason, "source": m.source} for m in ctx.missing_fields] if ctx.missing_fields else [],
+        "fabrication_found": ctx.fabrication_report.fabrication_found if hasattr(ctx.fabrication_report, "fabrication_found") else False,
+        "score": ctx.score,
+        "user_stage": ctx.user_stage,
+        "target_role": ctx.target_role,
+        "scenario": ctx.scenario,
+        "has_cv": ctx.has_cv,
+    })
     return ctx
