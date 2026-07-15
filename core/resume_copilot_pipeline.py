@@ -89,6 +89,10 @@ def _clean_template_watermarks(resume_data: dict, query_text: str = "", has_cv: 
             # generate_path: query IS the fact source — no field value
             # derived from query should be treated as leakage.
             return False
+        # target_role and job_intention are user INTENT, not candidate facts.
+        # They are expected to come from query/JD.  Never treat as leakage.
+        if ".meta.target_role" in path or ".meta.job_intention" in path:
+            return False
         if len(value) < 3:
             return False
         v = value.lower().strip()
@@ -207,6 +211,7 @@ class PipelineContext:
         if not self._debug_dir:
             return
         import json, os
+        os.makedirs(self._debug_dir, exist_ok=True)
         path = os.path.join(self._debug_dir, f"{self._debug_prefix}_{name}")
         try:
             if isinstance(data, str):
