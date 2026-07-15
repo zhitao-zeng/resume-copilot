@@ -8,6 +8,7 @@ natural-language reply + scoring metadata.
 from __future__ import annotations
 
 import copy
+import os
 import re
 import time
 from datetime import datetime
@@ -759,10 +760,37 @@ async def resume_copilot_service(
     )
     ctx = await stage_classify(ctx)
 
-    if ctx.has_cv:
-        ctx = await rewrite_path(ctx)
-    else:
-        ctx = await generate_path(ctx)
+    # V2 pipeline flag
+    _pipeline_version = os.environ.get("RESUME_PIPELINE_VERSION", "v1").strip()
+    if _pipeline_version in ("v2", "shadow"):
+        try:
+            from v2_pipeline import run_v2_pipeline
+            v2_result = run_v2_pipeline(
+                cv_text=ctx.cv_text,
+                query_text=ctx.query_text,
+                jd_text=ctx.jd_text,
+            )
+            if _pipeline_version == "shadow":
+                logger.info("SHADOW | V2 produced %d edu, %d exp",
+                            len(v2_result.resume.education),
+                            len(v2_result.resume.experiences))
+            else:
+                ctx.resume_data = v2_result.resume_dict
+                ctx.fabrication_report = None
+                ctx.missing_fields = []
+        except Exception as exc:
+            logger.error("V2 pipeline failed: %s", exc)
+            if _pipeline_version == "v2":
+                if ctx.has_cv:
+                    ctx = await rewrite_path(ctx)
+                else:
+                    ctx = await generate_path(ctx)
+
+    if _pipeline_version == "v1" or (_pipeline_version == "v2" and not ctx.resume_data):
+        if ctx.has_cv:
+            ctx = await rewrite_path(ctx)
+        else:
+            ctx = await generate_path(ctx)
 
     ctx = await stage_score(ctx)
     ctx = await stage_render(ctx)
