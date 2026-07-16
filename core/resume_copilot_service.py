@@ -773,7 +773,7 @@ async def resume_copilot_service(
             if _pipeline_version == "shadow":
                 logger.info("SHADOW | V2 produced %d edu, %d exp",
                             len(v2_result.resume.education),
-                            len(v2_result.resume.experiences))
+                            len(v2_result.resume.experience))
             else:
                 ctx.resume_data = v2_result.resume_dict
                 ctx.fabrication_report = None

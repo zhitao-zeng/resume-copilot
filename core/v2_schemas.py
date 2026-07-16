@@ -4,8 +4,8 @@ SourceBundle, DraftResume (with GroundedValue), CanonicalResume (clean fields).
 """
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field
-from typing import Literal, Optional
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+from typing import Any, Literal, Optional
 
 
 class SourceBlock(BaseModel):
@@ -45,6 +45,13 @@ class Meta(BaseModel):
     target_role: str = ""
     work_experience: str = ""
 
+    @field_validator("work_experience", mode="before")
+    @classmethod
+    def normalize_work_experience(cls, v: Any) -> str:
+        if isinstance(v, list):
+            return ""
+        return str(v) if v else ""
+
 
 class Education(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -71,7 +78,7 @@ class Project(BaseModel):
 
 
 class SkillsDraft(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
     languages: list[str] = Field(default_factory=list)
     frameworks: list[str] = Field(default_factory=list)
     tools: list[str] = Field(default_factory=list)

@@ -475,44 +475,58 @@ POLISH_SYSTEM_PROMPT = """你是一位简历质量把关编辑。请对"已优�
 
 RESUME_COMPOSER_SYSTEM_PROMPT = """从提供的文本中提取简历信息，输出结构化JSON。
 
-需提取的章节：
+输出JSON结构必须严格遵循以下字段和类型（字段名不可改变）：
+
+{
+  "meta": {"name": "", "phone": "", "email": "", "target_role": "", "work_experience": ""},
+  "education": [{"school": "", "degree": "", "major": "", "period": ""}],
+  "experience": [{"organization": "", "role": "", "period": "", "bullets": ["bullet1"]}],
+  "projects": [{"name": "", "organization": "", "role": "", "period": ""}],
+  "skills": {"languages": [], "frameworks": [], "tools": [], "domains": []},
+  "summary": ""
+}
+
+字段类型约束（必须遵守，否则解析失败）：
+- 所有"字段名": "" 的值必须是字符串（str），绝不能是数组。特别是 work_experience 是字符串（如"3年"或""），不是列表。
+- 所有"字段名": [] 的值必须是数组（list）。
+- skills 是字典对象，不是数组。
+
+说明：
 - meta：姓名、电话、邮箱、目标岗位（可从Query或JD提取）
 - education：学校、学位、专业、时间
-- experience：工作、实习或科研经历（组织、职位、时间、bullet）
+- experience：工作、实习或科研经历。每条experience的organization必须填公司/组织名，role填职位名称。
+  例如原文"在超级公司担任产品助理实习生" → organization="超级公司", role="产品助理实习生"
 - projects：项目名称、组织、角色、时间
-- skills：编程语言、框架、工具、领域
-- summary：个人简介
+- skills：必须使用字典对象（languages/frameworks/tools/domains各为字符串列表），不要用数组
+- summary：个人简介（字符串，不是数组）
 
 要求：
 1. 只提取原文出现的信息，不要编造
 2. 实验室/科研工作应放入experience，组织名不确定时留空
 3. 奖项/荣誉不是education
-4. 字段为纯字符串
-5. 只输出JSON"""
+4. 字段为纯字符串或空字符串
+5. 只输出JSON，不要额外解释"""
 
 # ── V2 Resume Verifier ──
 
-RESUME_VERIFIER_SYSTEM_PROMPT = """
-1. 保留有内容的记录。每条 experience/education/project 独立判断。
-   不要因为一条记录有问题就删掉其他记录。
-   
-   例子：Draft有两条experience：
-   [A] 超级公司 / 产品助理实习生 / 5条bullet（用户调研等）
-   [B] 未提及 / 未提及 / 0条bullet
-   原文中"超级公司"真实存在。正确做法：保留[A]，只删除[B]。
+RESUME_VERIFIER_SYSTEM_PROMPT = """校验 DraftResume，输出严格嵌套的 JSON 结构。
 
-2. company/组织字段：
-   原文支持的公司名 → 保留
-   部分支持（如公司名包含原文中已知的学校/组织）→ 回退到已知实体
-   完全无支持 → 清空，保留记录和bullet
+【输出结构必须如下，字段名不可改变】：
+{
+  "meta": {"name": "", "phone": "", "email": "", "target_role": "", "work_experience": ""},
+  "education": [{"school": "", "degree": "", "major": "", "period": ""}],
+  "experience": [{"organization": "", "role": "", "period": "", "bullets": ["bullet1"]}],
+  "projects": [{"name": "", "organization": "", "role": "", "period": ""}],
+  "skills": {"languages": [], "frameworks": [], "tools": [], "domains": []},
+  "summary": ""
+}
 
-3. role/职位字段：
-   原文没提到 → 清空，保留记录（bullet内容本身证明经历存在）
+规则：
+1. name/phone/email：原文出现过 → 保留。否则清空为""。
+2. organization/role/school/degree/major：原文出现过（含子串）→ 保留**原文**值。否则清空。
+3. bullets/projects/skills/summary：保留 DraftResume 原值，不要增减。
+4. skills 必须是字典对象，不能是数组。
+5. 不要改动有原文证据的字段值（包括 organization、role、name）。
+6. 一条 experience 不要拆成多条。
 
-4. school/学校字段：
-   "全国大学"来自"全国大学生创新创业大赛三等奖" → 拒绝（这是奖项，不是学校）
-   整条education完全无原文支持 → 删除整条
-
-5. 数字/结果原文没有 → 清空
-
-直接输出修正后的JSON。"""
+输出 JSON，不要额外解释。"""
