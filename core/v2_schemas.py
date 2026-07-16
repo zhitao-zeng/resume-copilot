@@ -34,56 +34,6 @@ class DraftField(BaseModel):
     evidence: list[EvidenceRef] = Field(default_factory=list)
 
 
-class MetaDraft(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    name: DraftField = Field(default_factory=DraftField)
-    phone: DraftField = Field(default_factory=DraftField)
-    email: DraftField = Field(default_factory=DraftField)
-    target_role: DraftField = Field(default_factory=DraftField)
-
-
-class EducationDraft(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    school: DraftField = Field(default_factory=DraftField)
-    degree: DraftField = Field(default_factory=DraftField)
-    major: DraftField = Field(default_factory=DraftField)
-    period: DraftField = Field(default_factory=DraftField)
-
-
-class ExperienceDraft(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    organization: DraftField = Field(default_factory=DraftField)
-    role: DraftField = Field(default_factory=DraftField)
-    period: DraftField = Field(default_factory=DraftField)
-    bullets: list[DraftField] = Field(default_factory=list)
-
-
-class ProjectDraft(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    name: DraftField = Field(default_factory=DraftField)
-    organization: DraftField = Field(default_factory=DraftField)
-    role: DraftField = Field(default_factory=DraftField)
-    period: DraftField = Field(default_factory=DraftField)
-
-
-class SkillsDraft(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    languages: list[DraftField] = Field(default_factory=list)
-    frameworks: list[DraftField] = Field(default_factory=list)
-    tools: list[DraftField] = Field(default_factory=list)
-    domains: list[DraftField] = Field(default_factory=list)
-
-
-class DraftResume(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    meta: MetaDraft = Field(default_factory=MetaDraft)
-    education: list[EducationDraft] = Field(default_factory=list)
-    experience: list[ExperienceDraft] = Field(default_factory=list)
-    projects: list[ProjectDraft] = Field(default_factory=list)
-    skills: SkillsDraft = Field(default_factory=SkillsDraft)
-    summary: DraftField = Field(default_factory=DraftField)
-
-
 # ---- Canonical (clean, no DraftField) ----
 
 
@@ -120,11 +70,32 @@ class Project(BaseModel):
     period: str = ""
 
 
-class CanonicalResume(BaseModel):
+class SkillsDraft(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    languages: list[str] = Field(default_factory=list)
+    frameworks: list[str] = Field(default_factory=list)
+    tools: list[str] = Field(default_factory=list)
+    domains: list[str] = Field(default_factory=list)
+
+
+class CanonicalResume(BaseModel):
+    model_config = ConfigDict(extra="ignore")  # LLM output may have extra fields
     meta: Meta = Field(default_factory=Meta)
     education: list[Education] = Field(default_factory=list)
     experiences: list[Experience] = Field(default_factory=list)
+    projects: list[Project] = Field(default_factory=list)
+    skills: SkillsDraft = Field(default_factory=SkillsDraft)
+    summary: str = ""
+
+
+# ---- DraftResume (plain strings, no evidence wrapper) ----
+# Verifier judges factuality; Composer just extracts structure.
+
+class DraftResume(BaseModel):
+    model_config = ConfigDict(extra="ignore")  # LLM may add extra fields
+    meta: Meta = Field(default_factory=Meta)
+    education: list[Education] = Field(default_factory=list)
+    experience: list[Experience] = Field(default_factory=list)
     projects: list[Project] = Field(default_factory=list)
     skills: SkillsDraft = Field(default_factory=SkillsDraft)
     summary: str = ""
@@ -141,3 +112,4 @@ class VerifiedResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
     resume: CanonicalResume
     changes: list[Change] = Field(default_factory=list)
+    resume_dict: dict = Field(default_factory=dict)

@@ -11,7 +11,7 @@ from prompts import RESUME_VERIFIER_SYSTEM_PROMPT
 from server_runtime import call_llm_typed, llm_enabled
 from v2_schemas import (
     SourceBundle, DraftResume, VerifiedResult, CanonicalResume,
-    Change, Meta,
+    Change, Meta, Education, Experience, Project,
 )
 
 logger = logging.getLogger(__name__)
@@ -50,7 +50,7 @@ def verify_resume(source: SourceBundle, draft: DraftResume) -> VerifiedResult:
 
     try:
         parsed = call_llm_typed(
-            VerifiedResult,
+            CanonicalResume,
             RESUME_VERIFIER_SYSTEM_PROMPT,
             prompt,
             temperature=0.0,
@@ -64,7 +64,8 @@ def verify_resume(source: SourceBundle, draft: DraftResume) -> VerifiedResult:
         return conservative_fallback()
 
     try:
-        result = VerifiedResult(**parsed)
+        resume = CanonicalResume(**parsed)
+        result = VerifiedResult(resume=resume)
         return result
     except Exception as exc:
         logger.warning("ResumeVerifier output validation failed: %s", exc)
