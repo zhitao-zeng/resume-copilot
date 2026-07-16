@@ -541,6 +541,7 @@ RESUME_VERIFIER_SYSTEM_PROMPT = """校验 DraftResume，输出严格嵌套的 JS
 - organization/role/school/degree/major：原文 Resume 或 Query 中出现过（含子串）→ 保留原文值。否则清空。
 - bullets/projects/skills/summary：保留 DraftResume 原值，不要增减。
 - skills.items 每条 skill 包含 name + category。
+- **记录级判定**：一条 experience/education 只要部分字段有证据（如 bullet 内容真实），就保留整条记录，只清空无证据的字段。不要整条删除。
 - 一条 experience 不要拆成多条。
 
 输出 JSON，不要额外解释。"""
