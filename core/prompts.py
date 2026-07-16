@@ -482,7 +482,7 @@ RESUME_COMPOSER_SYSTEM_PROMPT = """从提供的文本中提取简历信息，输
   "education": [{"school": "", "degree": "", "major": "", "period": ""}],
   "experience": [{"organization": "", "role": "", "period": "", "bullets": ["bullet1"]}],
   "projects": [{"name": "", "organization": "", "role": "", "period": ""}],
-  "skills": {"languages": [], "frameworks": [], "tools": [], "domains": []},
+  "skills": {"items": [{"name": "Python", "category": "language"}, {"name": "PyTorch", "category": "framework"}]},
   "summary": ""
 }
 
@@ -497,7 +497,7 @@ RESUME_COMPOSER_SYSTEM_PROMPT = """从提供的文本中提取简历信息，输
 - experience：工作、实习或科研经历。每条experience的organization必须填公司/组织名，role填职位名称。
   例如原文"在超级公司担任产品助理实习生" → organization="超级公司", role="产品助理实习生"
 - projects：项目名称、组织、角色、时间
-- skills：必须使用字典对象（languages/frameworks/tools/domains各为字符串列表），不要用数组
+- skills：使用 {"items": [{"name": "技能名", "category": "类别"}]} 格式，每条技能一个 name+category。类别可以是 language/framework/tool/domain/method/other
 - summary：个人简介（字符串，不是数组）
 
 重要：JD（岗位描述）文本描述的是目标岗位要求，不是候选人的经历。
@@ -521,7 +521,7 @@ RESUME_VERIFIER_SYSTEM_PROMPT = """校验 DraftResume，输出严格嵌套的 JS
   "education": [{"school": "", "degree": "", "major": "", "period": ""}],
   "experience": [{"organization": "", "role": "", "period": "", "bullets": ["bullet1"]}],
   "projects": [{"name": "", "organization": "", "role": "", "period": ""}],
-  "skills": {"languages": [], "frameworks": [], "tools": [], "domains": []},
+  "skills": {"items": [{"name": "Python", "category": "language"}]},
   "summary": ""
 }
 
@@ -540,7 +540,7 @@ RESUME_VERIFIER_SYSTEM_PROMPT = """校验 DraftResume，输出严格嵌套的 JS
 【证据规则】
 - organization/role/school/degree/major：原文 Resume 或 Query 中出现过（含子串）→ 保留原文值。否则清空。
 - bullets/projects/skills/summary：保留 DraftResume 原值，不要增减。
-- skills 必须是字典对象，不能是数组。
+- skills.items 每条 skill 包含 name + category。
 - 一条 experience 不要拆成多条。
 
 输出 JSON，不要额外解释。"""

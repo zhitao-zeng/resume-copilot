@@ -25,16 +25,22 @@ def _canonical_to_v1_format(canonical: CanonicalResume) -> dict:
     for proj in data.get("projects", []):
         if isinstance(proj, dict) and "organization" in proj:
             proj["company"] = proj.pop("organization")
-    # Flatten skills from DraftField list to plain string list
+    # Convert flat skills.items to V1 categorized format
     skills = data.get("skills", {})
     if isinstance(skills, dict):
-        for key in ("languages", "frameworks", "tools", "domains"):
-            items = skills.get(key, [])
-            if isinstance(items, list):
-                skills[key] = [
-                    s.get("value", "") if isinstance(s, dict) else s
-                    for s in items
-                ]
+        items = skills.pop("items", []) if isinstance(skills.get("items"), list) else []
+        categorized: dict[str, list[str]] = {
+            "languages": [], "frameworks": [], "tools": [], "domains": []}
+        if items:
+            for item in items:
+                if isinstance(item, dict):
+                    name = item.get("name", "")
+                    cat = item.get("category", "other")
+                    if cat in categorized:
+                        categorized[cat].append(name)
+                    else:
+                        categorized.setdefault("tools", []).append(name)
+            skills.update(categorized)
     return data
 
 

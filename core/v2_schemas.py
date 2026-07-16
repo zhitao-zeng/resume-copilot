@@ -77,12 +77,35 @@ class Project(BaseModel):
     period: str = ""
 
 
+class SkillItem(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    name: str = ""
+    category: str = ""
+
+
 class SkillsDraft(BaseModel):
     model_config = ConfigDict(extra="ignore")
-    languages: list[str] = Field(default_factory=list)
-    frameworks: list[str] = Field(default_factory=list)
-    tools: list[str] = Field(default_factory=list)
-    domains: list[str] = Field(default_factory=list)
+    items: list[SkillItem] = Field(default_factory=list)
+
+    @field_validator("items", mode="before")
+    @classmethod
+    def normalize_items(cls, v: Any) -> list:
+        """Accept both flat list of SkillItem and old dict format."""
+        if isinstance(v, dict):
+            # Old format: {"languages": [...], "tools": [...]}
+            items = []
+            cat_map = {"languages": "language", "frameworks": "framework",
+                       "tools": "tool", "domains": "domain"}
+            for cat, names in v.items():
+                target_cat = cat_map.get(cat, cat)
+                if isinstance(names, list):
+                    for n in names:
+                        if isinstance(n, str):
+                            items.append({"name": n, "category": target_cat})
+            return items
+        if isinstance(v, list):
+            return v
+        return []
 
 
 class CanonicalResume(BaseModel):

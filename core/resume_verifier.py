@@ -127,7 +127,7 @@ def verify_resume(source: SourceBundle, draft: DraftResume) -> VerifiedResult:
         "experience": {"organization", "role", "period", "bullets"},
         "projects": {"name", "organization", "role", "period"},
         "meta": {"name", "phone", "email", "target_role", "work_experience"},
-        "skills": {"languages", "frameworks", "tools", "domains"},
+        "skills": {"items"},  # Skills is flat items format, not categorized dict
     }
     for section, allowed in _STRIP_KEYS.items():
         items = parsed.get(section)
@@ -138,11 +138,13 @@ def verify_resume(source: SourceBundle, draft: DraftResume) -> VerifiedResult:
                 for item in items
             ]
 
-    # Fix skills format: if skills is a list, convert to dict
+    # Fix skills format: if skills is a flat list, convert to items format
     skills = parsed.get("skills")
     if isinstance(skills, list):
-        # Flat list like ["Python", "PyTorch"] → put in languages
-        parsed["skills"] = {"languages": skills, "frameworks": [], "tools": [], "domains": []}
+        # Flat list like ["Python", "PyTorch"] → items format with category="other"
+        parsed["skills"] = {"items": [
+            {"name": s, "category": "other"} for s in skills if isinstance(s, str)
+        ]}
 
     # ── Post-processing: merge adjacent duplicate experiences ──
     exp_list = parsed.get("experience", [])
@@ -265,11 +267,12 @@ def verify_resume(source: SourceBundle, draft: DraftResume) -> VerifiedResult:
         parsed["projects"] = [p.model_dump() for p in draft.projects]
     if not parsed.get("skills") or (
         isinstance(parsed.get("skills"), dict)
-        and not any(parsed["skills"].get(k) for k in ("languages", "frameworks", "tools", "domains"))
+        and not parsed["skills"].get("items")
     ):
         draft_skills = draft.skills.model_dump() if draft.skills else {}
-        if any(draft_skills.get(k) for k in ("languages", "frameworks", "tools", "domains")):
-            logger.info("ResumeVerifier restored skills from draft")
+        draft_items = draft_skills.get("items", []) if isinstance(draft_skills, dict) else []
+        if draft_items:
+            logger.info("ResumeVerifier restored skills from draft (%d items)", len(draft_items))
             parsed["skills"] = draft_skills
 
     try:
