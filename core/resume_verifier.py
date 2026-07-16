@@ -125,6 +125,7 @@ def verify_resume(source: SourceBundle, draft: DraftResume) -> VerifiedResult:
     _STRIP_KEYS = {
         "education": {"school", "degree", "major", "period"},
         "experience": {"organization", "role", "period", "bullets"},
+        "research": {"institution", "topic", "period", "bullets"},
         "projects": {"name", "organization", "role", "period"},
         "meta": {"name", "phone", "email", "target_role", "work_experience"},
         "skills": {"items"},  # Skills is flat items format, not categorized dict
@@ -197,6 +198,7 @@ def verify_resume(source: SourceBundle, draft: DraftResume) -> VerifiedResult:
         if school and school not in resume_query_text and school in jd_text:
             entry["school"] = ""
             logger.info("ResumeVerifier cleared JD-only school: %s", school)
+        # (education school validation handled by Verifier LLM prompt)
 
     # Restore role from draft if Verifier changed it
     for entry in parsed.get("experience", []):

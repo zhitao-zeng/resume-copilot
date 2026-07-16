@@ -77,6 +77,18 @@ class Project(BaseModel):
     period: str = ""
 
 
+class Research(BaseModel):
+    """Research/lab experience — distinct from employment (Experience).
+
+    Student identity (研究生, 研究助理) belongs here, not in Experience.
+    """
+    model_config = ConfigDict(extra="forbid")
+    institution: str = ""
+    topic: str = ""
+    period: str = ""
+    bullets: list[str] = Field(default_factory=list)
+
+
 class SkillItem(BaseModel):
     model_config = ConfigDict(extra="ignore")
     name: str = ""
@@ -109,23 +121,24 @@ class SkillsDraft(BaseModel):
 
 
 class CanonicalResume(BaseModel):
-    model_config = ConfigDict(extra="ignore")  # LLM output may have extra fields
+    model_config = ConfigDict(extra="ignore")
     meta: Meta = Field(default_factory=Meta)
     education: list[Education] = Field(default_factory=list)
     experience: list[Experience] = Field(default_factory=list)
+    research: list[Research] = Field(default_factory=list)
     projects: list[Project] = Field(default_factory=list)
     skills: SkillsDraft = Field(default_factory=SkillsDraft)
     summary: str = ""
 
 
 # ---- DraftResume (plain strings, no evidence wrapper) ----
-# Verifier judges factuality; Composer just extracts structure.
 
 class DraftResume(BaseModel):
-    model_config = ConfigDict(extra="ignore")  # LLM may add extra fields
+    model_config = ConfigDict(extra="ignore")
     meta: Meta = Field(default_factory=Meta)
     education: list[Education] = Field(default_factory=list)
     experience: list[Experience] = Field(default_factory=list)
+    research: list[Research] = Field(default_factory=list)
     projects: list[Project] = Field(default_factory=list)
     skills: SkillsDraft = Field(default_factory=SkillsDraft)
     summary: str = ""

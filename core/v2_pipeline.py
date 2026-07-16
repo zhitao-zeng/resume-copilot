@@ -25,6 +25,18 @@ def _canonical_to_v1_format(canonical: CanonicalResume) -> dict:
     for proj in data.get("projects", []):
         if isinstance(proj, dict) and "organization" in proj:
             proj["company"] = proj.pop("organization")
+    # Merge research into experience (V1 renderer doesn't know research)
+    research = data.pop("research", [])
+    if research:
+        for r in research:
+            if isinstance(r, dict):
+                data["experience"].append({
+                    "organization": r.get("institution", ""),
+                    "role": r.get("topic", "科研经历"),
+                    "period": r.get("period", ""),
+                    "bullets": r.get("bullets", []),
+                    "company": r.get("institution", ""),
+                })
     # Convert flat skills.items to V1 categorized format
     skills = data.get("skills", {})
     if isinstance(skills, dict):
@@ -54,13 +66,13 @@ def run_v2_pipeline(
     logger.info("V2 | SourceBundle: %d blocks", len(source.blocks))
 
     draft = compose_resume(source)
-    logger.info("V2 | DraftResume: %d edu, %d exp, %d proj",
-                len(draft.education), len(draft.experience), len(draft.projects))
+    logger.info("V2 | DraftResume: %d edu, %d exp, %d res, %d proj",
+                len(draft.education), len(draft.experience), len(draft.research), len(draft.projects))
 
     result = verify_resume(source, draft)
-    logger.info("V2 | VerifiedResult: %d education, %d experiences, %d changes",
+    logger.info("V2 | VerifiedResult: %d edu, %d exp, %d res, %d changes",
                 len(result.resume.education), len(result.resume.experience),
-                len(result.changes))
+                len(result.resume.research), len(result.changes))
 
     result.resume = validate_resume(result.resume)
 

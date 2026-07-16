@@ -481,6 +481,7 @@ RESUME_COMPOSER_SYSTEM_PROMPT = """从材料中提取候选人简历信息，输
   "meta": {"name": "", "phone": "", "email": "", "target_role": "", "work_experience": ""},
   "education": [{"school": "", "degree": "", "major": "", "period": ""}],
   "experience": [{"organization": "", "role": "", "period": "", "bullets": ["bullet1"]}],
+  "research": [{"institution": "", "topic": "", "period": "", "bullets": ["bullet1"]}],
   "projects": [{"name": "", "organization": "", "role": "", "period": ""}],
   "skills": {"items": [{"name": "Python", "category": "language"}]},
   "summary": ""
@@ -498,7 +499,8 @@ RESUME_COMPOSER_SYSTEM_PROMPT = """从材料中提取候选人简历信息，输
 【semantic 约束】
 - name：候选人本人姓名。公司名、品牌名、模板标识不是 name。不确定时返回空字符串。
 - education：必须有实际教育机构（大学/学院/学校）。奖学金、竞赛、奖项不构成 education。
-- experience types：工作经历、实习经历、科研经历均为 experience。但"学生"、"研究生"是身份不是职位，organization 不确定时留空。
+- experience：企业或实习经历（有明确组织/公司）。"学生"、"研究生"是身份不是工作经验。
+- research：科研/实验室经历（在读学生、研究助理等）。不同于企业 experience。
 - projects：仅包含真正的项目。学生活动、社团工作、志愿服务不是 project。
 - dates：只提取原文明确出现的日期。不要根据学历时间推断项目日期。
 - summary：基于候选人事实撰写。TARGET CONTEXT 中的要求不能写成候选人已有经验。
@@ -514,6 +516,7 @@ RESUME_VERIFIER_SYSTEM_PROMPT = """校验 DraftResume，输出严格嵌套的 JS
   "meta": {"name": "", "phone": "", "email": "", "target_role": "", "work_experience": ""},
   "education": [{"school": "", "degree": "", "major": "", "period": ""}],
   "experience": [{"organization": "", "role": "", "period": "", "bullets": ["bullet1"]}],
+  "research": [{"institution": "", "topic": "", "period": "", "bullets": ["bullet1"]}],
   "projects": [{"name": "", "organization": "", "role": "", "period": ""}],
   "skills": {"items": [{"name": "Python", "category": "language"}]},
   "summary": ""
@@ -533,7 +536,7 @@ RESUME_VERIFIER_SYSTEM_PROMPT = """校验 DraftResume，输出严格嵌套的 JS
 
 【证据规则】
 - organization/role/school/degree/major：原文 Resume 或 Query 中出现过（含子串）→ 保留原文值。否则清空。
-- bullets/projects/skills/summary：保留 DraftResume 原值，不要增减。
+- bullets/projects/research/skills/summary：保留 DraftResume 原值，不要增减。
 - skills.items 每条 skill 包含 name + category。
 - **记录级判定**：一条 experience/education 只要部分字段有证据（如 bullet 内容真实），就保留整条记录，只清空无证据的字段。不要整条删除。
 - 一条 experience 不要拆成多条。
