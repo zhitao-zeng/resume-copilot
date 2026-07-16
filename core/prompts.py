@@ -473,7 +473,7 @@ POLISH_SYSTEM_PROMPT = """你是一位简历质量把关编辑。请对"已优�
 
 # ── V2 Resume Composer ──
 
-RESUME_COMPOSER_SYSTEM_PROMPT = """从提供的文本中提取简历信息，输出结构化JSON。
+RESUME_COMPOSER_SYSTEM_PROMPT = """从材料中提取候选人简历信息，输出结构化JSON。
 
 输出JSON结构必须严格遵循以下字段和类型（字段名不可改变）：
 
@@ -482,34 +482,28 @@ RESUME_COMPOSER_SYSTEM_PROMPT = """从提供的文本中提取简历信息，输
   "education": [{"school": "", "degree": "", "major": "", "period": ""}],
   "experience": [{"organization": "", "role": "", "period": "", "bullets": ["bullet1"]}],
   "projects": [{"name": "", "organization": "", "role": "", "period": ""}],
-  "skills": {"items": [{"name": "Python", "category": "language"}, {"name": "PyTorch", "category": "framework"}]},
+  "skills": {"items": [{"name": "Python", "category": "language"}]},
   "summary": ""
 }
 
-字段类型约束（必须遵守，否则解析失败）：
-- 所有"字段名": "" 的值必须是字符串（str），绝不能是数组。特别是 work_experience 是字符串（如"3年"或""），不是列表。
-- 所有"字段名": [] 的值必须是数组（list）。
-- skills 是字典对象，不是数组。
+【字段类型】
+- 所有 "" 值必须是字符串，所有 [] 值必须是数组
+- skills 是 {"items": [{"name": "", "category": ""}]} 格式
 
-说明：
-- meta：姓名、电话、邮箱、目标岗位（可从Query或JD提取）
-- education：学校、学位、专业、时间
-- experience：工作、实习或科研经历。每条experience的organization必须填公司/组织名，role填职位名称。
-  例如原文"在超级公司担任产品助理实习生" → organization="超级公司", role="产品助理实习生"
-- projects：项目名称、组织、角色、时间
-- skills：使用 {"items": [{"name": "技能名", "category": "类别"}]} 格式，每条技能一个 name+category。类别可以是 language/framework/tool/domain/method/other
-- summary：个人简介（字符串，不是数组）
+【来源隔离 — 最重要】
+材料分为两部分：
+1. CANDIDATE EVIDENCE：候选人原文 + 用户补充。这是 experience/education/projects/skills 的唯一事实来源。
+2. TARGET CONTEXT：目标岗位描述，只用于 target_role 参考，**绝不能**生成候选人的经历、项目、技能。
 
-重要：JD（岗位描述）文本描述的是目标岗位要求，不是候选人的经历。
-不得将JD中的公司名、岗位职责、任职要求提取到candidate的experience、education、projects中。
-JD只用于提取 target_role 和 skills 参考。
+【semantic 约束】
+- name：候选人本人姓名。公司名、品牌名、模板标识不是 name。不确定时返回空字符串。
+- education：必须有实际教育机构（大学/学院/学校）。奖学金、竞赛、奖项不构成 education。
+- experience types：工作经历、实习经历、科研经历均为 experience。但"学生"、"研究生"是身份不是职位，organization 不确定时留空。
+- projects：仅包含真正的项目。学生活动、社团工作、志愿服务不是 project。
+- dates：只提取原文明确出现的日期。不要根据学历时间推断项目日期。
+- summary：基于候选人事实撰写。TARGET CONTEXT 中的要求不能写成候选人已有经验。
 
-要求：
-1. 只提取原文出现的信息，不要编造
-2. 实验室/科研工作应放入experience，组织名不确定时留空
-3. 奖项/荣誉不是education
-4. 字段为纯字符串或空字符串
-5. 只输出JSON，不要额外解释"""
+要求：只输出JSON，不编造，不推断。"""
 
 # ── V2 Resume Verifier ──
 

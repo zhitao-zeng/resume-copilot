@@ -2,6 +2,9 @@
 
 V2 Layer 2.  Outputs plain JSON (no evidence wrapping).
 Verifier judges factuality.
+
+Source separation: JD (Target Context) is NEVER a candidate fact source.
+Only Candidate Evidence (resume + query) can produce experience/education/projects/skills.
 """
 from __future__ import annotations
 
@@ -15,19 +18,51 @@ from v2_schemas import SourceBundle, DraftResume
 logger = logging.getLogger(__name__)
 
 
+def _build_source_text(source: SourceBundle) -> str:
+    """Build source text with strict semantic separation.
+
+    Two sections:
+      1. CANDIDATE EVIDENCE — resume text + user query.  This is the
+         ONLY source for experience, education, projects, skills.
+      2. TARGET CONTEXT — job description.  ONLY for target_role and
+         writing style hints.  NOT a source of candidate facts.
+    """
+    parts = []
+
+    # Section 1: Candidate Evidence (resume + query)
+    evidence_parts = []
+    resume_texts = [b.text for b in source.blocks if b.source_type == "resume"]
+    if resume_texts:
+        evidence_parts.append("-- CANDIDATE RESUME --\n" + "\n".join(resume_texts))
+
+    query_texts = [b.text for b in source.blocks if b.source_type == "query"]
+    if query_texts:
+        evidence_parts.append("-- USER QUERY --\n" + "\n".join(query_texts))
+
+    if evidence_parts:
+        parts.append("## CANDIDATE EVIDENCE (facts)\n" + "\n\n".join(evidence_parts))
+
+    # Section 2: Target Context (JD only)
+    jd_texts = [b.text for b in source.blocks if b.source_type == "jd"]
+    if jd_texts:
+        parts.append("## TARGET CONTEXT (reference only — NOT candidate facts)\n"
+                     + "\n".join(jd_texts))
+
+    return "\n\n".join(parts)
+
+
 def compose_resume(source: SourceBundle) -> DraftResume:
     """Call LLM to extract structured resume from source material."""
     if not llm_enabled():
         return DraftResume()
 
-    parts = []
-    for block in source.blocks:
-        parts.append(f"[{block.block_id}] {block.text}")
-    source_text = "\n".join(parts)
+    source_text = _build_source_text(source)
 
     prompt = (
-        "请从以下原始材料中提取简历信息，输出结构化 JSON。\n\n"
-        "【原始材料】\n"
+        "请从以下材料中提取简历信息。注意材料分为两部分：\n"
+        "1) CANDIDATE EVIDENCE：候选人的简历原文和用户补充，这是事实来源。\n"
+        "2) TARGET CONTEXT：目标岗位描述，只做参考。\n\n"
+        "【材料】\n"
         f"{source_text}"
     )
 
