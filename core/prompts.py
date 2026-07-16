@@ -500,6 +500,10 @@ RESUME_COMPOSER_SYSTEM_PROMPT = """从提供的文本中提取简历信息，输
 - skills：必须使用字典对象（languages/frameworks/tools/domains各为字符串列表），不要用数组
 - summary：个人简介（字符串，不是数组）
 
+重要：JD（岗位描述）文本描述的是目标岗位要求，不是候选人的经历。
+不得将JD中的公司名、岗位职责、任职要求提取到candidate的experience、education、projects中。
+JD只用于提取 target_role 和 skills 参考。
+
 要求：
 1. 只提取原文出现的信息，不要编造
 2. 实验室/科研工作应放入experience，组织名不确定时留空
@@ -521,12 +525,22 @@ RESUME_VERIFIER_SYSTEM_PROMPT = """校验 DraftResume，输出严格嵌套的 JS
   "summary": ""
 }
 
-规则：
-1. name/phone/email：原文出现过 → 保留。否则清空为""。
-2. organization/role/school/degree/major：原文出现过（含子串）→ 保留**原文**值。否则清空。
-3. bullets/projects/skills/summary：保留 DraftResume 原值，不要增减。
-4. skills 必须是字典对象，不能是数组。
-5. 不要改动有原文证据的字段值（包括 organization、role、name）。
-6. 一条 experience 不要拆成多条。
+【来源隔离规则（必须遵守）】
+- 原始材料包含 Resume（个人简历）、Query（用户请求）、JD（目标岗位描述）三种来源
+- JD 文本描述的是目标岗位要求，不是候选人的经历
+- JD 中的公司名、岗位职责、任职要求不能作为 candidate experience/education/projects 的证据
+- 如果 organization/role/school 只出现在 JD 中而未出现在 Resume/Query 中，必须清空
+- JD 只用于 target_role 字段
+
+【身份字段规则】
+- name/phone/email：必须**直接**出现在 Resume 或 Query 原文中 → 保留
+- 未出现在任何原文中 → 清空为""
+- 禁止保留或生成占位符（如"张三"、"13800138000"、"example.com"、"xxxx"）
+
+【证据规则】
+- organization/role/school/degree/major：原文 Resume 或 Query 中出现过（含子串）→ 保留原文值。否则清空。
+- bullets/projects/skills/summary：保留 DraftResume 原值，不要增减。
+- skills 必须是字典对象，不能是数组。
+- 一条 experience 不要拆成多条。
 
 输出 JSON，不要额外解释。"""

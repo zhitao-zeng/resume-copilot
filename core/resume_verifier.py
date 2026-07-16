@@ -172,6 +172,30 @@ def verify_resume(source: SourceBundle, draft: DraftResume) -> VerifiedResult:
     # ── Post-processing: source-based guard ──
     source_text = "\n".join(b.text for b in source.blocks)
 
+    # ── JD isolation: values only in JD text → clear ──
+    jd_text = "\n".join(b.text for b in source.blocks if b.source_type == "jd")
+    resume_query_text = "\n".join(b.text for b in source.blocks if b.source_type in ("resume", "query"))
+    if jd_text.strip():
+        for entry in parsed.get("experience", []):
+            if not isinstance(entry, dict):
+                continue
+            org = entry.get("organization", "")
+            role = entry.get("role", "")
+            if org and org not in resume_query_text and org in jd_text:
+                entry["organization"] = ""
+                logger.info("ResumeVerifier cleared JD-only org: %s", org)
+            if role and role not in resume_query_text and role in jd_text:
+                entry["role"] = ""
+                logger.info("ResumeVerifier cleared JD-only role: %s", role)
+
+    for entry in parsed.get("education", []):
+        if not isinstance(entry, dict):
+            continue
+        school = entry.get("school", "")
+        if school and school not in resume_query_text and school in jd_text:
+            entry["school"] = ""
+            logger.info("ResumeVerifier cleared JD-only school: %s", school)
+
     # Restore role from draft if Verifier changed it
     for entry in parsed.get("experience", []):
         if not isinstance(entry, dict):
@@ -187,15 +211,51 @@ def verify_resume(source: SourceBundle, draft: DraftResume) -> VerifiedResult:
 
     # Clear fabricated identity fields (name/phone/email not in source)
     if isinstance(parsed.get("meta"), dict):
+        PLACEHOLDER_PHONE_PATTERNS = {"138-xxxx", "13800138000", "13900139000",
+                                       "13800000000", "13900000000", "10086",
+                                       "12345678901", "1234567890"}
+        PLACEHOLDER_EMAIL_DOMAINS = {"example.com", "test.com", "mail.com",
+                                      "email.com", "domain.com"}
+        PLACEHOLDER_EMAIL_FULL = {"xxxx@xxxx.com", "test@test.com",
+                                   "zhangsan@example.com", "lisi@example.com"}
+
         for field in ("name", "phone", "email"):
             val = parsed["meta"].get(field, "")
-            if val and val not in source_text:
-                # Check if it's a default placeholder
-                DEFAULT_NAMES = {"张三", "李四", "王五", "用户", "test", "测试", "姓名"}
-                if field == "name" and val in DEFAULT_NAMES:
+            if not val:
+                continue
+
+            # Check placeholder patterns FIRST, before source_text check
+            # (placeholder like "用户" may match source_text as a substring)
+            DEFAULT_NAMES = {"张三", "李四", "王五", "用户", "test", "测试", "姓名", "用户姓名"}
+            if field == "name" and val in DEFAULT_NAMES:
+                parsed["meta"][field] = ""
+                logger.info("ResumeVerifier cleared placeholder name '%s'", val)
+                continue
+
+            if val in source_text:
+                continue  # Has direct evidence
+            if field == "phone":
+                clean = val.replace("-", "").replace(" ", "").replace("×", "x")
+                if val in PLACEHOLDER_PHONE_PATTERNS or len(clean) < 8:
                     parsed["meta"][field] = ""
-                    logger.info("ResumeVerifier cleared fabricated name '%s'", val)
-                elif field == "name" and len(val) <= 4 and val not in source_text:
+                    logger.info("ResumeVerifier cleared placeholder phone '%s'", val)
+                elif clean.isdigit() and clean not in source_text:
+                    parsed["meta"][field] = ""
+                    logger.info("ResumeVerifier cleared phone '%s' (not in source)", val)
+            elif field == "email":
+                if val.lower() in PLACEHOLDER_EMAIL_FULL:
+                    parsed["meta"][field] = ""
+                    logger.info("ResumeVerifier cleared placeholder email '%s'", val)
+                elif "@" in val:
+                    domain = val.split("@")[1].lower()
+                    if domain in PLACEHOLDER_EMAIL_DOMAINS:
+                        parsed["meta"][field] = ""
+                        logger.info("ResumeVerifier cleared placeholder email domain '%s'", val)
+                    elif val not in source_text:
+                        parsed["meta"][field] = ""
+                        logger.info("ResumeVerifier cleared email '%s' (not in source)", val)
+            elif field == "name":
+                if len(val) <= 4 and val not in source_text:
                     parsed["meta"][field] = ""
                     logger.info("ResumeVerifier cleared name '%s' (not in source)", val)
 
