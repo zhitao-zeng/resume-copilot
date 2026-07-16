@@ -498,11 +498,11 @@ RESUME_COMPOSER_SYSTEM_PROMPT = """从材料中提取候选人简历信息，输
 
 【semantic 约束】
 - name：候选人本人姓名。公司名、品牌名、模板标识不是 name。不确定时返回空字符串。
-- education：必须有实际教育机构（大学/学院/学校）。奖学金、竞赛、奖项不构成 education。
+- education：必须有实际教育机构名（如"北京邮电大学"）且伴随就读上下文（学历/专业/时间段）。仅章节标题"教育经历"加上奖项/竞赛文本不构成 education record。奖学金名称（如"校级一等奖学金"）不是学校名。
 - experience：企业或实习经历（有明确组织/公司）。"学生"、"研究生"是身份不是工作经验。
 - research：科研/实验室经历（在读学生、研究助理等）。不同于企业 experience。
-- projects：仅包含真正的项目。学生活动、社团工作、志愿服务不是 project。
-- dates：只提取原文明确出现的日期。不要根据学历时间推断项目日期。
+- projects：仅包含真正的项目。学生活动、社团工作、志愿服务不是 project。project 的 organization 必须有该项目的直接证据，不能从 education/research 上下文推断。
+- dates：只提取原文明确出现的日期。不要根据学历时间推断项目日期。project/research 的 period 必须有直接来源，不能从 education period 复制。
 - summary：基于候选人事实撰写。TARGET CONTEXT 中的要求不能写成候选人已有经验。
 
 要求：只输出JSON，不编造，不推断。"""
