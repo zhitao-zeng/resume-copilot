@@ -18,7 +18,13 @@ logger = logging.getLogger(__name__)
 def _canonical_to_v1_format(canonical: CanonicalResume) -> dict:
     """Bridge format for existing renderer compatibility."""
     data = canonical.model_dump()
-    # experiences already renamed to experience in schema
+    # Rename organization → company for V1 renderer
+    for exp in data.get("experience", []):
+        if isinstance(exp, dict) and "organization" in exp:
+            exp["company"] = exp.pop("organization")
+    for proj in data.get("projects", []):
+        if isinstance(proj, dict) and "organization" in proj:
+            proj["company"] = proj.pop("organization")
     # Flatten skills from DraftField list to plain string list
     skills = data.get("skills", {})
     if isinstance(skills, dict):
