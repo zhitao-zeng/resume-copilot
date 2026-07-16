@@ -82,7 +82,7 @@ class CanonicalResume(BaseModel):
     model_config = ConfigDict(extra="ignore")  # LLM output may have extra fields
     meta: Meta = Field(default_factory=Meta)
     education: list[Education] = Field(default_factory=list)
-    experiences: list[Experience] = Field(default_factory=list)
+    experience: list[Experience] = Field(default_factory=list)
     projects: list[Project] = Field(default_factory=list)
     skills: SkillsDraft = Field(default_factory=SkillsDraft)
     summary: str = ""

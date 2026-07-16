@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 def _canonical_to_v1_format(canonical: CanonicalResume) -> dict:
     """Bridge format for existing renderer compatibility."""
     data = canonical.model_dump()
-    data["experience"] = data.pop("experiences", [])
+    # experiences already renamed to experience in schema
     # Flatten skills from DraftField list to plain string list
     skills = data.get("skills", {})
     if isinstance(skills, dict):
@@ -47,7 +47,7 @@ def run_v2_pipeline(
 
     result = verify_resume(source, draft)
     logger.info("V2 | VerifiedResult: %d education, %d experiences, %d changes",
-                len(result.resume.education), len(result.resume.experiences),
+                len(result.resume.education), len(result.resume.experience),
                 len(result.changes))
 
     result.resume = validate_resume(result.resume)

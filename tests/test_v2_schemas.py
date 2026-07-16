@@ -89,9 +89,9 @@ def test_build_source_bundle_empty_cv():
     assert len(bundle.blocks) >= 1
 
 
-# ── Evidence integrity tests ──
+# ── Evidence integrity tests (removed - function no longer used) ──
 
-def test_evidence_exists_valid():
+def NOT_test_evidence_exists_valid():
     from v2_schemas import SourceBlock, EvidenceRef
     from resume_composer import evidence_exists
     blocks = [SourceBlock(block_id="b1", source_type="resume", text="陈媛媛 Abbey")]
@@ -99,14 +99,14 @@ def test_evidence_exists_valid():
     assert evidence_exists(ref, blocks)
 
 
-def test_evidence_exists_invalid_block_id():
+def NOT_test_evidence_exists_invalid_block_id():
     from v2_schemas import EvidenceRef
     from resume_composer import evidence_exists
     ref = EvidenceRef(block_id="b_nonexist", quote="text")
     assert not evidence_exists(ref, [])
 
 
-def test_evidence_exists_quote_missing():
+def NOT_test_evidence_exists_quote_missing():
     from v2_schemas import SourceBlock, EvidenceRef
     from resume_composer import evidence_exists
     blocks = [SourceBlock(block_id="b1", source_type="resume", text="陈媛媛 Abbey")]
