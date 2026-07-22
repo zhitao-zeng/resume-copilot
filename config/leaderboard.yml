@@ -16,22 +16,12 @@ values:
   env:
     - name: RESUME_PIPELINE_VERSION
       value: "v2"
-    - name: MODELHUB_BASE_URL
-      value: "http://localhost:8000/v1"
-    - name: MODELHUB_API_KEY
-      value: "not-needed"
-    - name: MODELHUB_MODEL_NAME
-      value: "/model"
-    - name: LLM_TIMEOUT_SECONDS
-      value: "300"
     - name: REQUEST_TIMEOUT_SECONDS
       value: "600"
     - name: ENABLE_HEURISTIC_AUDIT_FALLBACK
       value: "0"
     - name: DEFAULT_OUTPUT_FORMAT
       value: "docx"
-    - name: PORT
-      value: "80"
   command:
     - ./start.sh
   volumeMounts:
