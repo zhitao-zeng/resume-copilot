@@ -38,18 +38,20 @@ fi
 # ═══ vLLM 启动并等待模型加载完成 ═══
 # AWQ 量化模型自动检测并调整参数
 VLLM_EXTRA_ARGS=""
-VLLM_SEQS="${MAX_NUM_SEQS:-2}"
+VLLM_GPU_MEM=0.95
+VLLM_SEQS=2
 case "$MODEL_FOUND" in
     *AWQ*|*awq*)
         VLLM_EXTRA_ARGS="--quantization awq_marlin"
-        VLLM_SEQS="${MAX_NUM_SEQS:-1}"
+        VLLM_GPU_MEM=0.95
+        VLLM_SEQS=1
         log "  ▸ 检测到 AWQ 模型, 启用 awq_marlin, max_seqs=1"
         ;;
 esac
 
 vllm serve "$MODEL_FOUND" \
     --host 0.0.0.0 --port 8000 \
-    --gpu-memory-utilization "${GPU_MEM_UTIL:-0.95}" \
+    --gpu-memory-utilization "$VLLM_GPU_MEM" \
     --max-model-len "${MAX_MODEL_LEN:-16384}" \
     --max-num-seqs "$VLLM_SEQS" \
     --trust-remote-code --dtype auto \
