@@ -1,12 +1,12 @@
-# ── V2 + Qwen3.5-27B-AWQ ──
+# ── V2 + Qwen3.6-35B-A3B-AWQ ──
 # Pipeline: V2 (SourceAdapter → Composer → Verifier → Validator → Renderer)
-# Model: Qwen3.5-27B-AWQ (AWQ 4-bit, ~21GB weights, ~25-40GB runtime)
+# Model: Qwen3.6-35B-A3B-AWQ (MoE AWQ 4-bit, ~24GB weights, 3B active params)
 
 inferenceVolumeMounts:
   - name: model
     mountPoint: /model
     source: ceph_customer
-    srcRelativePath: liuwenjie/Qwen3.5-27B-AWQ
+    srcRelativePath: zengzhitao/resume-copilot/models/Qwen3.6-35B-A3B-AWQ
 
 inferenceImage:
   repository: "harbor-contest.4pd.io/zengzhitao/resume-copilot"
@@ -28,7 +28,7 @@ values:
     - mountPath: /model
       name: ceph-customer
       readOnly: true
-      subPath: liuwenjie/Qwen3.5-27B-AWQ
+      subPath: zengzhitao/resume-copilot/models/Qwen3.6-35B-A3B-AWQ
   resources:
     limits:
       cpu: '8'

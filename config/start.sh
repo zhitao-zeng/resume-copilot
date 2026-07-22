@@ -4,8 +4,8 @@ set -e
 log() { echo "[$(date '+%H:%M:%S')] $1"; }
 
 # === 版本信息 ===
-VERSION_COMMIT="88197c1"
-VERSION_DATE="2026-07-22"
+VERSION_COMMIT="6684a05"
+VERSION_DATE="2026-07-23"
 log "============================================"
 log "  resume-copilot 版本: ${VERSION_COMMIT} (${VERSION_DATE})"
 log "============================================"
@@ -38,10 +38,9 @@ fi
 # ═══ vLLM 启动并等待模型加载完成 ═══
 vllm serve "$MODEL_FOUND" \
     --host 0.0.0.0 --port 8000 \
-    --quantization awq_marlin \
-    --kv-cache-dtype fp8_e4m3 \
-    --gpu-memory-utilization 0.95 \
-    --max-model-len "${MAX_MODEL_LEN:-16384}" \
+    --quantization awq \
+    --gpu-memory-utilization 0.48 \
+    --max-model-len 8192 \
     --max-num-seqs 1 \
     --trust-remote-code --dtype auto \
     --enforce-eager \

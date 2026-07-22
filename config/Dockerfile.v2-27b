@@ -1,4 +1,4 @@
-FROM harbor-contest.4pd.io/zengzhitao/resume-copilot:vllm023-base
+FROM harbor-contest.4pd.io/zengzhitao/resume-copilot@sha256:644e77e9bcfdb38d2be94c3b86da39b9bbf8c6d7d147d80465cf4875ea912e62
 
 # Overlay latest V2 code + start.sh
 COPY core/prompts.py /root/app/core/prompts.py
