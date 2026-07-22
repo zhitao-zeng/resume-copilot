@@ -4,7 +4,7 @@ set -e
 log() { echo "[$(date '+%H:%M:%S')] $1"; }
 
 # === 版本信息 ===
-VERSION_COMMIT="ffb0fe9"
+VERSION_COMMIT="3392c98"
 VERSION_DATE="2026-07-22"
 log "============================================"
 log "  resume-copilot 版本: ${VERSION_COMMIT} (${VERSION_DATE})"
@@ -35,21 +35,14 @@ if [ -z "$MODEL_FOUND" ]; then
     exit 1
 fi
 
-# 诊断：vLLM 看到的显存（HAMI 虚拟化）
-python3 -c "import torch; free,total=torch.cuda.mem_get_info(); print(f'[CUDA] free={free/2**30:.1f}GiB total={total/2**30:.1f}GiB')" 2>/dev/null || true
-
-export VLLM_ENABLE_V1_MULTIPROCESSING=0
-export PYTHONFAULTHANDLER=1
-export VLLM_LOGGING_LEVEL=DEBUG
-
 # ═══ vLLM 启动并等待模型加载完成 ═══
 vllm serve "$MODEL_FOUND" \
     --host 0.0.0.0 --port 8000 \
-    --quantization awq \
-    --gpu-memory-utilization 0.85 \
-    --max-model-len 8192 \
+    --quantization awq_marlin \
+    --kv-cache-dtype fp8_e4m3 \
+    --gpu-memory-utilization 0.48 \
+    --max-model-len "${MAX_MODEL_LEN:-16384}" \
     --max-num-seqs 1 \
-    --limit-mm-per-prompt '{"image":0,"video":0}' \
     --trust-remote-code --dtype auto \
     --enforce-eager \
     > /tmp/vllm_stdout.log 2>&1 &
