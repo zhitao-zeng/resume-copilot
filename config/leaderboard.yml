@@ -6,7 +6,7 @@ inferenceVolumeMounts:
   - name: model
     mountPoint: /model
     source: ceph_customer
-    srcRelativePath: zengzhitao/resume-copilot/models/Qwen3.5-27B-AWQ
+    srcRelativePath: liuwenjie/Qwen3.5-27B-AWQ
 
 inferenceImage:
   repository: "harbor-contest.4pd.io/zengzhitao/resume-copilot"
@@ -28,7 +28,7 @@ values:
     - mountPath: /model
       name: ceph-customer
       readOnly: true
-      subPath: zengzhitao/resume-copilot/models/Qwen3.5-27B-AWQ
+      subPath: liuwenjie/Qwen3.5-27B-AWQ
   resources:
     limits:
       cpu: '8'
