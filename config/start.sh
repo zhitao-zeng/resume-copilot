@@ -13,7 +13,7 @@ log "============================================"
 # ═══ 等模型就绪 (NFS 可能延迟, 最多等 120s) ═══
 # subPath 直接挂载模型目录到 /model, config.json 在 /model/config.json
 find_model() {
-    for c in "/model" "/model/Qwen3-14B-GPTQ-Int4" "/model/Qwen3-8B-AWQ" "/model/Qwen3.5-9B-AWQ-4bit" "/mounted_model" "${MODEL_PATH:-}"; do
+    for c in "/model" "/model/Qwen3-14B-GPTQ-Int4" "/model/Qwen3-8B-AWQ" "/model/Qwen3.5-9B-AWQ-4bit" "/model/Qwen3.5-27B-AWQ" "/mounted_model" "${MODEL_PATH:-}"; do
         [ -n "$c" ] && [ -f "$c/config.json" ] && echo "$c" && return 0
     done
     return 1
@@ -36,15 +36,24 @@ if [ -z "$MODEL_FOUND" ]; then
 fi
 
 # ═══ vLLM 启动并等待模型加载完成 ═══
-# Qwen3-14B-GPTQ-Int4: 纯文本 GPTQ, 9.4GB
-# gpumem 30GB: 80×0.95=76GB但HAMI限制30GB, 模型9+KV≈12+开销=25GB<30GB ✓
+# AWQ 量化模型自动检测并添加 --quantization awq_marlin
+VLLM_EXTRA_ARGS=""
+case "$MODEL_FOUND" in
+    *AWQ*|*awq*)
+        VLLM_EXTRA_ARGS="--quantization awq_marlin"
+        log "  ▸ 检测到 AWQ 模型, 启用 awq_marlin"
+        ;;
+esac
+
 vllm serve "$MODEL_FOUND" \
     --host 0.0.0.0 --port 8000 \
     --gpu-memory-utilization "${GPU_MEM_UTIL:-0.95}" \
     --max-model-len "${MAX_MODEL_LEN:-16384}" \
     --max-num-seqs "${MAX_NUM_SEQS:-2}" \
     --trust-remote-code --dtype auto \
-    --enforce-eager > /tmp/vllm_stdout.log 2>&1 &
+    --enforce-eager \
+    $VLLM_EXTRA_ARGS \
+    > /tmp/vllm_stdout.log 2>&1 &
 VLLM_LOG="/tmp/vllm_stdout.log"
 VLLM_PID=$!
 log "vLLM 启动 (pid=$VLLM_PID), 等待模型加载就绪..."
@@ -101,9 +110,10 @@ export PORT=80
 export PYTHONPATH="/root/app/core:$PYTHONPATH"
 export ENABLE_HEURISTIC_AUDIT_FALLBACK="${ENABLE_HEURISTIC_AUDIT_FALLBACK:-0}"
 export REQUEST_TIMEOUT_SECONDS="${REQUEST_TIMEOUT_SECONDS:-480}"
-export LLM_TIMEOUT_SECONDS="${LLM_TIMEOUT_SECONDS:-180}"
+export LLM_TIMEOUT_SECONDS="${LLM_TIMEOUT_SECONDS:-300}"
 export DEFAULT_OUTPUT_FORMAT="${DEFAULT_OUTPUT_FORMAT:-docx}"
 export OUTPUT_DIR="${OUTPUT_DIR:-/root/app/output}"
+export RESUME_PIPELINE_VERSION="${RESUME_PIPELINE_VERSION:-v1}"
 mkdir -p "$OUTPUT_DIR"
 cd /root/app
 

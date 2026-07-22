@@ -1,38 +1,61 @@
+# ── V2 + Qwen3.5-27B-AWQ ──
+# Pipeline: V2 (SourceAdapter → Composer → Verifier → Validator → Renderer)
+# Model: Qwen3.5-27B-AWQ (AWQ 4-bit, ~21GB weights, ~25-40GB runtime)
+
 inferenceVolumeMounts:
   - name: model
     mountPoint: /model
     source: ceph_customer
-    srcRelativePath: zengzhitao/resume-copilot/models/Qwen3-14B-GPTQ-Int4
+    srcRelativePath: zengzhitao/resume-copilot/models/Qwen3.5-27B-AWQ
 
 inferenceImage:
   repository: "harbor-contest.4pd.io/zengzhitao/resume-copilot"
-  tag: "latest"
+  tag: "v2-27b"
 
 values:
+  env:
+    - name: RESUME_PIPELINE_VERSION
+      value: "v2"
+    - name: MODELHUB_BASE_URL
+      value: "http://localhost:8000/v1"
+    - name: MODELHUB_API_KEY
+      value: "not-needed"
+    - name: MODELHUB_MODEL_NAME
+      value: "/model"
+    - name: LLM_TIMEOUT_SECONDS
+      value: "300"
+    - name: REQUEST_TIMEOUT_SECONDS
+      value: "600"
+    - name: ENABLE_HEURISTIC_AUDIT_FALLBACK
+      value: "0"
+    - name: DEFAULT_OUTPUT_FORMAT
+      value: "docx"
+    - name: PORT
+      value: "80"
   command:
-  - ./start.sh
+    - ./start.sh
   volumeMounts:
-  - mountPath: /model
-    name: ceph-customer
-    readOnly: true
-    subPath: zengzhitao/resume-copilot/models/Qwen3-14B-GPTQ-Int4
+    - mountPath: /model
+      name: ceph-customer
+      readOnly: true
+      subPath: zengzhitao/resume-copilot/models/Qwen3.5-27B-AWQ
   resources:
     limits:
-      cpu: '4'
-      memory: 16Gi
+      cpu: '8'
+      memory: 32Gi
       nvidia.com/gpu: '1'
-      nvidia.com/gpucores: '25'
-      nvidia.com/gpumem: '30720'
+      nvidia.com/gpucores: '50'
+      nvidia.com/gpumem: '51200'
     requests:
-      cpu: '4'
-      memory: 16Gi
+      cpu: '8'
+      memory: 32Gi
       nvidia.com/gpu: '1'
-      nvidia.com/gpucores: '25'
-      nvidia.com/gpumem: '30720'
+      nvidia.com/gpucores: '50'
+      nvidia.com/gpumem: '51200'
   readinessProbe:
     httpGet:
       path: /ready
       port: 80
-    initialDelaySeconds: 300
+    initialDelaySeconds: 600
     periodSeconds: 10
     timeoutSeconds: 5

@@ -1,0 +1,12 @@
+FROM harbor-contest.4pd.io/zengzhitao/resume-copilot@sha256:644e77e9bcfdb38d2be94c3b86da39b9bbf8c6d7d147d80465cf4875ea912e62
+
+# Overlay latest V2 code + start.sh
+COPY core/prompts.py /root/app/core/prompts.py
+COPY core/v2_schemas.py /root/app/core/v2_schemas.py
+COPY core/v2_pipeline.py /root/app/core/v2_pipeline.py
+COPY core/resume_composer.py /root/app/core/resume_composer.py
+COPY core/resume_verifier.py /root/app/core/resume_verifier.py
+COPY core/v2_validator.py /root/app/core/v2_validator.py
+COPY core/source_adapter.py /root/app/core/source_adapter.py
+COPY core/llm_gateway.py /root/app/core/llm_gateway.py
+COPY config/start.sh /root/app/start.sh
