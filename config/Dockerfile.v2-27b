@@ -1,9 +1,4 @@
-FROM harbor-contest.4pd.io/zengzhitao/resume-copilot@sha256:644e77e9bcfdb38d2be94c3b86da39b9bbf8c6d7d147d80465cf4875ea912e62
-
-# Upgrade vLLM from 0.19.1 → 0.23.0 (fixes AWQ-Marlin OOM on HAMI 40GB)
-RUN pip install --no-cache-dir vllm==0.23.0 \
-    -i https://pypi.tuna.tsinghua.edu.cn/simple/ 2>/dev/null || \
-    pip install --no-cache-dir vllm==0.23.0
+FROM harbor-contest.4pd.io/zengzhitao/resume-copilot:vllm023-base
 
 # Overlay latest V2 code + start.sh
 COPY core/prompts.py /root/app/core/prompts.py
