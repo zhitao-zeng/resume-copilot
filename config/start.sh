@@ -4,7 +4,7 @@ set -e
 log() { echo "[$(date '+%H:%M:%S')] $1"; }
 
 # === 版本信息 ===
-VERSION_COMMIT="d564cb8"
+VERSION_COMMIT="058ebab"
 VERSION_DATE="2026-07-22"
 log "============================================"
 log "  resume-copilot 版本: ${VERSION_COMMIT} (${VERSION_DATE})"
@@ -36,25 +36,15 @@ if [ -z "$MODEL_FOUND" ]; then
 fi
 
 # ═══ vLLM 启动并等待模型加载完成 ═══
-# AWQ 量化模型自动检测（通过 config.json 而非路径名）
-VLLM_EXTRA_ARGS=""
-VLLM_GPU_MEM=0.95
-VLLM_SEQS=2
-if grep -q '"quant_method"[[:space:]]*:[[:space:]]*"awq"' "$MODEL_FOUND/config.json" 2>/dev/null; then
-    VLLM_EXTRA_ARGS="--quantization awq_marlin --kv-cache-dtype fp8_e4m3"
-    VLLM_GPU_MEM=0.48
-    VLLM_SEQS=1
-    log "  ▸ 检测到 AWQ 量化 (config.json), 启用 awq_marlin + fp8 KV cache, gpu_mem=0.48, max_seqs=1"
-fi
-
 vllm serve "$MODEL_FOUND" \
     --host 0.0.0.0 --port 8000 \
-    --gpu-memory-utilization "$VLLM_GPU_MEM" \
+    --quantization awq_marlin \
+    --kv-cache-dtype fp8_e4m3 \
+    --gpu-memory-utilization "${GPU_MEM_UTIL:-0.95}" \
     --max-model-len "${MAX_MODEL_LEN:-16384}" \
-    --max-num-seqs "$VLLM_SEQS" \
+    --max-num-seqs 1 \
     --trust-remote-code --dtype auto \
     --enforce-eager \
-    $VLLM_EXTRA_ARGS \
     > /tmp/vllm_stdout.log 2>&1 &
 VLLM_LOG="/tmp/vllm_stdout.log"
 VLLM_PID=$!
