@@ -4,7 +4,7 @@ set -e
 log() { echo "[$(date '+%H:%M:%S')] $1"; }
 
 # === 版本信息 ===
-VERSION_COMMIT="1f43a05"
+VERSION_COMMIT="673d359"
 VERSION_DATE="2026-07-22"
 log "============================================"
 log "  resume-copilot 版本: ${VERSION_COMMIT} (${VERSION_DATE})"
@@ -42,10 +42,10 @@ VLLM_GPU_MEM=0.95
 VLLM_SEQS=2
 case "$MODEL_FOUND" in
     *AWQ*|*awq*)
-        VLLM_EXTRA_ARGS="--quantization awq_marlin"
-        VLLM_GPU_MEM=0.95
+        VLLM_EXTRA_ARGS="--quantization awq_marlin --kv-cache-dtype fp8_e4m3"
+        VLLM_GPU_MEM=0.48
         VLLM_SEQS=1
-        log "  ▸ 检测到 AWQ 模型, 启用 awq_marlin, max_seqs=1"
+        log "  ▸ 检测到 AWQ 模型, 启用 awq_marlin + fp8 KV cache, gpu_mem=0.48, max_seqs=1"
         ;;
 esac
 
