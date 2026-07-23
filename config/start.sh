@@ -4,7 +4,7 @@ set -e
 log() { echo "[$(date '+%H:%M:%S')] $1"; }
 
 # === 版本信息 ===
-VERSION_COMMIT="c72a231"
+VERSION_COMMIT="8f87c19"
 VERSION_DATE="2026-07-23"
 log "============================================"
 log "  resume-copilot 版本: ${VERSION_COMMIT} (${VERSION_DATE})"
@@ -35,14 +35,23 @@ if [ -z "$MODEL_FOUND" ]; then
     exit 1
 fi
 
+# ═══ 自适应 GPU 显存利用率 ═══
+TOTAL_MIB=$(python3 -c "import torch; print(int(torch.cuda.mem_get_info()[1]/2**20))" 2>/dev/null || echo "81920")
+TOTAL_GIB=$((TOTAL_MIB / 1024))
+SAFE_GIB=35
+GPU_MEM_UTIL=$(python3 -c "print(f'{min($SAFE_GIB/$TOTAL_GIB, 0.95):.2f}')")
+log "GPU total=${TOTAL_GIB}GiB, safe_target=${SAFE_GIB}GiB → gpu_memory_utilization=${GPU_MEM_UTIL}"
+
 # ═══ vLLM 启动并等待模型加载完成 ═══
 vllm serve "$MODEL_FOUND" \
     --host 0.0.0.0 --port 8000 \
     --quantization awq \
-    --gpu-memory-utilization 0.35 \
+    --gpu-memory-utilization "$GPU_MEM_UTIL" \
     --max-model-len 4096 \
     --max-num-seqs 1 \
-    --dtype float16 --limit-mm-per-prompt '{"image":0,"video":0}' --trust-remote-code \
+    --dtype float16 \
+    --limit-mm-per-prompt '{"image":0,"video":0}' \
+    --trust-remote-code \
     --enforce-eager \
     > /tmp/vllm_stdout.log 2>&1 &
 VLLM_LOG="/tmp/vllm_stdout.log"
