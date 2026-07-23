@@ -72,7 +72,7 @@ def compose_resume(source: SourceBundle) -> DraftResume:
             RESUME_COMPOSER_SYSTEM_PROMPT,
             prompt,
             temperature=0.0,
-            max_tokens=4096,
+            max_tokens=3072,
         )
     except Exception as exc:
         logger.warning("ResumeComposer LLM call failed: %s", exc)
