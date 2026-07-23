@@ -1,6 +1,6 @@
-# ── V2 + Qwen3.6-35B-A3B-AWQ ──
+# ── V2 + Qwen3.6-35B-A3B-AWQ (MoE) ──
 # Pipeline: V2 (SourceAdapter → Composer → Verifier → Validator → Renderer)
-# Model: Qwen3.6-35B-A3B-AWQ (MoE AWQ 4-bit, ~24GB weights, 3B active params)
+# Model: Qwen3.6-35B-A3B-AWQ (24GB, MoE ~3B active, needs ~6GB CPU)
 
 inferenceVolumeMounts:
   - name: model
@@ -32,15 +32,15 @@ values:
   resources:
     limits:
       cpu: '8'
-      memory: 32Gi
+      memory: 64Gi
       nvidia.com/gpu: '1'
-      nvidia.com/gpucores: '25'
+      nvidia.com/gpucores: '50'
       nvidia.com/gpumem: '40960'
     requests:
       cpu: '8'
-      memory: 32Gi
+      memory: 64Gi
       nvidia.com/gpu: '1'
-      nvidia.com/gpucores: '25'
+      nvidia.com/gpucores: '50'
       nvidia.com/gpumem: '40960'
   readinessProbe:
     httpGet:
