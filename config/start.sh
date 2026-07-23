@@ -4,7 +4,7 @@ set -e
 log() { echo "[$(date '+%H:%M:%S')] $1"; }
 
 # === 版本信息 ===
-VERSION_COMMIT="8f87c19"
+VERSION_COMMIT="2c236d2"
 VERSION_DATE="2026-07-23"
 log "============================================"
 log "  resume-copilot 版本: ${VERSION_COMMIT} (${VERSION_DATE})"
@@ -38,7 +38,7 @@ fi
 # ═══ 自适应 GPU 显存利用率 ═══
 TOTAL_MIB=$(python3 -c "import torch; print(int(torch.cuda.mem_get_info()[1]/2**20))" 2>/dev/null || echo "81920")
 TOTAL_GIB=$((TOTAL_MIB / 1024))
-SAFE_GIB=35
+SAFE_GIB=28
 GPU_MEM_UTIL=$(python3 -c "print(f'{min($SAFE_GIB/$TOTAL_GIB, 0.95):.2f}')")
 log "GPU total=${TOTAL_GIB}GiB, safe_target=${SAFE_GIB}GiB → gpu_memory_utilization=${GPU_MEM_UTIL}"
 
