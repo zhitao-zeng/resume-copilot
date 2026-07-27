@@ -789,7 +789,7 @@ def audit_resume_core(resume_text: str, jd_text: Optional[str], resume_data: Opt
         "- 若 JD 为空，jd_alignment 仍需返回合法空结构"
     )
     try:
-        raw = call_llm_typed(AuditLLMOutput, AUDIT_SYSTEM_PROMPT, user_prompt, temperature=0.3)
+        raw = call_llm_typed(AuditLLMOutput, AUDIT_SYSTEM_PROMPT, user_prompt, temperature=0.3, max_tokens=2560)
         if not raw:
             return _audit_fallback(resume_text, jd_text, "audit_resume_core: llm returned empty audit")
         return normalize_audit_result(raw, resume_text, jd_text)

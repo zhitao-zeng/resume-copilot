@@ -39,7 +39,8 @@ from resume_parsing import (
     resume_data_to_text,
 )
 from schemas import OptimizeLLMOutput, OptimizeWithAuditLLMOutput, RevisionLLMOutput, RevisionTarget
-from server_runtime import DETAIL_HINT_WORDS, RESPONSIBILITY_WORDS, SHRINK_GUARD_MIN_SOURCE_CHARS, call_llm_typed, llm_enabled, logger, sanitize_user_text
+from server_runtime import DETAIL_HINT_WORDS, RESPONSIBILITY_WORDS, SHRINK_GUARD_MIN_SOURCE_CHARS, call_llm_text, call_llm_typed, llm_enabled, logger, sanitize_user_text
+from llm_gateway import parse_json_content
 
 
 def _normalize_style(style: str) -> str:
@@ -1067,15 +1068,16 @@ def analyze_bullet(bullet: FactBullet) -> Optional[dict[str, Any]]:
         "输出诊断 JSON。"
     )
     try:
-        result = call_llm_typed(
-            _BulletAnalysisOutput,
+        result = call_llm_text(
             _ANALYZE_SYSTEM_PROMPT,
             prompt,
             temperature=0.1,
             max_tokens=192,
-            prefill='{"missing_situation":',
         )
-        return result if isinstance(result, dict) else None
+        parsed = parse_json_content(result)
+        if not isinstance(parsed, dict) or not parsed:
+            return None
+        return parsed
     except Exception as exc:
         logger.warning("analyze_bullet failed for %s: %s", bullet.id, exc)
         return None

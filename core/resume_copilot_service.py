@@ -762,6 +762,7 @@ async def resume_copilot_service(
 
     # V2 pipeline flag
     _pipeline_version = os.environ.get("RESUME_PIPELINE_VERSION", "v1").strip()
+    _v2_succeeded = False
     if _pipeline_version in ("v2", "shadow"):
         try:
             from v2_pipeline import run_v2_pipeline
@@ -778,15 +779,11 @@ async def resume_copilot_service(
                 ctx.resume_data = v2_result.resume_dict
                 ctx.fabrication_report = None
                 ctx.missing_fields = []
+                _v2_succeeded = True
         except Exception as exc:
             logger.error("V2 pipeline failed: %s", exc)
-            if _pipeline_version == "v2":
-                if ctx.has_cv:
-                    ctx = await rewrite_path(ctx)
-                else:
-                    ctx = await generate_path(ctx)
 
-    if _pipeline_version == "v1" or (_pipeline_version == "v2" and not ctx.resume_data):
+    if not _v2_succeeded:
         if ctx.has_cv:
             ctx = await rewrite_path(ctx)
         else:
