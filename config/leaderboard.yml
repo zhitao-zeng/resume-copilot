@@ -10,7 +10,7 @@ inferenceVolumeMounts:
 
 inferenceImage:
   repository: "harbor-contest.4pd.io/zengzhitao/resume-copilot"
-  tag: "v2-27b"
+  tag: "v2-27b-fix1"
 
 values:
   env:
