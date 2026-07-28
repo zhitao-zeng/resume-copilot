@@ -1,7 +1,3 @@
-# ── V2 + Qwen3.6-35B-A3B-AWQ (MoE) ──
-# Pipeline: V2 (SourceAdapter → Composer → Verifier → Validator → Renderer)
-# Model: Qwen3.6-35B-A3B-AWQ (24GB, MoE ~3B active, needs ~6GB CPU)
-
 inferenceVolumeMounts:
   - name: model
     mountPoint: /model
@@ -11,41 +7,3 @@ inferenceVolumeMounts:
 inferenceImage:
   repository: "harbor-contest.4pd.io/zengzhitao/resume-copilot"
   tag: "v2-27b-fix3"
-
-values:
-  env:
-    - name: RESUME_PIPELINE_VERSION
-      value: "v2"
-    - name: REQUEST_TIMEOUT_SECONDS
-      value: "600"
-    - name: ENABLE_HEURISTIC_AUDIT_FALLBACK
-      value: "0"
-    - name: DEFAULT_OUTPUT_FORMAT
-      value: "docx"
-  command:
-    - ./start.sh
-  volumeMounts:
-    - mountPath: /model
-      name: ceph-customer
-      readOnly: true
-      subPath: zengzhitao/resume-copilot/models/Qwen3.6-35B-A3B-AWQ
-  resources:
-    limits:
-      cpu: '8'
-      memory: 64Gi
-      nvidia.com/gpu: '1'
-      nvidia.com/gpucores: '50'
-      nvidia.com/gpumem: '40960'
-    requests:
-      cpu: '8'
-      memory: 64Gi
-      nvidia.com/gpu: '1'
-      nvidia.com/gpucores: '50'
-      nvidia.com/gpumem: '40960'
-  readinessProbe:
-    httpGet:
-      path: /ready
-      port: 80
-    initialDelaySeconds: 600
-    periodSeconds: 10
-    timeoutSeconds: 5
