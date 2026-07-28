@@ -775,6 +775,10 @@ async def resume_copilot_service(
     ctx.fabrication_report = None
     ctx.missing_fields = []
 
+    # V2: skip V1 audit in stage_score (it calls audit_resume_core which is very slow)
+    ctx._has_audit = True
+    ctx.audit_report = {"overall_score": 0, "issues": [], "summary": ""}
+
     ctx = await stage_score(ctx)
     ctx = await stage_render(ctx)
 
