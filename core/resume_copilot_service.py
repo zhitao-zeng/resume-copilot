@@ -761,37 +761,19 @@ async def resume_copilot_service(
     )
     ctx = await stage_classify(ctx)
 
-    # V2 pipeline flag
-    _pipeline_version = os.environ.get("RESUME_PIPELINE_VERSION", "v1").strip()
-    _v2_succeeded = False
-    if _pipeline_version in ("v2", "shadow"):
-        try:
-            from v2_pipeline import run_v2_pipeline
-            loop = asyncio.get_event_loop()
-            v2_result = await loop.run_in_executor(
-                None,
-                run_v2_pipeline,
-                ctx.cv_text,
-                ctx.query_text,
-                ctx.jd_text,
-            )
-            if _pipeline_version == "shadow":
-                logger.info("SHADOW | V2 produced %d edu, %d exp",
-                            len(v2_result.resume.education),
-                            len(v2_result.resume.experience))
-            else:
-                ctx.resume_data = v2_result.resume_dict
-                ctx.fabrication_report = None
-                ctx.missing_fields = []
-                _v2_succeeded = True
-        except Exception as exc:
-            logger.error("V2 pipeline failed: %s", exc)
-
-    if not _v2_succeeded:
-        if ctx.has_cv:
-            ctx = await rewrite_path(ctx)
-        else:
-            ctx = await generate_path(ctx)
+    # V2 pipeline only
+    from v2_pipeline import run_v2_pipeline
+    loop = asyncio.get_event_loop()
+    v2_result = await loop.run_in_executor(
+        None,
+        run_v2_pipeline,
+        ctx.cv_text,
+        ctx.query_text,
+        ctx.jd_text,
+    )
+    ctx.resume_data = v2_result.resume_dict
+    ctx.fabrication_report = None
+    ctx.missing_fields = []
 
     ctx = await stage_score(ctx)
     ctx = await stage_render(ctx)
