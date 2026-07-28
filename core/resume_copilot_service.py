@@ -7,6 +7,7 @@ natural-language reply + scoring metadata.
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import os
 import re
@@ -766,10 +767,13 @@ async def resume_copilot_service(
     if _pipeline_version in ("v2", "shadow"):
         try:
             from v2_pipeline import run_v2_pipeline
-            v2_result = run_v2_pipeline(
-                cv_text=ctx.cv_text,
-                query_text=ctx.query_text,
-                jd_text=ctx.jd_text,
+            loop = asyncio.get_event_loop()
+            v2_result = await loop.run_in_executor(
+                None,
+                run_v2_pipeline,
+                ctx.cv_text,
+                ctx.query_text,
+                ctx.jd_text,
             )
             if _pipeline_version == "shadow":
                 logger.info("SHADOW | V2 produced %d edu, %d exp",
