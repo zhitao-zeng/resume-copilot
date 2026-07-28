@@ -5,6 +5,7 @@ Layers: SourceAdapter → Composer → Verifier → Validator
 from __future__ import annotations
 
 import logging
+import time
 
 from v2_schemas import VerifiedResult, CanonicalResume, Meta
 from source_adapter import build_source_bundle
@@ -62,21 +63,30 @@ def run_v2_pipeline(
     jd_text: str,
 ) -> VerifiedResult:
     """Run the V2 5-layer pipeline. Returns VerifiedResult or fallback."""
+    t_start = time.perf_counter()
+
     source = build_source_bundle(cv_text, query_text, jd_text)
-    logger.info("V2 | SourceBundle: %d blocks", len(source.blocks))
+    logger.info("V2 | SourceBundle: %d blocks (%.1fs)",
+                len(source.blocks), time.perf_counter() - t_start)
 
+    t_composer = time.perf_counter()
     draft = compose_resume(source)
-    logger.info("V2 | DraftResume: %d edu, %d exp, %d res, %d proj",
-                len(draft.education), len(draft.experience), len(draft.research), len(draft.projects))
+    logger.info("V2 | Composer done: %d edu, %d exp, %d res, %d proj (%.1fs)",
+                len(draft.education), len(draft.experience),
+                len(draft.research), len(draft.projects),
+                time.perf_counter() - t_composer)
 
+    t_verifier = time.perf_counter()
     result = verify_resume(source, draft)
-    logger.info("V2 | VerifiedResult: %d edu, %d exp, %d res, %d changes",
+    logger.info("V2 | Verifier done: %d edu, %d exp, %d res, %d changes (%.1fs)",
                 len(result.resume.education), len(result.resume.experience),
-                len(result.resume.research), len(result.changes))
+                len(result.resume.research), len(result.changes),
+                time.perf_counter() - t_verifier)
 
     result.resume = validate_resume(result.resume)
-
-    # Attach V1-format dict for renderer compatibility
     result.resume_dict = _canonical_to_v1_format(result.resume)
+
+    logger.info("V2 | Total: %.1fs (Composer+Verifier+Validate+Format)",
+                time.perf_counter() - t_start)
 
     return result
