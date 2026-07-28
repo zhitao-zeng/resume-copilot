@@ -7,7 +7,6 @@ natural-language reply + scoring metadata.
 
 from __future__ import annotations
 
-import asyncio
 import copy
 import os
 import re
@@ -761,26 +760,26 @@ async def resume_copilot_service(
     )
     ctx = await stage_classify(ctx)
 
-    # V2 pipeline only
+    # V2 pipeline — synchronous call (total ~60-90s for 2 LLM calls)
+    t_v2 = time.perf_counter()
     from v2_pipeline import run_v2_pipeline
-    loop = asyncio.get_event_loop()
-    v2_result = await loop.run_in_executor(
-        None,
-        run_v2_pipeline,
-        ctx.cv_text,
-        ctx.query_text,
-        ctx.jd_text,
-    )
+    v2_result = run_v2_pipeline(ctx.cv_text, ctx.query_text, ctx.jd_text)
     ctx.resume_data = v2_result.resume_dict
     ctx.fabrication_report = None
     ctx.missing_fields = []
+    logger.info("V2 pipeline done in %.1fs", time.perf_counter() - t_v2)
 
-    # V2: skip V1 audit in stage_score (it calls audit_resume_core which is very slow)
+    # Skip V1 audit (Verifier already validates)
     ctx._has_audit = True
     ctx.audit_report = {"overall_score": 0, "issues": [], "summary": ""}
 
+    t_score = time.perf_counter()
     ctx = await stage_score(ctx)
+    logger.info("stage_score done in %.1fs", time.perf_counter() - t_score)
+
+    t_render = time.perf_counter()
     ctx = await stage_render(ctx)
+    logger.info("stage_render done in %.1fs", time.perf_counter() - t_render)
 
     return ResumeCopilotResponse(
         files=ctx.files,
