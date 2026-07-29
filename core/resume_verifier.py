@@ -59,7 +59,7 @@ def verify_resume(source: SourceBundle, draft: DraftResume) -> VerifiedResult:
             RESUME_VERIFIER_SYSTEM_PROMPT,
             prompt,
             temperature=0.0,
-            max_tokens=3072,
+            max_tokens=4096,
         )
     except Exception as exc:
         logger.warning("ResumeVerifier LLM call failed: %s", exc)
