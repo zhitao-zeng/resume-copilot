@@ -1,6 +1,6 @@
 """V2 Pipeline orchestration.
 
-Layers: SourceAdapter → Composer → Verifier → Validator
+Layers: SourceAdapter → Composer → Verifier → Optimizer → Validator
 """
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from v2_schemas import VerifiedResult, CanonicalResume, Meta
 from source_adapter import build_source_bundle
 from resume_composer import compose_resume
 from resume_verifier import verify_resume
+from resume_optimizer import optimize_resume
 from v2_validator import validate_resume
 
 logger = logging.getLogger(__name__)
@@ -82,6 +83,10 @@ def run_v2_pipeline(
                 len(result.resume.education), len(result.resume.experience),
                 len(result.resume.research), len(result.changes),
                 time.perf_counter() - t_verifier)
+
+    t_optimizer = time.perf_counter()
+    result.resume = optimize_resume(result.resume, jd_text)
+    logger.info("V2 | Optimizer done (%.1fs)", time.perf_counter() - t_optimizer)
 
     result.resume = validate_resume(result.resume)
     result.resume_dict = _canonical_to_v1_format(result.resume)
