@@ -3,6 +3,7 @@ FROM harbor-contest.4pd.io/zengzhitao/resume-copilot@sha256:644e77e9bcfdb38d2be9
 # Overlay latest V2 code + start.sh
 COPY core/prompts.py /root/app/core/prompts.py
 COPY core/v2_schemas.py /root/app/core/v2_schemas.py
+COPY core/resume_renderer.py /root/app/core/resume_renderer.py
 COPY core/v2_pipeline.py /root/app/core/v2_pipeline.py
 COPY core/resume_composer.py /root/app/core/resume_composer.py
 COPY core/resume_verifier.py /root/app/core/resume_verifier.py

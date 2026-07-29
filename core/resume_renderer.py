@@ -187,12 +187,12 @@ def _compress_resume_data_for_docx(resume_data: dict[str, Any]) -> dict[str, Any
         exp["achievements"] = _cap_texts(exp.get("achievements"), 1)
         for proj in exp.get("projects", []) if isinstance(exp.get("projects"), list) else []:
             if isinstance(proj, dict):
-                proj["bullets"] = _cap_texts(_collect_project_bullets(proj), 1)
+                proj["bullets"] = _cap_texts(_collect_project_bullets(proj), 3)
 
-    # Projects: cap to 1 bullet each to keep page count down
+    # Projects: cap to 3 bullets each
     for proj in data.get("projects", []) if isinstance(data.get("projects"), list) else []:
         if isinstance(proj, dict):
-            proj["bullets"] = _cap_texts(_collect_project_bullets(proj), 1)
+            proj["bullets"] = _cap_texts(_collect_project_bullets(proj), 3)
 
     skills = data.get("skills")
     if isinstance(skills, dict):

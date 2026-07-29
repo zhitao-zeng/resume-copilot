@@ -75,6 +75,7 @@ class Project(BaseModel):
     organization: str = ""
     role: str = ""
     period: str = ""
+    bullets: list[str] = Field(default_factory=list)
 
 
 class Research(BaseModel):
@@ -129,6 +130,7 @@ class CanonicalResume(BaseModel):
     projects: list[Project] = Field(default_factory=list)
     skills: SkillsDraft = Field(default_factory=SkillsDraft)
     summary: str = ""
+    awards: list[str] = Field(default_factory=list)
 
 
 # ---- DraftResume (plain strings, no evidence wrapper) ----
@@ -142,6 +144,7 @@ class DraftResume(BaseModel):
     projects: list[Project] = Field(default_factory=list)
     skills: SkillsDraft = Field(default_factory=SkillsDraft)
     summary: str = ""
+    awards: list[str] = Field(default_factory=list)
 
 
 class Change(BaseModel):

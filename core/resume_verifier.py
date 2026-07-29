@@ -126,7 +126,7 @@ def verify_resume(source: SourceBundle, draft: DraftResume) -> VerifiedResult:
         "education": {"school", "degree", "major", "period"},
         "experience": {"organization", "role", "period", "bullets"},
         "research": {"institution", "topic", "period", "bullets"},
-        "projects": {"name", "organization", "role", "period"},
+        "projects": {"name", "organization", "role", "period", "bullets"},
         "meta": {"name", "phone", "email", "target_role", "work_experience"},
         "skills": {"items"},  # Skills is flat items format, not categorized dict
     }

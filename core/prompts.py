@@ -484,8 +484,9 @@ RESUME_COMPOSER_SYSTEM_PROMPT = """从材料中提取候选人简历信息，输
   "education": [{"school": "", "degree": "", "major": "", "period": ""}],
   "experience": [{"organization": "", "role": "", "period": "", "bullets": ["bullet1"]}],
   "research": [{"institution": "", "topic": "", "period": "", "bullets": ["bullet1"]}],
-  "projects": [{"name": "", "organization": "", "role": "", "period": ""}],
-  "skills": {"items": [{"name": "Python", "category": "language"}]}
+  "projects": [{"name": "", "organization": "", "role": "", "period": "", "bullets": ["bullet1"]}],
+  "skills": {"items": [{"name": "Python", "category": "language"}]},
+  "awards": ["奖项1"]
 }
 
 【字段类型】
@@ -500,9 +501,10 @@ RESUME_COMPOSER_SYSTEM_PROMPT = """从材料中提取候选人简历信息，输
 【semantic 约束】
 - name：候选人本人姓名。公司名、品牌名、模板标识不是 name。不确定时返回空字符串。
 - education：必须有实际教育机构名（如"北京邮电大学"）且伴随就读上下文（学历/专业/时间段）。仅章节标题"教育经历"加上奖项/竞赛文本不构成 education record。奖学金名称（如"校级一等奖学金"）不是学校名。
-- experience：企业或实习经历（有明确组织/公司）。"学生"、"研究生"是身份不是工作经验。
+- experience：企业或实习经历（有明确组织/公司）。学生会、社团、志愿者等校园活动如果有明确组织名和具体职责，也可以作为 experience。
 - research：科研/实验室经历（在读学生、研究助理等）。不同于企业 experience。
-- projects：仅包含真正的项目。学生活动、社团工作、志愿服务不是 project。project 的 organization 必须有该项目的直接证据，不能从 education/research 上下文推断。
+- projects：独立的项目经历（课程设计、个人项目、竞赛项目等）。每个 project 必须有 bullets 描述具体工作内容和成果。
+- awards：奖学金、竞赛获奖、荣誉称号等（如"校级一等奖学金""优秀学生干部""全国大学生创新创业大赛三等奖"）。
 - dates：只提取原文明确出现的日期。不要根据学历时间推断项目日期。project/research 的 period 必须有直接来源，不能从 education period 复制。
 - summary：基于候选人事实撰写 2-4 句完整总结。TARGET CONTEXT 中的要求不能写成候选人已有经验。
 - bullets：保留原文的完整描述，包括具体数字、技术名称、项目细节、成果指标。不要压缩、简化或概括原文内容。原文有多详细就保留多详细。
@@ -520,8 +522,9 @@ RESUME_VERIFIER_SYSTEM_PROMPT = """校验 DraftResume，输出严格嵌套的 JS
   "education": [{"school": "", "degree": "", "major": "", "period": ""}],
   "experience": [{"organization": "", "role": "", "period": "", "bullets": ["bullet1"]}],
   "research": [{"institution": "", "topic": "", "period": "", "bullets": ["bullet1"]}],
-  "projects": [{"name": "", "organization": "", "role": "", "period": ""}],
-  "skills": {"items": [{"name": "Python", "category": "language"}]}
+  "projects": [{"name": "", "organization": "", "role": "", "period": "", "bullets": ["bullet1"]}],
+  "skills": {"items": [{"name": "Python", "category": "language"}]},
+  "awards": ["奖项1"]
 }
 
 【来源隔离规则（必须遵守）】
