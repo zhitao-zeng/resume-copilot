@@ -441,11 +441,12 @@ REPLY_GENERATION_SYSTEM_PROMPT = """你是一位简洁专业的简历顾问助�
 规则：
 1) 只陈述事实：基于输入的审计分数、问题、改动，不编造未提及的信息
 2) 语气专业但友好，避免AI套话（如"赋能""助力""全方位"）
-3) 篇幅控制在 80-200 字
-4) 如果有具体问题需要补充，优先列出 1-3 个最关键的
-5) 如果有实质改写，简要说明改了什么方向
-6) 如果分数较高，鼓励用户；分数较低，给出最优先的 1-2 个改进建议
-7) 只输出回复文本，不要输出 JSON 或 markdown
+3) 篇幅控制在 120-300 字
+4) 必须具体指出缺失的信息字段（如姓名、电话、教育时间等），不要泛泛而谈
+5) 如果有目标岗位（JD），给出 1-2 条针对该岗位的具体建议（如"建议补充与XX岗位相关的项目经验"）
+6) 如果有实质改写或校验修正，简要说明改了什么
+7) 如果分数较高，鼓励用户；分数较低，给出最优先的 1-2 个改进建议
+8) 只输出回复文本，不要输出 JSON 或 markdown
 """
 
 POLISH_SYSTEM_PROMPT = """你是一位简历质量把关编辑。请对"已优化简历"做最后一轮保真润色。
@@ -479,12 +480,12 @@ RESUME_COMPOSER_SYSTEM_PROMPT = """从材料中提取候选人简历信息，输
 
 {
   "meta": {"name": "", "phone": "", "email": "", "target_role": "", "work_experience": ""},
+  "summary": "",
   "education": [{"school": "", "degree": "", "major": "", "period": ""}],
   "experience": [{"organization": "", "role": "", "period": "", "bullets": ["bullet1"]}],
   "research": [{"institution": "", "topic": "", "period": "", "bullets": ["bullet1"]}],
   "projects": [{"name": "", "organization": "", "role": "", "period": ""}],
-  "skills": {"items": [{"name": "Python", "category": "language"}]},
-  "summary": ""
+  "skills": {"items": [{"name": "Python", "category": "language"}]}
 }
 
 【字段类型】
@@ -503,7 +504,8 @@ RESUME_COMPOSER_SYSTEM_PROMPT = """从材料中提取候选人简历信息，输
 - research：科研/实验室经历（在读学生、研究助理等）。不同于企业 experience。
 - projects：仅包含真正的项目。学生活动、社团工作、志愿服务不是 project。project 的 organization 必须有该项目的直接证据，不能从 education/research 上下文推断。
 - dates：只提取原文明确出现的日期。不要根据学历时间推断项目日期。project/research 的 period 必须有直接来源，不能从 education period 复制。
-- summary：基于候选人事实撰写。TARGET CONTEXT 中的要求不能写成候选人已有经验。
+- summary：基于候选人事实撰写 2-4 句完整总结。TARGET CONTEXT 中的要求不能写成候选人已有经验。
+- bullets：保留原文的完整描述，包括具体数字、技术名称、项目细节、成果指标。不要压缩、简化或概括原文内容。原文有多详细就保留多详细。
 
 要求：只输出JSON，不编造，不推断。"""
 
@@ -514,12 +516,12 @@ RESUME_VERIFIER_SYSTEM_PROMPT = """校验 DraftResume，输出严格嵌套的 JS
 【输出结构必须如下，字段名不可改变】：
 {
   "meta": {"name": "", "phone": "", "email": "", "target_role": "", "work_experience": ""},
+  "summary": "",
   "education": [{"school": "", "degree": "", "major": "", "period": ""}],
   "experience": [{"organization": "", "role": "", "period": "", "bullets": ["bullet1"]}],
   "research": [{"institution": "", "topic": "", "period": "", "bullets": ["bullet1"]}],
   "projects": [{"name": "", "organization": "", "role": "", "period": ""}],
-  "skills": {"items": [{"name": "Python", "category": "language"}]},
-  "summary": ""
+  "skills": {"items": [{"name": "Python", "category": "language"}]}
 }
 
 【来源隔离规则（必须遵守）】
@@ -536,7 +538,7 @@ RESUME_VERIFIER_SYSTEM_PROMPT = """校验 DraftResume，输出严格嵌套的 JS
 
 【证据规则】
 - organization/role/school/degree/major：原文 Resume 或 Query 中出现过（含子串）→ 保留原文值。否则清空。
-- bullets/projects/research/skills/summary：保留 DraftResume 原值，不要增减。
+- bullets/projects/research/skills/summary：保留 DraftResume 原值，不要增减、简化或压缩。bullets 的原始详细程度必须完整保留。
 - skills.items 每条 skill 包含 name + category。
 - **记录级判定**：一条 experience/education 只要部分字段有证据（如 bullet 内容真实），就保留整条记录，只清空无证据的字段。不要整条删除。
 - 一条 experience 不要拆成多条。

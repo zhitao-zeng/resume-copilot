@@ -416,13 +416,43 @@ def _build_user_report(
 
 
 def _build_llm_reply(
-    *, audit_report, score, missing_fields, changes
+    *, audit_report, score, missing_fields, changes,
+    jd_text: str = "", resume_data: dict | None = None,
 ) -> str:
     """Generate reply_text via LLM. Returns empty string on failure."""
     if not llm_enabled():
         return ""
     try:
         summary_parts = []
+
+        # Resume content overview
+        if resume_data and isinstance(resume_data, dict):
+            sections = []
+            edu = resume_data.get("education", [])
+            exp = resume_data.get("experience", [])
+            proj = resume_data.get("projects", [])
+            skills = resume_data.get("skills", {})
+            summary = resume_data.get("summary", "")
+            if edu:
+                sections.append(f"{len(edu)}段教育经历")
+            if exp:
+                sections.append(f"{len(exp)}段工作/实习经历")
+            if proj:
+                sections.append(f"{len(proj)}个项目")
+            if isinstance(skills, dict) and skills.get("items"):
+                sections.append(f"{len(skills['items'])}项技能")
+            elif isinstance(skills, dict):
+                total = sum(len(v) for v in skills.values() if isinstance(v, list))
+                if total:
+                    sections.append(f"{total}项技能")
+            if summary:
+                sections.append("个人总结")
+            if sections:
+                summary_parts.append("简历包含：" + "、".join(sections))
+            else:
+                summary_parts.append("简历内容为空或极少，需要用户补充个人信息")
+
+        # Audit issues (V1 path)
         if isinstance(audit_report, dict):
             issues = audit_report.get("issues", [])
             if isinstance(issues, list) and issues:
@@ -433,25 +463,44 @@ def _build_llm_reply(
                     p = h.get("problem", "")
                     if p:
                         summary_parts.append(f"重点关注：{p[:80]}")
+
+        # Missing fields — be specific
         if missing_fields:
-            reasons = "；".join(item.get("reason", "") for item in missing_fields[:3] if item.get("reason"))
+            labels = [item.get("label", "") for item in missing_fields[:5] if item.get("label")]
+            reasons = [item.get("reason", "") for item in missing_fields[:3] if item.get("reason")]
+            if labels:
+                summary_parts.append(f"缺失字段：{'、'.join(labels)}")
             if reasons:
-                summary_parts.append(f"需要补充的信息：{reasons}")
-        if not missing_fields:
+                summary_parts.append(f"具体说明：{'；'.join(reasons)}")
+        else:
             summary_parts.append("提醒用户核对联系方式、教育时间等关键信息是否完整")
-        substantive = [c for c in changes if isinstance(c, dict) and len(str(c.get("after", ""))) > len(str(c.get("before", ""))) * 1.2]
-        if substantive:
-            summary_parts.append(f"已完成 {len(substantive)} 处实质性改写")
+
+        # V2 changes (verified/corrected items)
+        if changes:
+            actions = [c for c in changes if isinstance(c, dict)]
+            if actions:
+                summary_parts.append(f"校验阶段处理了 {len(actions)} 处修正")
+                for c in actions[:3]:
+                    reason = c.get("reason", "")
+                    if reason:
+                        summary_parts.append(f"修正：{reason[:60]}")
+
+        # JD context for targeted advice
+        if jd_text and jd_text.strip():
+            jd_snippet = jd_text.strip()[:200]
+            summary_parts.append(f"目标岗位参考：{jd_snippet}")
+            summary_parts.append("请根据目标岗位给出 1-2 条针对性建议")
+
         user_prompt = "请根据以下简历处理结果生成面向用户的自然语言回复（不要提及具体评分数值）：\n\n" + "\n".join(summary_parts)
         reply = call_llm_text(
             system_prompt=REPLY_GENERATION_SYSTEM_PROMPT,
             user_prompt=user_prompt,
-            temperature=0.3, max_tokens=512,
+            temperature=0.3, max_tokens=768,
         )
         if reply and missing_fields:
-            _mf_reasons = "；".join(item.get("reason", "") for item in missing_fields[:3] if item.get("reason"))
-            if _mf_reasons and _mf_reasons not in reply:
-                reply += f"\n\n需要补充的信息：{_mf_reasons}"
+            _mf_labels = "、".join(item.get("label", "") for item in missing_fields[:5] if item.get("label"))
+            if _mf_labels and _mf_labels not in reply:
+                reply += f"\n\n需要补充的信息：{_mf_labels}"
         if reply:
             logger.info("回复信息: %s", reply)
         return reply if reply else ""
@@ -1362,6 +1411,7 @@ async def stage_render(ctx: PipelineContext) -> PipelineContext:
     reply_text = _build_llm_reply(
         audit_report=ctx.audit_report, score=ctx.score,
         missing_fields=missing_dict, changes=ctx.changes,
+        jd_text=ctx.jd_text, resume_data=ctx.resume_data,
     )
     if not reply_text:
         reply_text = build_reply_text(

@@ -761,17 +761,35 @@ async def resume_copilot_service(
     ctx = await stage_classify(ctx)
 
     # V2 pipeline — synchronous call (total ~60-90s for 2 LLM calls)
-    t_v2 = time.perf_counter()
-    from v2_pipeline import run_v2_pipeline
-    v2_result = run_v2_pipeline(ctx.cv_text, ctx.query_text, ctx.jd_text)
-    ctx.resume_data = v2_result.resume_dict
-    ctx.fabrication_report = None
-    ctx.missing_fields = []
-    logger.info("V2 pipeline done in %.1fs", time.perf_counter() - t_v2)
+    # For no-CV cases, use generate_path to produce a structured framework from JD
+    if not ctx.has_cv:
+        ctx = await generate_path(ctx)
+        logger.info("generate_path done (no CV)")
+    else:
+        t_v2 = time.perf_counter()
+        from v2_pipeline import run_v2_pipeline
+        v2_result = run_v2_pipeline(ctx.cv_text, ctx.query_text, ctx.jd_text)
+        ctx.resume_data = v2_result.resume_dict
+        ctx.fabrication_report = None
 
-    # Skip V1 audit (Verifier already validates)
-    ctx._has_audit = True
-    ctx.audit_report = {"overall_score": 0, "issues": [], "summary": ""}
+        # Pass V2 changes for reply context
+        ctx.changes = [
+            {"path": c.path, "action": c.action, "reason": c.reason}
+            for c in (v2_result.changes or [])
+        ]
+
+        # Check required fields on V2 output
+        ctx.missing_fields = check_required_fields(
+            ctx.resume_data,
+            user_stage=ctx.user_stage,
+            source_text=ctx.cv_text,
+        )
+        logger.info("V2 pipeline done in %.1fs, %d missing fields",
+                     time.perf_counter() - t_v2, len(ctx.missing_fields))
+
+        # Skip V1 audit (Verifier already validates)
+        ctx._has_audit = True
+        ctx.audit_report = {"overall_score": 0, "issues": [], "summary": ""}
 
     t_score = time.perf_counter()
     ctx = await stage_score(ctx)

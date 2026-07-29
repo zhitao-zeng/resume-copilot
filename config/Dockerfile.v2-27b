@@ -10,6 +10,7 @@ COPY core/v2_validator.py /root/app/core/v2_validator.py
 COPY core/source_adapter.py /root/app/core/source_adapter.py
 COPY core/llm_gateway.py /root/app/core/llm_gateway.py
 COPY core/resume_copilot_service.py /root/app/core/resume_copilot_service.py
+COPY core/resume_copilot_pipeline.py /root/app/core/resume_copilot_pipeline.py
 COPY core/audit_logic.py /root/app/core/audit_logic.py
 COPY core/resume_optimization.py /root/app/core/resume_optimization.py
 COPY config/start.sh /root/app/start.sh
