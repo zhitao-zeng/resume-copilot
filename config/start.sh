@@ -41,7 +41,7 @@ export MALLOC_ARENA_MAX=2 OMP_NUM_THREADS=1
 vllm serve "$MODEL_FOUND" \
     --host 0.0.0.0 --port 8000 \
     --quantization awq --dtype float16 \
-    --gpu-memory-utilization 0.95 \
+    --gpu-memory-utilization 0.88 \
     --max-model-len 8192 --max-num-seqs 1 \
     --limit-mm-per-prompt '{"image":0,"video":0}' \
     --trust-remote-code \
