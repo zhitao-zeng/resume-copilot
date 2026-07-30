@@ -4,8 +4,8 @@ set -e
 log() { echo "[$(date '+%H:%M:%S')] $1"; }
 
 # === 版本信息 ===
-VERSION_COMMIT="e815bad"
-VERSION_DATE="2026-07-29"
+VERSION_COMMIT="91f5056"
+VERSION_DATE="2026-07-30"
 log "============================================"
 log "  resume-copilot 版本: ${VERSION_COMMIT} (${VERSION_DATE})"
 log "============================================"
