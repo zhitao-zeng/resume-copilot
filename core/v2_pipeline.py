@@ -112,7 +112,9 @@ def run_v2_pipeline(
     result.resume = optimize_resume(result.resume, jd_text)
     logger.info("V2 | Optimizer done (%.1fs)", time.perf_counter() - t_optimizer)
 
-    result.resume = validate_resume(result.resume)
+    # Deterministic repair (school backfill) uses raw CV + query as source
+    _source_for_validate = "\n".join(b.text for b in source.blocks)
+    result.resume = validate_resume(result.resume, source_text=_source_for_validate)
     result.resume_dict = _canonical_to_v1_format(result.resume)
 
     logger.info("V2 | Total: %.1fs (Composer+Verifier+Validate+Format)",
