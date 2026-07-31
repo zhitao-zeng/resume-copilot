@@ -77,12 +77,20 @@ _TEMPLATE_WATERMARK_PATTERNS: dict[str, re.Pattern] = {
 }
 
 
-def _clean_template_watermarks(resume_data: dict, query_text: str = "", has_cv: bool = False) -> list[str]:
+def _clean_template_watermarks(
+    resume_data: dict, query_text: str = "", has_cv: bool = False, cv_text: str = "",
+) -> list[str]:
     """Scan all fields in resume_data for known watermark/template placeholders
     and query leakage (copy-pasted query text in fields). Returns a list of warnings."""
     warnings: list[str] = []
     _query_lower = query_text.lower().strip() if query_text else ""
-
+    _cv_lower = cv_text.lower().strip() if cv_text else ""
+    # Core fact fields: values here come from the real CV; a value that also
+    # appears in query (user re-stating their own CV) is NOT leakage.
+    _FACT_FIELD_SUFFIXES = (
+        ".school", ".organization", ".institution", ".company",
+        ".degree", ".major", ".name", ".role", ".period",
+    )
 
     def _is_query_leak(value: str, path: str) -> bool:
         if not has_cv:
@@ -96,6 +104,14 @@ def _clean_template_watermarks(resume_data: dict, query_text: str = "", has_cv: 
         if len(value) < 3:
             return False
         v = value.lower().strip()
+        # Core fact fields are exempt from query-leak clearing: the CV is the
+        # fact source, and users often re-state their own CV inside the query.
+        if any(path.endswith(sfx) for sfx in _FACT_FIELD_SUFFIXES):
+            return False
+        # A value that already exists in the raw CV text is a real fact,
+        # not a copy of the query.
+        if _cv_lower and v in _cv_lower:
+            return False
         # Field value is a verbatim substring of query (no length limit)
         if v in _query_lower:
             return True
@@ -1399,7 +1415,7 @@ async def stage_render(ctx: PipelineContext) -> PipelineContext:
 
     # ── Clean template watermarks + query leakage before rendering ──
     _watermark_warnings = _clean_template_watermarks(
-        ctx.resume_data, ctx.query_text, ctx.has_cv,
+        ctx.resume_data, ctx.query_text, ctx.has_cv, ctx.cv_text,
     )
     if _watermark_warnings:
         for _w in _watermark_warnings:
