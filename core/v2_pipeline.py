@@ -9,7 +9,7 @@ import time
 
 from v2_schemas import VerifiedResult, CanonicalResume, Meta
 from source_adapter import build_source_bundle
-from resume_composer import compose_resume
+from resume_composer import compose_resume, compose_from_query
 from resume_verifier import verify_resume
 from resume_optimizer import optimize_resume
 from v2_validator import validate_resume
@@ -66,6 +66,30 @@ def run_v2_pipeline(
     """Run the V2 5-layer pipeline. Returns VerifiedResult or fallback."""
     t_start = time.perf_counter()
 
+    # ── No CV: generate structured framework from query + JD ──
+    if not cv_text or not cv_text.strip():
+        logger.info("V2 | No CV — generating framework from query+JD")
+        t_gen = time.perf_counter()
+        resume = compose_from_query(query_text, jd_text)
+        n_exp = len(resume.experience)
+        n_proj = len(resume.projects)
+        n_bullets = sum(len(e.bullets) for e in resume.experience) + \
+                    sum(len(p.bullets) for p in resume.projects) + \
+                    sum(len(r.bullets) for r in resume.research)
+        logger.info("V2 | Generate done: %d exp, %d proj, %d bullets (%.1fs)",
+                    n_exp, n_proj, n_bullets, time.perf_counter() - t_gen)
+
+        # Run Optimizer (skip Verifier — no source evidence for generated content)
+        resume = optimize_resume(resume, jd_text)
+        resume = validate_resume(resume)
+
+        return VerifiedResult(
+            resume=resume,
+            changes=[],
+            resume_dict=_canonical_to_v1_format(resume),
+        )
+
+    # ── Has CV: full Composer → Verifier → Optimizer pipeline ──
     source = build_source_bundle(cv_text, query_text, jd_text)
     logger.info("V2 | SourceBundle: %d blocks (%.1fs)",
                 len(source.blocks), time.perf_counter() - t_start)

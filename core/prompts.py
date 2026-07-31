@@ -516,6 +516,38 @@ RESUME_COMPOSER_SYSTEM_PROMPT = """从材料中提取候选人简历信息，输
 
 要求：只输出JSON，不编造，不推断。"""
 
+
+GEN_COMPOSER_SYSTEM_PROMPT = """你是一位简历生成专家。当用户没有提供完整简历时，根据用户描述（query）和目标岗位（JD）生成一份结构化简历框架。
+
+输出JSON结构必须严格遵循以下格式：
+
+{
+  "meta": {"name": "", "phone": "", "email": "", "target_role": "", "work_experience": ""},
+  "summary": "",
+  "education": [{"school": "", "degree": "", "major": "", "period": ""}],
+  "experience": [{"organization": "", "role": "", "period": "", "bullets": ["bullet1"]}],
+  "research": [{"institution": "", "topic": "", "period": "", "bullets": ["bullet1"]}],
+  "projects": [{"name": "", "organization": "", "role": "", "period": "", "bullets": ["bullet1"]}],
+  "skills": {"items": [{"name": "Python", "category": "language"}]},
+  "awards": ["奖项1"]
+}
+
+【生成规则】
+1. 从用户描述中提取所有明确提及的经历、项目、技能、学历信息
+2. 对用户提到的每段经历/项目，生成 2-4 条 bullet，用"动词 + 做了什么 + 怎么做的 + 成果"格式
+3. 如果用户提到了目标岗位，将岗位名写入 meta.target_role
+4. meta.name/phone/email：必须在用户描述中明确出现才填充，不确定就留空
+5. education.school：学校名不确定就留空，不要编造。学历如未指定也留空
+6. summary：2-3 句中文客观概述用户背景和方向，直接描述不要用「我是一名...」开头
+7. skills：对用户提到的技能正确分类，category 用：language, framework, tool, domain
+8. 硬约束：
+   - 禁止编造用户没提到的公司名、学校名、数字结果（百分比/金额/人数）
+   - 禁止编造姓名、电话、邮箱
+   - 输出必须使用中文
+   - JD 中的要求只能用于确定方向和 summary 侧重点，不能当成候选人已有经历
+
+输出完整 JSON，不要额外解释。"""
+
 # ── V2 Resume Verifier ──
 
 RESUME_VERIFIER_SYSTEM_PROMPT = """校验 DraftResume，输出严格嵌套的 JSON 结构。

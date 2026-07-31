@@ -11,9 +11,9 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from prompts import RESUME_COMPOSER_SYSTEM_PROMPT
+from prompts import RESUME_COMPOSER_SYSTEM_PROMPT, GEN_COMPOSER_SYSTEM_PROMPT
 from server_runtime import call_llm_typed, llm_enabled
-from v2_schemas import SourceBundle, DraftResume
+from v2_schemas import SourceBundle, DraftResume, CanonicalResume
 
 logger = logging.getLogger(__name__)
 
@@ -86,3 +86,41 @@ def compose_resume(source: SourceBundle) -> DraftResume:
     except Exception as exc:
         logger.warning("ResumeComposer output validation failed: %s", exc)
         return DraftResume()
+
+
+def compose_from_query(query_text: str, jd_text: str) -> CanonicalResume:
+    """Generate structured resume framework from query + JD (no CV).
+
+    Used when the user has no resume file — constructs a framework from their
+    written description and optional job description.
+    """
+    if not llm_enabled():
+        return CanonicalResume()
+
+    prompt = ""
+    if query_text.strip():
+        prompt += f"【用户描述】\n{query_text.strip()[:2000]}\n\n"
+    if jd_text.strip():
+        prompt += f"【目标岗位 JD】\n{jd_text.strip()[:1500]}\n\n"
+    prompt += "请根据以上信息生成简历结构化框架。"
+
+    try:
+        parsed = call_llm_typed(
+            CanonicalResume,
+            GEN_COMPOSER_SYSTEM_PROMPT,
+            prompt,
+            temperature=0.2,
+            max_tokens=4096,
+        )
+    except Exception as exc:
+        logger.warning("GenerateComposer LLM call failed: %s", exc)
+        return CanonicalResume()
+
+    if not isinstance(parsed, dict):
+        return CanonicalResume()
+
+    try:
+        return CanonicalResume(**parsed)
+    except Exception as exc:
+        logger.warning("GenerateComposer output validation failed: %s", exc)
+        return CanonicalResume()
