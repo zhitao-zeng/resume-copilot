@@ -230,12 +230,15 @@ def _process_resume(task_id: str, form_data: Any) -> None:
         from resume_copilot_service import _ensure_time_budget
 
         class _MockUpload:
-            def __init__(self, path: str | None, name: str = ""):
+            def __init__(self, path: str | None, name: str = "", content: str | None = None):
                 self.path = path
+                self.content = content
                 self.filename = Path(path).name if path else name
                 self.content_type = None
 
             async def read(self) -> bytes:
+                if self.content is not None:
+                    return self.content.encode("utf-8")
                 if not self.path:
                     return b""
                 with open(self.path, "rb") as f:
@@ -243,16 +246,34 @@ def _process_resume(task_id: str, form_data: Any) -> None:
 
         cv_upload = _MockUpload(cv_path, "cv") if cv_path else None
 
-        # Fallback: if cv was sent as a text path (JSON mode or form text field)
-        # rather than a file upload, try to read the file from that path.
+        # Fallback: if cv was sent as a text field (JSON mode or form text field)
+        # rather than a file upload. Two sub-cases:
+        #   1. cv_text is a real file path string  → read that file
+        #   2. cv_text is the CV content itself    → use it directly as text CV
+        # Guard the path check: CV text can be long; calling .exists() on it
+        # raises FileNameTooLong (OSError 36), so only stat short path-like strings.
         if cv_upload is None and cv_text and len(cv_text) > 5:
-            _cv_text_path = Path(cv_text.strip())
-            if _cv_text_path.exists() and _cv_text_path.is_file():
-                _json_logger.info("[%s] cv received as path string, reading file: %s", task_id, cv_text)
-                cv_upload = _MockUpload(str(_cv_text_path), _cv_text_path.name)
-                cv_path = str(_cv_text_path)  # for logging
+            _cv_candidate = cv_text.strip()
+            _looks_like_path = (
+                len(_cv_candidate) < 500
+                and "\n" not in _cv_candidate
+                and Path(_cv_candidate).suffix.lower() in {".pdf", ".docx", ".png", ".jpg", ".jpeg", ".bmp", ".webp", ".txt", ".md"}
+            )
+            if _looks_like_path:
+                _cv_text_path = Path(_cv_candidate)
+                try:
+                    _is_cv_file = _cv_text_path.exists() and _cv_text_path.is_file()
+                except OSError:
+                    _is_cv_file = False
+                if _is_cv_file:
+                    _json_logger.info("[%s] cv received as path string, reading file: %s", task_id, cv_text)
+                    cv_upload = _MockUpload(str(_cv_text_path), _cv_text_path.name)
+                    cv_path = str(_cv_text_path)  # for logging
+                else:
+                    _json_logger.warning("[%s] cv_text=%s does not exist as file, cv_upload=None", task_id, cv_text[:100])
             else:
-                _json_logger.warning("[%s] cv_text=%s does not exist as file, cv_upload=None", task_id, cv_text[:100])
+                _json_logger.info("[%s] cv received as plain text content (%d chars), using directly", task_id, len(cv_text))
+                cv_upload = _MockUpload(None, "cv.txt", content=cv_text)
 
         cv_template_upload = _MockUpload(cv_template_path, "template") if cv_template_path else None
         jd_upload = _MockUpload(jd_path, "target_jd") if jd_path else None
