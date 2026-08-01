@@ -3,11 +3,17 @@
 import json
 import re
 import uuid
+import os
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
 from http_compat import HTTPException
+from security_utils import cleanup_old_files, private_file_mode
+
+
+_draft_lock = threading.RLock()
 
 
 def _now_iso() -> str:
@@ -38,8 +44,14 @@ def save_draft_state(drafts_dir: Path, state: dict[str, Any]) -> None:
     draft_id = state.get("draft_id")
     if not isinstance(draft_id, str):
         raise HTTPException(status_code=500, detail="invalid draft state")
+    drafts_dir.mkdir(parents=True, exist_ok=True)
     draft_path = _draft_file_path(drafts_dir, draft_id)
-    draft_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path = draft_path.with_suffix(f".{uuid.uuid4().hex}.tmp")
+    with _draft_lock:
+        temp_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        private_file_mode(temp_path)
+        temp_path.replace(draft_path)
+        private_file_mode(draft_path)
 
 
 def create_new_draft(
@@ -51,6 +63,7 @@ def create_new_draft(
     output_format: str,
     changes: Optional[list[dict[str, Any]]] = None,
 ) -> tuple[str, int]:
+    cleanup_old_files(drafts_dir, int(os.getenv("DATA_RETENTION_SECONDS", str(7 * 24 * 60 * 60))))
     draft_id = uuid.uuid4().hex[:10]
     state = {
         "draft_id": draft_id,

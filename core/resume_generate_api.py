@@ -19,16 +19,18 @@ import shutil
 import time
 import threading
 from pathlib import Path
+from typing import Any
 
 from flask import Flask, request, Response, send_file
 
-import resume_product_logic as product_logic
 from resume_copilot_service import resume_copilot_service
 from resume_io import extract_text_from_bytes, IMAGE_EXTENSIONS
-from server_runtime import OUTPUT_DIR, DEFAULT_TEMPLATE, MAX_FILE_SIZE, sanitize_user_text, logger
+from server_runtime import OUTPUT_DIR, DEFAULT_TEMPLATE, MAX_FILE_SIZE, logger
+from security_utils import safe_child_path, safe_filename, safe_task_id
 
 app = Flask(__name__)
 app.config["JSON_AS_ASCII"] = False
+app.config["MAX_CONTENT_LENGTH"] = int(os.getenv("MAX_REQUEST_SIZE_BYTES", str(64 * 1024 * 1024)))
 
 # ── 压制 werkzeug 噪声(polling/health) ────────────────────────────
 import logging as _logging
@@ -53,12 +55,53 @@ _task_executor = concurrent.futures.ThreadPoolExecutor(
 )
 _task_futures: dict[str, concurrent.futures.Future] = {}
 _task_futures_lock = threading.Lock()
+_TASK_QUEUE_LIMIT = max(1, int(os.getenv("TASK_QUEUE_LIMIT", "8")))
+_TASK_STATE_TTL = max(60, int(os.getenv("TASK_STATE_TTL_SECONDS", "86400")))
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 UPLOADS_DIR = OUTPUT_DIR / "uploads"
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 _json_logger = logging.getLogger("resume_api")
+
+
+def _discard_future(task_id: str) -> None:
+    with _task_futures_lock:
+        _task_futures.pop(task_id, None)
+
+
+def _cleanup_task_state() -> None:
+    cutoff = time.time() - _TASK_STATE_TTL
+    with task_lock:
+        expired = [
+            task_id for task_id, state in async_tasks.items()
+            if state.get("finished") and state.get("end_time", state.get("start_time", 0)) < cutoff
+        ]
+        for task_id in expired:
+            async_tasks.pop(task_id, None)
+
+
+def _cleanup_saved_inputs(form_data: Any) -> None:
+    for value in getattr(form_data, "values", lambda: [])():
+        if not isinstance(value, str) or not value:
+            continue
+        try:
+            path = Path(value).resolve()
+            if path.is_relative_to(UPLOADS_DIR.resolve()) and path.is_file():
+                path.unlink(missing_ok=True)
+        except OSError:
+            continue
+
+
+@app.before_request
+def _check_api_token():
+    expected = os.getenv("API_AUTH_TOKEN", "").strip()
+    if not expected or request.path == "/ready":
+        return None
+    supplied = request.headers.get("Authorization", "")
+    if supplied != f"Bearer {expected}":
+        return _json_response({"success": False, "message": "unauthorized"}, 401)
+    return None
 
 
 def _json_response(data: dict, status_code: int = 200) -> Response:
@@ -86,10 +129,14 @@ def _save_upload_file(file_storage: Any, task_id: str, field_name: str) -> str |
     # Case 2: Flask FileStorage
     if not getattr(file_storage, "filename", None):
         return None
-    filename = file_storage.filename
-    save_path = UPLOADS_DIR / f"{task_id}_{field_name}_{filename}"
+    filename = safe_filename(file_storage.filename)
+    save_path = safe_child_path(UPLOADS_DIR, f"{safe_task_id(task_id)}_{field_name}_{filename}")
     try:
         file_storage.save(str(save_path))
+        if save_path.stat().st_size > MAX_FILE_SIZE:
+            save_path.unlink(missing_ok=True)
+            _json_logger.warning("Rejected oversized %s upload", field_name)
+            return None
     except Exception as exc:
         _json_logger.warning("Failed to save upload %s: %s", field_name, exc)
         return None
@@ -123,9 +170,18 @@ def _extract_file_field(form_data: dict, field_name: str, id_str: str) -> tuple[
             if file_storage and len(file_storage) > 10:
                 return None, file_storage
             return None, None
-        save_path = Path(file_storage)
+        try:
+            save_path = Path(file_storage).resolve()
+            if not save_path.is_relative_to(UPLOADS_DIR.resolve()):
+                logger.warning("Rejected local path input for %s", field_name)
+                return None, None
+        except (OSError, ValueError):
+            return None, None
         if not save_path.exists():
             logger.warning("Pre-saved file for %s not found: %s", field_name, file_storage)
+            return None, None
+        if save_path.stat().st_size > MAX_FILE_SIZE:
+            logger.warning("Rejected oversized pre-saved %s upload", field_name)
             return None, None
         ext = save_path.suffix.lower()
         try:
@@ -141,8 +197,14 @@ def _extract_file_field(form_data: dict, field_name: str, id_str: str) -> tuple[
     if hasattr(file_storage, "filename"):
         if not file_storage.filename:
             return None, None
-        save_path = UPLOADS_DIR / f"{id_str}_{field_name}_{file_storage.filename}"
+        save_path = safe_child_path(
+            UPLOADS_DIR,
+            f"{safe_task_id(id_str)}_{field_name}_{safe_filename(file_storage.filename)}",
+        )
         file_storage.save(str(save_path))
+        if save_path.stat().st_size > MAX_FILE_SIZE:
+            save_path.unlink(missing_ok=True)
+            return None, None
         ext = Path(save_path).suffix.lower()
         if ext in IMAGE_EXTENSIONS:
             with open(save_path, "rb") as f:
@@ -212,7 +274,7 @@ def _process_resume(task_id: str, form_data: Any) -> None:
         for k in form_data:
             v = form_data[k]
             is_file = hasattr(v, "filename")
-            _keys_summary.append(f"{k}=<file:{getattr(v, 'filename', '')}>" if is_file else f"{k}=<str:{len(str(v))}c>")
+            _keys_summary.append(f"{k}=<file>" if is_file else f"{k}=<str:{len(str(v))}c>")
         _json_logger.info("[%s] form keys: %d fields, %s", task_id, len(form_data), ", ".join(_keys_summary) if _keys_summary else "(none)")
 
         # Extract files
@@ -266,7 +328,7 @@ def _process_resume(task_id: str, form_data: Any) -> None:
                 except OSError:
                     _is_cv_file = False
                 if _is_cv_file:
-                    _json_logger.info("[%s] cv received as path string, reading file: %s", task_id, cv_text)
+                    _json_logger.info("[%s] cv received as persisted upload", task_id)
                     cv_upload = _MockUpload(str(_cv_text_path), _cv_text_path.name)
                     cv_path = str(_cv_text_path)  # for logging
                 else:
@@ -289,7 +351,7 @@ def _process_resume(task_id: str, form_data: Any) -> None:
             "[%s] calling resume_copilot_service | cv_upload=%s | cv_path=%s | has_jd=%s | query_chars=%d",
             task_id,
             "present" if cv_upload is not None else "NONE",
-            cv_path or "N/A",
+            "present" if cv_path else "N/A",
             bool(jd_upload is not None or jd_text_value or target_jd_url),
             len(query or ""),
         )
@@ -338,7 +400,6 @@ def _process_resume(task_id: str, form_data: Any) -> None:
                 "start_time": start_time,
                 "end_time": time.time(),
             }
-
     except Exception as exc:
         elapsed = round(time.time() - start_time, 3)
         _json_logger.error("Task %s failed after %.1fs: %s", task_id, elapsed, exc, exc_info=True)
@@ -356,6 +417,8 @@ def _process_resume(task_id: str, form_data: Any) -> None:
                 "start_time": start_time,
                 "end_time": time.time(),
             }
+    finally:
+        _cleanup_saved_inputs(form_data)
 
 
 # ── Routes ──────────────────────────────────────────────────────────
@@ -371,11 +434,12 @@ def ready():
 def resume_generate():
     """Receive resume generation request, start background processing."""
     try:
+        _cleanup_task_state()
         task_id = "unknown"
         data: Any = {}
 
         if request.content_type and "multipart/form-data" in request.content_type:
-            task_id = str(request.form.get("id", "unknown"))
+            task_id = safe_task_id(request.form.get("id"))
             # request.form only contains text fields; file uploads are in request.files
             data = dict(request.form)
             for key in request.files:
@@ -385,10 +449,15 @@ def resume_generate():
             data = request.get_json(silent=True) or {}
             if not isinstance(data, dict):
                 return _json_response({"success": False, "message": "请求数据必须是 dict 格式"}, 400)
-            task_id = str(data.get("id", "unknown"))
+            task_id = safe_task_id(data.get("id"))
 
         # Normalize task_id
-        task_id = str(task_id)
+        task_id = safe_task_id(task_id)
+
+        with task_lock:
+            existing = async_tasks.get(task_id)
+            if existing and not existing.get("finished", False):
+                return _json_response({"success": False, "message": "task id is already active"}, 409)
 
         # ── Save files to disk BEFORE spawning background thread ──
         # Flask/Werkzeug stores uploaded files as temp files; those are cleaned up
@@ -396,10 +465,17 @@ def resume_generate():
         # is sent, so we must persist files now and pass paths instead of FileStorage.
         for key, val in list(data.items()):
             if hasattr(val, "filename") and getattr(val, "filename", None):
-                save_path = UPLOADS_DIR / f"{task_id}_{key}_{val.filename}"
+                save_path = safe_child_path(
+                    UPLOADS_DIR,
+                    f"{task_id}_{safe_filename(key, 'file')}_{safe_filename(val.filename)}",
+                )
                 val.save(str(save_path))
+                if save_path.stat().st_size > MAX_FILE_SIZE:
+                    save_path.unlink(missing_ok=True)
+                    _cleanup_saved_inputs(data)
+                    return _json_response({"success": False, "message": "uploaded file is too large"}, 413)
                 data[key] = str(save_path)  # Replace FileStorage with persisted path
-                _json_logger.info("[%s] saved upload %s → %s", task_id, key, save_path)
+                _json_logger.info("[%s] saved upload field=%s bytes=%d", task_id, key, save_path.stat().st_size)
 
         # Register task
         with task_lock:
@@ -414,13 +490,20 @@ def resume_generate():
 
         # Log received fields
         query = data.get("Query", data.get("query", ""))
-        _json_logger.info("[%s] 收到简历生成请求: Query=%s", task_id, str(query)[:80])
+        _json_logger.info("[%s] 收到简历生成请求: query_chars=%d", task_id, len(str(query)))
 
         # Submit to thread pool (max_workers=1 prevents thread accumulation)
         _task_id = task_id
-        future = _task_executor.submit(_process_resume, _task_id, data)
         with _task_futures_lock:
+            active = sum(1 for item in _task_futures.values() if not item.done())
+            if active >= _TASK_QUEUE_LIMIT:
+                with task_lock:
+                    async_tasks.pop(_task_id, None)
+                _cleanup_saved_inputs(data)
+                return _json_response({"success": False, "message": "任务队列已满，请稍后重试"}, 429)
+            future = _task_executor.submit(_process_resume, _task_id, data)
             _task_futures[_task_id] = future
+        future.add_done_callback(lambda _f, tid=_task_id: _discard_future(tid))
 
         return _json_response({
             "success": True,
@@ -428,15 +511,22 @@ def resume_generate():
             "task_id": task_id,
         })
 
+    except ValueError as exc:
+        return _json_response({"success": False, "message": str(exc)}, 400)
     except Exception as exc:
         _json_logger.error("resume_generate error: %s", exc, exc_info=True)
-        return _json_response({"success": False, "message": str(exc)}, 500)
+        return _json_response({"success": False, "message": "internal server error"}, 500)
 
 
 @app.route("/generate_progress/<task_id>", methods=["GET"])
 @app.route("/optimize_progress/<task_id>", methods=["GET"])  # 兼容旧版评测端
 def generate_progress(task_id: str):
     """Query resume generation progress and summary."""
+    _cleanup_task_state()
+    try:
+        task_id = safe_task_id(task_id)
+    except ValueError:
+        return _json_response({"success": False, "message": "invalid task id"}, 400)
     with task_lock:
         status = async_tasks.get(task_id, {})
 
@@ -452,13 +542,17 @@ def generate_progress(task_id: str):
 @app.route("/optimize_download/<task_id>", methods=["GET"])  # 兼容旧版评测端
 def download_resume(task_id: str):
     """Download the generated resume file (docx)."""
+    try:
+        task_id = safe_task_id(task_id)
+    except ValueError:
+        return _json_response({"success": False, "message": "invalid task id"}, 400)
     with task_lock:
         status = async_tasks.get(task_id, {})
         file_path = status.get("file_path", "")
 
     # Fallback: check OUTPUT_DIR directly
     if not file_path:
-        fallback = OUTPUT_DIR / f"{task_id}.docx"
+        fallback = safe_child_path(OUTPUT_DIR, f"{task_id}.docx")
         if fallback.exists():
             file_path = str(fallback)
 

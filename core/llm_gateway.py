@@ -3,6 +3,7 @@
 import json
 import logging
 import re
+import threading
 import time
 from typing import Any, Callable, Optional
 
@@ -86,6 +87,25 @@ class LLMGateway:
         self._logger = logger
         self._enable_json_repair = enable_json_repair
         self._dump_failure_payload = dump_failure_payload
+        self._circuit_lock = threading.Lock()
+        self._consecutive_failures = 0
+        self._circuit_open_until = 0.0
+
+    def _ensure_circuit_closed(self) -> None:
+        with self._circuit_lock:
+            if time.monotonic() < self._circuit_open_until:
+                raise RuntimeError("LLM backend circuit is temporarily open")
+
+    def _record_success(self) -> None:
+        with self._circuit_lock:
+            self._consecutive_failures = 0
+            self._circuit_open_until = 0.0
+
+    def _record_failure(self) -> None:
+        with self._circuit_lock:
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= 2:
+                self._circuit_open_until = time.monotonic() + 30.0
 
     @staticmethod
     def _is_json_mode_unsupported_error(exc: Exception) -> bool:
@@ -111,6 +131,7 @@ class LLMGateway:
         prefill: str = "",
     ) -> str:
         client = self._client_factory()
+        self._ensure_circuit_closed()
         started = time.perf_counter()
         json_mode_used = True
         extra_body = {
@@ -120,31 +141,36 @@ class LLMGateway:
             "min_p": 0.0,
         }
         try:
-            response = client.chat.completions.create(
-                model=self._model_name,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                response_format={"type": "json_object"},
-                extra_body=extra_body,
-            )
-        except Exception as exc:
-            if not self._is_json_mode_unsupported_error(exc):
-                raise
-            json_mode_used = False
-            self._logger.warning(
-                "JSON mode unsupported by backend, fallback to plain chat completion | model=%s | tag=%s | err=%s",
-                self._model_name,
-                trace_tag,
-                str(exc),
-            )
-            response = client.chat.completions.create(
-                model=self._model_name,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                extra_body=extra_body,
-            )
+            try:
+                response = client.chat.completions.create(
+                    model=self._model_name,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    response_format={"type": "json_object"},
+                    extra_body=extra_body,
+                )
+            except Exception as exc:
+                if not self._is_json_mode_unsupported_error(exc):
+                    raise
+                json_mode_used = False
+                self._logger.warning(
+                    "JSON mode unsupported by backend, fallback to plain chat completion | model=%s | tag=%s | err=%s",
+                    self._model_name,
+                    trace_tag,
+                    str(exc),
+                )
+                response = client.chat.completions.create(
+                    model=self._model_name,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    extra_body=extra_body,
+                )
+        except Exception:
+            self._record_failure()
+            raise
+        self._record_success()
         elapsed = time.perf_counter() - started
         # messages[-1] is the prefill "{" when using call_typed/call_json;
         # the real user prompt is always at index 1 (messages[1]).
@@ -296,15 +322,21 @@ class LLMGateway:
             {"role": "user", "content": user_prompt},
         ]
         client = self._client_factory()
+        self._ensure_circuit_closed()
         started = time.perf_counter()
         extra_body = {"chat_template_kwargs": {"enable_thinking": False}}
-        response = client.chat.completions.create(
-            model=self._model_name,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            extra_body=extra_body,
-        )
+        try:
+            response = client.chat.completions.create(
+                model=self._model_name,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                extra_body=extra_body,
+            )
+        except Exception:
+            self._record_failure()
+            raise
+        self._record_success()
         elapsed = time.perf_counter() - started
         self._logger.info(
             "LLM text completion done | model=%s | elapsed=%.2fs | temp=%.2f | max_tokens=%d",

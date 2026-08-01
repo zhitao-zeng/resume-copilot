@@ -10,8 +10,6 @@ import copy
 import re
 
 from server_runtime import logger
-
-from server_runtime import logger
 from typing import Any, Optional
 
 from resume_validator import calculate_experience_years
@@ -19,6 +17,7 @@ from resume_validator import calculate_experience_years
 
 INDUSTRY_LABELS = {
     "product_research": "产研",
+    "ai_engineering": "算法/AI",
     "operations": "运营",
     "doctor": "医疗",
     "teacher": "教师/教育",
@@ -30,14 +29,26 @@ INDUSTRY_LABELS = {
     "other": "综合",
 }
 
+
+def display_industry(industry: str) -> str:
+    """Return a useful label for both known and free-text industries."""
+
+    value = str(industry or "").strip()
+    if not value or value == "other":
+        return "综合"
+    return INDUSTRY_LABELS.get(value, value)
+
 INDUSTRY_KEYWORDS: dict[str, tuple[str, ...]] = {
     "product_research": (
         "产品经理", "产品实习", "产品助理", "需求分析", "需求调研",
         "竞品分析", "原型设计", "PRD", "数据指标", "数据产品", "B端产品",
-        "产研", "算法", "研发工程师", "3D大模型", "大语言模型",
+        "产研",
+    ),
+    "ai_engineering": (
+        "算法", "算法工程师", "算法研究员", "3D大模型", "大语言模型",
         "深度学习", "计算机视觉", "语音算法", "NLP", "多模态",
-        "强化学习", "扩散模型", "RLHF", "Prompt",
-        "PyTorch", "TensorFlow", "Transformer",
+        "强化学习", "扩散模型", "RLHF", "Prompt", "模型训练", "参数调优",
+        "PyTorch", "TensorFlow", "Transformer", "OCR", "目标检测", "图像生成",
         "数据工程", "数据管道", "SLURM", "GDAL", "OpenCV",
         "遥感", "卫星图像", "遥感数据", "GEE",
         "ASR", "TTS", "语音识别", "声学模型", "端侧",
@@ -57,6 +68,8 @@ STRONG_INDUSTRY_KEYWORDS: dict[str, tuple[str, ...]] = {
     "product_research": (
         "产品经理", "产品实习生", "产品实习", "产品助理", "需求分析", "需求调研",
         "竞品分析", "原型设计", "PRD",
+    ),
+    "ai_engineering": (
         "算法研究员", "大模型", "深度学习", "计算机视觉", "语音算法", "NLP",
         "多模态", "强化学习", "扩散模型", "RLHF", "Transformer",
         "数据工程师", "数据工程", "数据管道", "SLURM", "GDAL",
@@ -145,7 +158,10 @@ def infer_user_stage(text: str, resume_data: Optional[dict[str, Any]] = None) ->
 
     # Priority 2: keyword matching on text
     value = str(text or "")
-    if any(k in value for k in ("在校", "应届", "校园", "学生", "本科", "研究生", "实习")):
+    if any(k in value for k in (
+        "在校", "在读", "应届", "校园", "学生", "本科", "硕士", "博士",
+        "研究生", "毕业生", "预计毕业", "即将毕业", "马上要毕业", "实习",
+    )):
         return "student"
     if any(k in value for k in ("工作", "任职", "职场", "从业", "经验", "经理", "主管")):
         return "experienced"
@@ -153,6 +169,16 @@ def infer_user_stage(text: str, resume_data: Optional[dict[str, Any]] = None) ->
         if resume_data.get("education"):
             return "student"
     return "job_seeker"
+
+
+def display_user_stage(user_stage: str) -> str:
+    """Translate internal stage enums for user-facing replies."""
+
+    return {
+        "student": "在校生/应届生",
+        "experienced": "职场人士",
+        "job_seeker": "求职者",
+    }.get(str(user_stage or "").strip(), "求职者")
 
 
 def _is_student_with_internals(experience: list[dict]) -> bool:
@@ -340,11 +366,49 @@ def _extract_experience(text: str) -> list[dict[str, Any]]:
 def _extract_skills(text: str) -> dict[str, list[str]]:
     found = [skill for skill in SKILL_KEYWORDS if skill.lower() in text.lower()]
     domains = [keyword for keyword in ("贷款审核", "客户管理", "课程设计", "临床诊疗", "用户增长", "数据分析", "产品规划", "项目管理") if keyword in text]
-    return {"languages": [s for s in found if s in {"Python", "Java", "C++"}], "frameworks": [], "tools": [s for s in found if s not in {"Python", "Java", "C++"}], "domains": domains}
+    result: dict[str, list[str]] = {
+        "languages": [s for s in found if s in {"Python", "Java", "C++"}],
+        "frameworks": [s for s in found if s.lower() in {"pytorch", "tensorflow"}],
+        "tools": [s for s in found if s not in {"Python", "Java", "C++"} and s.lower() not in {"pytorch", "tensorflow"}],
+        "domains": domains,
+        "methodologies": [],
+        "certifications": [],
+        "natural_languages": [],
+        "others": [],
+    }
+
+    # Generic fallback for unknown industries: preserve explicitly listed
+    # skill tokens even when they are not in SKILL_KEYWORDS.  The heading gives
+    # a broad semantic bucket; individual profession terms need no dictionary.
+    heading_buckets = (
+        (r"(?:证书|资质|资格|认证)", "certifications"),
+        (r"(?:外语|语言能力)", "natural_languages"),
+        (r"(?:方法|方法论|流程)", "methodologies"),
+        (r"(?:专业领域|业务领域|擅长领域)", "domains"),
+        (r"(?:工具|软件|平台)", "tools"),
+        (r"(?:技术栈|专业技能|技能清单|技能)", "others"),
+    )
+    for line in (value.strip() for value in str(text or "").splitlines() if value.strip()):
+        if "：" in line:
+            heading, values = line.split("：", 1)
+        elif ":" in line:
+            heading, values = line.split(":", 1)
+        else:
+            continue
+        bucket = next((target for pattern, target in heading_buckets if re.search(pattern, heading, re.IGNORECASE)), "")
+        if not bucket:
+            continue
+        for token in re.split(r"[、,，；;|/]|\s{2,}", values):
+            token = token.strip(" ·•-\t")
+            if not 1 < len(token) <= 40 or re.search(r"[。！？!?]", token):
+                continue
+            if token not in result[bucket] and not any(token in items for items in result.values()):
+                result[bucket].append(token)
+    return result
 
 
 def _build_summary(resume_data: dict[str, Any], meta: dict[str, Any], industry: str, target_role: str, skills: dict[str, list[str]]) -> str:
-    label = INDUSTRY_LABELS.get(industry, "综合")
+    label = display_industry(industry)
     role = target_role or meta.get("target_role") or f"{label}岗位"
     skill_terms: list[str] = []
     for bucket in ("domains", "tools", "languages"):
@@ -586,6 +650,6 @@ def normalize_resume_data_for_product(resume_data: dict[str, Any], *, raw_text: 
         data["summary"] = _build_summary(data, meta, industry, target_role, data["skills"])
     elif len(str(data.get("summary") or "")) > 120:
         data["summary"] = str(data["summary"]).strip()[:120]
-        data["summary"] = str(data["summary"]).strip()[:100]
+        data["summary"] = str(data["summary"]).strip()
     data.setdefault("fact_sources", {"raw_input": "query/cv", "jd_usage": "JD only used for direction; facts must come from query/cv."})
     return data

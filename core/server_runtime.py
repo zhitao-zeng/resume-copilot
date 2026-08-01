@@ -36,7 +36,7 @@ except ImportError:
     np = None
 
 API_BASE_URL = os.getenv("MODELHUB_BASE_URL", "http://localhost:8000/v1")
-API_KEY = os.getenv("MODELHUB_API_KEY", "not-needed")
+API_KEY = os.getenv("MODELHUB_API_KEY", "")
 MODEL_NAME = os.getenv("MODELHUB_MODEL_NAME", "/data/Qwen3.6-27B-AWQ-INT4")
 DEFAULT_OUTPUT_FORMAT = os.getenv("DEFAULT_OUTPUT_FORMAT", "both")
 DEFAULT_TEMPLATE = os.getenv("DEFAULT_TEMPLATE", "classic")
@@ -47,12 +47,14 @@ DRAFTS_DIR = OUTPUT_DIR / "drafts"
 AVATAR_DIR = OUTPUT_DIR / "assets"
 LLM_FAILURE_DUMP_DIR = OUTPUT_DIR / "debug" / "llm_json_failures"
 ENABLE_LLM_FAILURE_DUMP = os.getenv("ENABLE_LLM_FAILURE_DUMP", "0").strip() == "1"
-ENABLE_PARSE_DEBUG_LOG = os.getenv("ENABLE_PARSE_DEBUG_LOG", "1").strip() != "0"
+ENABLE_PARSE_DEBUG_LOG = os.getenv("ENABLE_PARSE_DEBUG_LOG", "0").strip() != "0"
 ENABLE_HEURISTIC_AUDIT_FALLBACK = os.getenv("ENABLE_HEURISTIC_AUDIT_FALLBACK", "1").strip() != "0"
 ENABLE_RESUME_SHRINK_GUARD = os.getenv("ENABLE_RESUME_SHRINK_GUARD", "1").strip() != "0"
 ENABLE_TEXT_LAYOUT_NORMALIZATION = os.getenv("ENABLE_TEXT_LAYOUT_NORMALIZATION", "1").strip() != "0"
 ENABLE_AVATAR_EXTRACTION = os.getenv("ENABLE_AVATAR_EXTRACTION", "1").strip() != "0"
 ENABLE_AVATAR_FACE_SCORE = os.getenv("ENABLE_AVATAR_FACE_SCORE", "1").strip() != "0"
+ENABLE_LLM_CLASSIFIER = os.getenv("ENABLE_LLM_CLASSIFIER", "1").strip() != "0"
+ENABLE_LLM_REPLY = os.getenv("ENABLE_LLM_REPLY", "1").strip() != "0"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -87,6 +89,7 @@ SHRINK_GUARD_MIN_SOURCE_CHARS = _safe_env_int("SHRINK_GUARD_MIN_SOURCE_CHARS", 5
 MAX_AUDIT_ISSUES = _safe_env_int("MAX_AUDIT_ISSUES", 12)
 LLM_TIMEOUT_SECONDS = _safe_env_int("LLM_TIMEOUT_SECONDS", 180)
 REQUEST_TIMEOUT_SECONDS = _safe_env_int("REQUEST_TIMEOUT_SECONDS", 480)
+DATA_RETENTION_SECONDS = _safe_env_int("DATA_RETENTION_SECONDS", 7 * 24 * 60 * 60)
 
 SECTION_HEADING_KEYWORDS = (
     "个人简历",

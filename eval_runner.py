@@ -7,9 +7,14 @@ field-completeness path on the fixed JSONL case set.
 from __future__ import annotations
 
 import json
+import sys
 import time
 from pathlib import Path
 from typing import Any
+
+CORE_DIR = Path(__file__).resolve().parent / "core"
+if str(CORE_DIR) not in sys.path:
+    sys.path.insert(0, str(CORE_DIR))
 
 from resume_product_logic import (
     heuristic_resume_from_text,

@@ -1,8 +1,17 @@
 import os
+import sys
+import asyncio
+import hmac
 from datetime import datetime
 from typing import Any, Optional
 
 from pathlib import Path
+
+# Keep the repository runnable without a caller-specific PYTHONPATH while the
+# historical core modules are migrated into a conventional package.
+CORE_DIR = Path(__file__).resolve().parent / "core"
+if str(CORE_DIR) not in sys.path:
+    sys.path.insert(0, str(CORE_DIR))
 
 import aiohttp
 import uvicorn
@@ -10,6 +19,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFi
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
+from starlette.middleware.wsgi import WSGIMiddleware
 
 from resume_copilot_service import resume_copilot_service
 from resume_service import (
@@ -28,23 +38,68 @@ from schemas import (
     ScoreResponse,
 )
 from server_runtime import (
-    AVATAR_DIR,
+    API_BASE_URL,
     DEFAULT_TEMPLATE,
-    MAX_FILE_SIZE,
     MODEL_NAME,
-    fitz,
+    REQUEST_TIMEOUT_SECONDS,
     llm_enabled,
     logger,
 )
 
-app = FastAPI(title="Resume Audit & Optimize API", version="3.0.0")
+app = FastAPI(title="Resume Audit & Optimize API", version="3.1.0")
+cors_origins = [item.strip() for item in os.getenv("CORS_ORIGINS", "*").split(",") if item.strip()]
+MAX_REQUEST_SIZE_BYTES = int(os.getenv("MAX_REQUEST_SIZE_BYTES", str(64 * 1024 * 1024)))
+REQUEST_CONCURRENCY = max(1, int(os.getenv("REQUEST_CONCURRENCY", "2")))
+_request_slots = asyncio.Semaphore(REQUEST_CONCURRENCY)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.getenv("CORS_ORIGINS", "*").split(","),
-    allow_credentials=True,
+    allow_origins=cors_origins,
+    allow_credentials="*" not in cors_origins,
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def authenticate_requests(request: Request, call_next):
+    content_length = request.headers.get("Content-Length", "")
+    if content_length.isdigit() and int(content_length) > MAX_REQUEST_SIZE_BYTES:
+        return JSONResponse(status_code=413, content={"detail": "request body is too large"})
+    expected = os.getenv("API_AUTH_TOKEN", "").strip()
+    if expected and request.url.path not in {"/ready", "/health"}:
+        supplied = request.headers.get("Authorization", "")
+        if not hmac.compare_digest(supplied, f"Bearer {expected}"):
+            return JSONResponse(status_code=401, content={"detail": "unauthorized"})
+    return await call_next(request)
+
+
+async def _backend_ready() -> bool:
+    if not llm_enabled():
+        return False
+    try:
+        url = f"{API_BASE_URL.rstrip('/')}/models"
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=2)) as session:
+            async with session.get(url) as response:
+                return response.status == 200
+    except Exception:
+        return False
+
+
+async def _run_copilot_with_timeout(**kwargs):
+    try:
+        await asyncio.wait_for(_request_slots.acquire(), timeout=0.1)
+    except TimeoutError as exc:
+        raise HTTPException(status_code=429, detail="server is at generation capacity; retry later") from exc
+    try:
+        async with asyncio.timeout(REQUEST_TIMEOUT_SECONDS):
+            return await resume_copilot_service(**kwargs)
+    except TimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail=f"resume-copilot exceeded the {REQUEST_TIMEOUT_SECONDS}s request budget",
+        ) from exc
+    finally:
+        _request_slots.release()
 
 
 @app.exception_handler(HTTPException)
@@ -65,7 +120,9 @@ async def http_exception_logger(request: Request, exc: HTTPException) -> JSONRes
 
 @app.get("/ready")
 async def readiness_probe() -> Response:
-    """K8s readiness probe — plain text True."""
+    """K8s readiness probe that verifies the configured LLM backend."""
+    if not await _backend_ready():
+        return Response("False", status_code=503, media_type="text/plain")
     return Response("True", media_type="text/plain")
 
 
@@ -74,7 +131,7 @@ async def health_check() -> HealthResponse:
     return HealthResponse(
         status="healthy",
         service="resume-audit-optimize",
-        version="3.0.0",
+        version="3.1.0",
         model=MODEL_NAME,
         llm_enabled=llm_enabled(),
         timestamp=datetime.utcnow().isoformat(),
@@ -138,7 +195,7 @@ async def resume_copilot(
     jd_url: Optional[str] = Form(None, description="兼容字段：目标岗位 JD 链接"),
     template: str = Form(DEFAULT_TEMPLATE),
 ) -> ResumeCopilotResponse:
-    return await resume_copilot_service(
+    return await _run_copilot_with_timeout(
         query=query,
         cv=cv,
         cv_template=cv_template,
@@ -169,7 +226,7 @@ async def generate_resume(
         query_parts.append(f"用户阶段：{user_stage}")
     if job_family:
         query_parts.append(f"目标行业：{job_family}")
-    response = await resume_copilot_service(
+    response = await _run_copilot_with_timeout(
         query="\n".join(part for part in query_parts if part),
         cv=None,
         cv_template=cv_template,
@@ -224,15 +281,15 @@ async def download_output_file(path: str = Query(..., description="Absolute path
     return FileResponse(file_path, filename=file_path.name)
 
 
+# Mount evaluator-compatible Flask routes only as a legacy fallback. FastAPI
+# routes above always win, and every port now runs through one ASGI server.
+try:
+    from resume_generate_api import app as legacy_flask_app
+    app.mount("/", WSGIMiddleware(legacy_flask_app), name="legacy-evaluator-api")
+except ImportError as exc:
+    logger.warning("Legacy evaluator routes unavailable: %s", exc)
+
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8001"))
-    # If PORT=80, run Flask mode (starting-kit compatible async API)
-    if port == 80:
-        try:
-            from resume_generate_api import app as flask_app
-            print("Starting Flask async resume API on port 80...")
-            flask_app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
-        except ImportError:
-            print("Flask not available; install it and retry.")
-    else:
-        uvicorn.run(app, host=os.getenv("HOST", "0.0.0.0"), port=port, log_level="info")
+    uvicorn.run(app, host=os.getenv("HOST", "0.0.0.0"), port=port, log_level="info")

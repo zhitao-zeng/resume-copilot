@@ -977,6 +977,38 @@ def _extract_text_from_pdf_bytes(content: bytes) -> str:
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif", ".tif", ".tiff"}
 
 
+def _validate_upload_signature(content: bytes, filename: str) -> None:
+    """Reject extension spoofing and compressed document bombs early."""
+    ext = _detect_extension(filename)
+    if not content:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+    if ext == ".pdf" and not content.lstrip().startswith(b"%PDF-"):
+        raise HTTPException(status_code=400, detail="File content is not a valid PDF")
+    if ext == ".docx":
+        try:
+            with zipfile.ZipFile(io.BytesIO(content)) as archive:
+                names = set(archive.namelist())
+                if "[Content_Types].xml" not in names or "word/document.xml" not in names:
+                    raise ValueError("missing DOCX package entries")
+                expanded = sum(info.file_size for info in archive.infolist())
+                compressed = max(1, sum(info.compress_size for info in archive.infolist()))
+                if expanded > 100 * 1024 * 1024 or expanded / compressed > 100:
+                    raise ValueError("compressed document exceeds safety limits")
+        except (zipfile.BadZipFile, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="File content is not a safe DOCX") from exc
+    if ext in IMAGE_EXTENSIONS:
+        try:
+            with Image.open(io.BytesIO(content)) as image:
+                width, height = image.size
+                if width <= 0 or height <= 0 or width * height > 40_000_000:
+                    raise ValueError("image dimensions exceed safety limits")
+                image.verify()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="File content is not a valid image") from exc
+    if ext in {".txt", ".md"} and b"\x00" in content[:4096]:
+        raise HTTPException(status_code=400, detail="Text upload contains binary data")
+
+
 def extract_text_from_image_bytes(content: bytes, filename: str) -> str:
     # Prefer RapidOCR (GPU, accurate), fall back to pytesseract (CPU)
     if not _RAPID_OCR_INITED:
@@ -1014,6 +1046,7 @@ def extract_text_from_bytes(content: bytes, filename: str) -> str:
     ext = _detect_extension(filename)
     if ext not in ALLOWED_UPLOAD_EXTENSIONS:
         raise HTTPException(status_code=400, detail=f"Unsupported file extension: {ext}")
+    _validate_upload_signature(content, filename)
 
     if ext in IMAGE_EXTENSIONS:
         return extract_text_from_image_bytes(content, filename)

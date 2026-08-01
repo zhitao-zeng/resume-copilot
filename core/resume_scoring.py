@@ -61,21 +61,8 @@ def _collect_project_bullets(project: dict[str, Any]) -> list[str]:
 
 
 def _compute_fabrication_score(report: FabricationReport) -> int:
-    """Graduated fabrication scoring instead of hard zero.
-
-    - 0 items: 100
-    - 1-2 items: 60 (significant penalty but not fatal)
-    - 3-5 items: 30
-    - 6+ items: 0 (severe fabrication)
-    """
-    if not report.fabrication_found:
-        return 100
-    count = len(report.details) if hasattr(report, "details") and report.details else 0
-    if count >= 6:
-        return 0
-    if count >= 3:
-        return 30
-    return 60
+    """Acceptance contract: any detected fabrication makes the score invalid."""
+    return 0 if report.fabrication_found else 100
 
 
 def _compute_readability_score(resume_data: dict[str, Any], template: str = "new_standard") -> float:

@@ -71,7 +71,7 @@
 ## 运行
 
 ```bash
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 python main.py
 ```
 
@@ -83,6 +83,10 @@ python main.py
 - `REQUEST_TIMEOUT_SECONDS`：单请求总预算，默认 `480`
 - `ENABLE_LLM_JSON_REPAIR`：LLM JSON 失败后进行一次纠错重试，默认开启
 - `ENABLE_LLM_FAILURE_DUMP`：是否落盘 LLM 失败原文，默认关闭；开启后会做邮箱和手机号脱敏
+- `API_AUTH_TOKEN`：生产环境建议设置；设置后除健康检查外均要求 `Authorization: Bearer ...`
+- `DATA_RETENTION_SECONDS`：生成文件和草稿的保留时间，默认 7 天
+- `ENABLE_LLM_CLASSIFIER` / `ENABLE_LLM_REPLY`：是否用 LLM 分类/生成回复；Docker 默认关闭以减少两次调用
+- `TASK_QUEUE_LIMIT`：兼容异步接口的最大排队任务数，默认 8
 
 图片 OCR 需要系统安装 Tesseract。Docker 镜像已安装：
 
@@ -94,15 +98,38 @@ python main.py
 
 ```bash
 docker build -t resume-copilot-server:acceptance .
-docker run --rm -p 8001:8001 resume-copilot-server:acceptance
+docker run --rm -p 8001:8001 \
+  -e MODELHUB_BASE_URL=http://host.docker.internal:8000/v1 \
+  -e MODELHUB_API_KEY=not-needed \
+  -e MODELHUB_MODEL_NAME=/models/Qwen3.5-9B-AWQ-4bit \
+  resume-copilot-server:acceptance
 ```
+
+本地同时启动 vLLM 和业务服务：
+
+```bash
+docker compose --profile local up --build
+```
+
+所有端口统一运行 FastAPI/Uvicorn。`/resume_generate`、`/generate_progress/{id}`、
+`/download_resume/{id}` 作为旧评测协议兼容路由保留。
 
 ## 测试与评测
 
-单元测试：
+单元测试（不连接真实 LLM）：
 
 ```bash
-python -m unittest discover -s tests
+python -m pytest -m "not integration"
+```
+
+LLM 集成测试：
+
+```bash
+RUN_LLM_INTEGRATION=1 \
+MODELHUB_BASE_URL=http://localhost:8000/v1 \
+MODELHUB_API_KEY=not-needed \
+MODELHUB_MODEL_NAME=/models/Qwen3.5-9B-AWQ-4bit \
+python -m pytest -m integration -v
 ```
 
 离线评测：
@@ -126,10 +153,10 @@ python eval_runner.py
 ## 代码结构
 
 - `main.py`：FastAPI 入口与兼容接口
-- `resume_copilot_service.py`：验收版统一编排
+- `core/resume_copilot_service.py`：验收版统一编排
 - `resume_product_logic.py`：无外部依赖的纯产品逻辑，用于测试和离线评测
-- `resume_io.py`：PDF、DOCX、图片 OCR 文本抽取
-- `resume_validator.py`：必填字段、时间冲突、排序和防编造校验
-- `resume_scoring.py`：验收评分
-- `resume_renderer.py`：DOCX/PDF 渲染
+- `core/resume_io.py`：PDF、DOCX、图片 OCR 文本抽取
+- `core/resume_validator.py`：必填字段、时间冲突、排序和防编造校验
+- `core/resume_scoring.py`：验收评分
+- `core/resume_renderer.py`：DOCX/PDF 渲染
 - `eval_runner.py`：固定评测集离线跑分

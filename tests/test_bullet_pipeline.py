@@ -1,4 +1,5 @@
 """Tests for the 4-stage bullet rewrite pipeline."""
+import asyncio
 import json
 import pytest
 from dataclasses import dataclass
@@ -128,8 +129,7 @@ def test_verdict_model_parses_unsafe():
     assert "fabricated_metric" in output.risk_tags
 
 
-@pytest.mark.asyncio
-async def test_pipeline_runs_with_mock_llm():
+def test_pipeline_runs_with_mock_llm():
     """Full pipeline should produce BulletPatch list even with mock LLM."""
     from fact_ledger import build_ledger
     from resume_optimization import patch_optimize_weak_bullets
@@ -156,7 +156,7 @@ async def test_pipeline_runs_with_mock_llm():
             # verify_bullet (batch 2)
             {"is_safe": True, "risk_tags": [], "reason": ""},
         ]
-        patches = await patch_optimize_weak_bullets(ledger, ["产品", "迭代"])
+        patches = asyncio.run(patch_optimize_weak_bullets(ledger, ["产品", "迭代"]))
         assert isinstance(patches, list)
         if patches:
             from semantic_guard import BulletPatch

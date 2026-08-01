@@ -312,7 +312,6 @@ def check_required_fields(
     meta = resume_data.get("meta", {})
     if not isinstance(meta, dict):
         meta = {}
-        resume_data["meta"] = meta
     stage_value = getattr(user_stage, "value", user_stage)
 
     # Required meta fields
@@ -332,11 +331,7 @@ def check_required_fields(
             ))
 
     if not str(meta.get("work_experience", "")).strip():
-        if resume_data.get("experience_years"):
-            meta["work_experience"] = f"{resume_data.get('experience_years')}年"
-        elif stage_value == "student":
-            meta["work_experience"] = "在校生"
-        else:
+        if stage_value != "student" and not resume_data.get("experience_years"):
             missing.append(MissingField(
                 field="meta.work_experience",
                 label="工作经验",
@@ -378,19 +373,20 @@ def check_required_fields(
                     reason="学历为必填项，请补充最高学历或教育背景中的学位信息",
                 ))
 
-    # Summary is required (≤100 chars, non-empty)
+    # Summary is required.  Allow several complete factual sentences; the
+    # renderer handles pagination and must not force a mid-sentence cut.
     summary = str(resume_data.get("summary", "")).strip()
     if not summary:
         missing.append(MissingField(
             field="summary",
             label="个人总结",
-            reason="个人总结为必填项，系统已自动生成，建议根据实际情况调整",
+            reason="个人总结为必填项，请补充真实职业背景、核心优势和求职方向",
         ))
-    elif len(summary) > 100:
+    elif len(summary) > 180:
         missing.append(MissingField(
             field="summary",
             label="个人总结",
-            reason=f"个人总结过长（{len(summary)}字），建议控制在100字以内",
+            reason=f"个人总结过长（{len(summary)}字），建议控制在180字以内",
         ))
 
     # At least one of experience/internship/project is required
@@ -467,13 +463,10 @@ def check_required_fields(
                     label="项目经历",
                     reason="如提供了项目经历，则所有信息必填（项目名称/时间），请补充缺失信息",
                 ))
-            if not str(proj.get("company", "") or proj.get("affiliation", "")).strip():
-                missing.append(MissingField(
-                    field=f"projects[{idx}].company",
-                    label="项目归属",
-                    reason=f"项目经历第{idx+1}段缺少所属公司/学校/组织，请补充",
-                ))
-            if not str(proj.get("description", "")).strip():
+            # Independent, course and open-source projects do not necessarily
+            # have a company/organization.  Do not turn an optional affiliation
+            # into a false missing-field warning.
+            if not str(proj.get("description", "")).strip() and not _has_function_description(proj):
                 missing.append(MissingField(
                     field=f"projects[{idx}].description",
                     label="项目描述",
@@ -495,7 +488,8 @@ def check_required_fields(
     # Skills are optional but we suggest
     skills = resume_data.get("skills", {})
     if not isinstance(skills, dict) or not any(
-        isinstance(skills.get(k), list) and len(skills[k]) > 0 for k in ("languages", "frameworks", "tools", "domains")
+        isinstance(value, list) and any(str(item).strip() for item in value)
+        for value in skills.values()
     ):
         missing.append(MissingField(
             field="skills",
@@ -828,6 +822,18 @@ def check_fabrication_heuristic(original_text: str, resume_data: dict[str, Any])
                 school_lower in orig_school
                 for orig_school in orig_schools
             )
+            if not _entity_match:
+                # Institution names are often followed directly by Chinese
+                # context ("北京邮电大学读人工智能").  The entity regex above
+                # intentionally avoids "全国大学生..."; retain that protection
+                # while accepting explicit contextual occurrences.
+                start = original_lower.find(school_lower)
+                while start >= 0:
+                    next_char = original_lower[start + len(school_lower):start + len(school_lower) + 1]
+                    if next_char not in {"生", "城", "排名"}:
+                        _entity_match = True
+                        break
+                    start = original_lower.find(school_lower, start + 1)
             if not _entity_match:
                 _add_detail("school", school, "该校名称未出现在用户原始输入中")
 

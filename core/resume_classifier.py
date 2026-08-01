@@ -19,11 +19,14 @@ from pydantic import BaseModel, Field
 
 import resume_product_logic as product_logic
 from resume_product_logic import _is_student_with_internals
-from server_runtime import call_llm_typed, llm_enabled
+from server_runtime import ENABLE_LLM_CLASSIFIER, call_llm_typed, llm_enabled
 
 logger = logging.getLogger(__name__)
 
 VALID_USER_STAGES = {"student", "experienced", "job_seeker"}
+# Public compatibility constant for callers that need the deterministic
+# classifier's known taxonomy. LLM classifications may still use free text.
+VALID_INDUSTRIES = set(product_logic.INDUSTRY_LABELS)
 
 NON_ROLE_HEADERS = {
     "岗位职责", "职责", "任职要求", "任职资格", "岗位要求", "职位要求",
@@ -155,7 +158,7 @@ def _build_classifier_prompt(*, query: str, cv_text: str, jd_text: str, has_cv: 
 
 def _classify_via_llm(*, query: str, cv_text: str, jd_text: str, has_cv: bool, has_jd: bool) -> Optional[_ClassifierLLMOutput]:
     """Call LLM for lightweight classification. Returns None on failure."""
-    if not llm_enabled():
+    if not ENABLE_LLM_CLASSIFIER or not llm_enabled():
         return None
     try:
         result = call_llm_typed(
@@ -175,7 +178,7 @@ def _classify_via_llm(*, query: str, cv_text: str, jd_text: str, has_cv: bool, h
 
 def _sanitize_target_role(role: str) -> str:
     role = str(role or "").strip()
-    if not role or len(role) < 2:
+    if not role or len(role) < 2 or role.lower().strip("：:，,。.、/\\ ") in {"jd", "的jd", "岗位jd"}:
         return ""
     if role.lower() in {h.lower() for h in NON_ROLE_HEADERS}:
         return ""
@@ -184,26 +187,57 @@ def _sanitize_target_role(role: str) -> str:
             role = role[: -len(header)].strip("：:，,。.、/\\")
         if role.startswith(header):
             role = role[len(header):].strip("：:，,。.、/\\")
+    for suffix in ("相关岗位", "相关职位", "相关工作", "相关方向", "相关"):
+        if role.endswith(suffix) and len(role) - len(suffix) >= 2:
+            role = role[: -len(suffix)].strip("：:，,。.、/\\ ")
+            break
     if not role or len(role) < 2:
         return ""
     return role
 
 
 def _extract_target_role_rules(query: str, jd_text: str) -> str:
-    text = "\n".join([query or "", jd_text or ""])
-    for pattern in [
-        r"(?:目标岗位|求职意向|应聘岗位|想投|想做|应聘)[:：\s]*([\u4e00-\u9fffA-Za-z0-9/ ]{2,30})",
-        r"(?:招聘岗位|招聘职位|岗位名称)[:：\s]*([\u4e00-\u9fffA-Za-z0-9/ ]{2,30})",
-    ]:
-        match = re.search(pattern, text)
+    query = query or ""
+    jd_text = jd_text or ""
+    # User intent has strict precedence over any title found in a fetched JD.
+    for pattern in (
+        r"(?:求职意向|应聘岗位|想投|想继续投|想做|应聘|希望从事)[:：\s]*([\u4e00-\u9fffA-Za-z0-9/ ]{2,30})",
+        r"(?:找|投|应聘|申请|目标是|方向是|一个)[:：\s]*([\u4e00-\u9fffA-Za-z0-9/+.#& -]{2,30}?)(?:的?(?:岗位|职位|工作|JD))",
+    ):
+        match = re.search(pattern, query)
         if match:
             role = _sanitize_target_role(match.group(1).strip("，。；; "))
             if role:
                 return role
-    for role in ("产品经理", "运营经理", "运营专员", "医生", "教师", "老师",
+    # Natural phrasing such as "一个IoT智能硬件产品经理的岗位JD".
+    for suffix in ("产品经理", "算法工程师", "软件工程师", "数据分析师", "项目经理"):
+        end = (query or "").find(suffix)
+        if end >= 0:
+            end += len(suffix)
+            window_start = max(0, end - len(suffix) - 20)
+            window = (query or "")[window_start:end]
+            marker_matches = list(re.finditer(r"(?:想继续投|想投|想做|应聘|希望从事|从事|成为|寻找|找|一个|目标是|方向是)", window))
+            start = marker_matches[-1].end() if marker_matches else max(0, len(window) - len(suffix))
+            role = window[start:].strip("，。；;、:： 的相关岗位工作")
+            if 2 <= len(role) <= 24:
+                return role
+    known_roles = ("产品经理", "运营经理", "运营专员", "医生", "教师", "老师",
                  "销售经理", "售前工程师", "金融风控", "交互设计师", "UI设计师",
-                 "算法工程师", "软件工程师", "数据分析师", "项目经理"):
-        if role in text:
+                 "算法工程师", "软件工程师", "数据分析师", "项目经理")
+    for role in known_roles:
+        if role in query:
+            return role
+
+    for pattern in (
+        r"(?:招聘岗位|招聘职位|岗位名称|目标岗位)[:：\s]*([\u4e00-\u9fffA-Za-z0-9/ ]{2,30})",
+    ):
+        match = re.search(pattern, jd_text)
+        if match:
+            role = _sanitize_target_role(match.group(1).strip("，。；; "))
+            if role:
+                return role
+    for role in known_roles:
+        if role in jd_text:
             return role
     return ""
 
@@ -213,11 +247,30 @@ def _rule_fallback(*, query: str, cv_text: str, jd_text: str, resume_data: Optio
     industry = product_logic.infer_industry(query, cv_text, jd_text)
     user_stage = product_logic.infer_user_stage(combined_text, resume_data)
     target_role = _extract_target_role_rules(query, jd_text)
+    query_role = _extract_target_role_rules(query, "")
+    industry_evidence = "rule-based"
+    role_matches_inferred_industry = False
+    if query_role and industry != "other":
+        role_text = query_role.casefold()
+        industry_terms = (
+            product_logic.INDUSTRY_KEYWORDS.get(industry, ())
+            + product_logic.STRONG_INDUSTRY_KEYWORDS.get(industry, ())
+        )
+        role_matches_inferred_industry = any(
+            str(term).casefold() in role_text for term in industry_terms
+        )
+    if query_role and (industry == "other" or not role_matches_inferred_industry):
+        # The public schema permits free-text industries.  Using the explicit
+        # user role is more informative than forcing an unknown profession
+        # into the nearest keyword category (for example DOE "实验设计" must
+        # not turn a battery-process role into the design industry).
+        industry = query_role
+        industry_evidence = query_role
     return ClassificationResult(
         industry=industry, user_stage=user_stage, target_role=target_role,
         confidence=0.4,
         evidence=ClassificationEvidence(
-            industry=[EvidenceSource(text="rule-based", source="query", usage="fact")],
+            industry=[EvidenceSource(text=industry_evidence, source="query", usage="fact")],
             user_stage=[EvidenceSource(text="rule-based", source="query", usage="fact")],
             target_role=[EvidenceSource(text="rule-based", source="query", usage="fact")],
         ),
@@ -228,6 +281,9 @@ def _rule_fallback(*, query: str, cv_text: str, jd_text: str, resume_data: Optio
 
 # English category name → Chinese target_role mapping
 _EN_TO_ZH_ROLE = {
+    # Common fixture/API taxonomy tokens.  These are direction labels, not
+    # user-facing job titles, so never render them verbatim in a resume.
+    "product_pm": "产品经理",
     "finance_risk": "金融风控",
     "financial_analyst": "金融分析师",
     "accountant": "会计师",
@@ -262,6 +318,26 @@ _EN_TO_ZH_ROLE = {
     "architect": "建筑设计师",
 }
 
+
+def normalize_target_role(role: str) -> str:
+    """Return a user-facing role name and reject JD section headings."""
+
+    sanitized = _sanitize_target_role(role)
+    return _EN_TO_ZH_ROLE.get(sanitized.casefold(), sanitized)
+
+
+def reconcile_user_stage(
+    current_stage: str,
+    resume_data: Optional[dict[str, Any]],
+    candidate_text: str = "",
+) -> str:
+    """Reconcile early text classification with final structured evidence."""
+
+    inferred = product_logic.infer_user_stage(candidate_text, resume_data)
+    if inferred in {"student", "experienced"}:
+        return inferred
+    return current_stage if current_stage in VALID_USER_STAGES else "job_seeker"
+
 def _validate_and_correct(
     result: ClassificationResult,
     *,
@@ -277,13 +353,10 @@ def _validate_and_correct(
         result.user_stage = "job_seeker"
 
     # 3. Sanitize target_role
-    result.target_role = _sanitize_target_role(result.target_role)
-
-    # 3.1. Map English category names → Chinese
-    if result.target_role in _EN_TO_ZH_ROLE:
-        zh_role = _EN_TO_ZH_ROLE[result.target_role]
-        warnings.append(f"target_role '{result.target_role}' mapped to '{zh_role}'")
-        result.target_role = zh_role
+    original_role = result.target_role
+    result.target_role = normalize_target_role(result.target_role)
+    if result.target_role and result.target_role != original_role:
+        warnings.append(f"target_role '{original_role}' mapped to '{result.target_role}'")
 
     # 4. Student + experience: nuanced check
     # Don't override student→experienced for internships, campus projects, part-time
@@ -382,4 +455,12 @@ def classify_resume_request(
         return _validate_and_correct(result, resume_data=resume_data, query=query, cv_text=cv_text)
 
     # LLM failed entirely — pure rule fallback
-    return _rule_fallback(query=query, cv_text=cv_text, jd_text=jd_text, resume_data=resume_data)
+    return _validate_and_correct(
+        _rule_fallback(
+            query=query, cv_text=cv_text, jd_text=jd_text,
+            resume_data=resume_data,
+        ),
+        resume_data=resume_data,
+        query=query,
+        cv_text=cv_text,
+    )

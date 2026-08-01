@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import unicodedata
 
 from prompts import RESUME_VERIFIER_SYSTEM_PROMPT
 from server_runtime import call_llm_text, llm_enabled
@@ -16,6 +18,153 @@ from v2_schemas import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_evidence_text(value: str) -> str:
+    value = unicodedata.normalize("NFKC", str(value or "")).lower()
+    return re.sub(r"[\s，。；、：:,.!?！？()（）\[\]【】'\"]+", "", value)
+
+
+def _date_signature(value: str) -> tuple[str, ...]:
+    """Normalize yyyy-mm/mm-yyyy/Chinese dates for factual comparison."""
+
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    pattern = re.compile(
+        r"(?<!\d)(?:(?P<year1>(?:19|20)\d{2})\s*[-./年]\s*(?P<month1>0?[1-9]|1[0-2])\s*月?"
+        r"|(?P<month2>0?[1-9]|1[0-2])\s*[-./]\s*(?P<year2>(?:19|20)\d{2}))(?!\d)"
+    )
+    signature: list[str] = []
+    for match in pattern.finditer(text):
+        year = match.group("year1") or match.group("year2")
+        month = match.group("month1") or match.group("month2")
+        signature.append(f"{year}{int(month):02d}")
+    return tuple(signature)
+
+
+def _has_equivalent_date_evidence(value: str, evidence_text: str) -> bool:
+    signature = _date_signature(value)
+    if not signature:
+        return False
+    for segment in re.split(r"[\n；;]", evidence_text):
+        source_signature = _date_signature(segment)
+        if len(source_signature) >= len(signature):
+            for index in range(len(source_signature) - len(signature) + 1):
+                if source_signature[index:index + len(signature)] == signature:
+                    return True
+    return False
+
+
+def _has_positive_evidence(value: str, evidence_text: str) -> bool:
+    """Return whether a fixed resume fact is explicitly supported.
+
+    Negated instructions such as ``不要增加某公司`` do not count as facts.
+    """
+
+    value = str(value or "").strip()
+    if not value:
+        return True
+    if _has_equivalent_date_evidence(value, evidence_text):
+        return True
+    normalized_value = _normalize_evidence_text(value)
+    normalized_source = _normalize_evidence_text(evidence_text)
+    if not normalized_value or normalized_value not in normalized_source:
+        # A listed topic such as "OCR识别、目标检测等项目" can safely be
+        # normalized to "OCR识别项目" without inventing a new project.
+        core_value = re.sub(r"(?:项目|课题|系统|平台)$", "", normalized_value)
+        if len(core_value) < 3 or core_value not in normalized_source:
+            return False
+    for match in re.finditer(re.escape(value), evidence_text, re.IGNORECASE):
+        prefix = evidence_text[max(0, match.start() - 12):match.start()]
+        if not re.search(r"(?:不要|禁止|不能|避免|不得|并非|没有)[^，。；\n]{0,8}$", prefix):
+            return True
+    # Normalized-only matches are accepted unless the source contains an
+    # obvious negated occurrence of the same value.
+    return not re.search(
+        rf"(?:不要|禁止|不能|避免|不得|并非|没有)[^，。；\n]{{0,8}}{re.escape(value)}",
+        evidence_text,
+        re.IGNORECASE,
+    )
+
+
+def _ground_fixed_fields(parsed: dict, evidence_text: str) -> None:
+    """Clear unsupported immutable fields and empty skill items in place."""
+
+    meta = parsed.get("meta")
+    if isinstance(meta, dict):
+        for key in ("name", "phone", "email", "work_experience"):
+            if meta.get(key) and not _has_positive_evidence(str(meta[key]), evidence_text):
+                logger.info("ResumeVerifier cleared unsupported meta.%s: %s", key, meta[key])
+                meta[key] = ""
+
+    section_fields = {
+        "education": ("school", "degree", "major", "period"),
+        "experience": ("organization", "role", "period"),
+        "research": ("institution", "topic", "period"),
+        "activities": ("organization", "role", "period"),
+        "projects": ("name", "organization", "role", "period"),
+    }
+    for section, fields in section_fields.items():
+        items = parsed.get(section)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            for field in fields:
+                value = str(item.get(field, "") or "").strip()
+                if value and not _has_positive_evidence(value, evidence_text):
+                    logger.info("ResumeVerifier cleared unsupported %s.%s: %s", section, field, value)
+                    item[field] = ""
+
+    skills = parsed.get("skills")
+    if isinstance(skills, dict) and isinstance(skills.get("items"), list):
+        skills["items"] = [
+            item for item in skills["items"]
+            if isinstance(item, dict)
+            and str(item.get("name", "")).strip()
+            and _has_positive_evidence(str(item.get("name", "")), evidence_text)
+        ]
+
+    awards = parsed.get("awards")
+    if isinstance(awards, list):
+        parsed["awards"] = [
+            str(item).strip() for item in awards
+            if str(item).strip() and _has_positive_evidence(str(item), evidence_text)
+        ]
+
+
+def _reclassify_non_work(parsed: dict, evidence_text: str) -> None:
+    experiences = parsed.get("experience")
+    if not isinstance(experiences, list):
+        return
+    kept: list[dict] = []
+    activities = list(parsed.get("activities") or [])
+    research = list(parsed.get("research") or [])
+    student_context = bool(re.search(r"(?:在读|学生|本科|硕士|博士|毕业)", evidence_text))
+    for item in experiences:
+        if not isinstance(item, dict):
+            continue
+        org = str(item.get("organization", "") or "")
+        role = str(item.get("role", "") or "")
+        combined = f"{org} {role}"
+        if re.search(r"(?:学生会|志愿者|志愿服务|社团|协会|校园组织)", combined):
+            activities.append(item)
+            continue
+        if student_context and (
+            re.search(r"(?:实验室|课题组|研究院|科研)", combined)
+            or (re.search(r"(?:大学|学院)", org) and re.search(r"(?:研究|算法|视觉|多模态)", role))
+        ):
+            research.append({
+                "institution": org,
+                "topic": role,
+                "period": item.get("period", ""),
+                "bullets": item.get("bullets", []),
+            })
+            continue
+        kept.append(item)
+    parsed["experience"] = kept
+    parsed["activities"] = activities
+    parsed["research"] = research
 
 
 def conservative_fallback() -> VerifiedResult:
@@ -43,7 +192,10 @@ def verify_resume(source: SourceBundle, draft: DraftResume) -> VerifiedResult:
     if not llm_enabled():
         return conservative_fallback()
 
-    source_parts = [f"[{b.block_id}] {b.text}" for b in source.blocks]
+    source_parts = [
+        f"[{b.block_id}{'|section=' + b.section_hint if b.section_hint else ''}] {b.text}"
+        for b in source.blocks
+    ]
     draft_json = draft.model_dump_json(exclude_none=True)
 
     prompt = (
@@ -81,7 +233,7 @@ def verify_resume(source: SourceBundle, draft: DraftResume) -> VerifiedResult:
                 logger.info("ResumeVerifier unwrapped key %s", wrapped_key)
 
     # Detect if LLM nested all content under meta (e.g. {"meta": {"name":"", "education":[...]}})
-    TOP_LEVEL_KEYS = {"education", "experience", "projects", "skills", "summary"}
+    TOP_LEVEL_KEYS = {"education", "experience", "research", "activities", "projects", "skills", "summary"}
     meta = parsed.get("meta")
     if isinstance(meta, dict):
         for key in TOP_LEVEL_KEYS:
@@ -126,6 +278,7 @@ def verify_resume(source: SourceBundle, draft: DraftResume) -> VerifiedResult:
         "education": {"school", "degree", "major", "period"},
         "experience": {"organization", "role", "period", "bullets"},
         "research": {"institution", "topic", "period", "bullets"},
+        "activities": {"organization", "role", "period", "bullets"},
         "projects": {"name", "organization", "role", "period", "bullets"},
         "meta": {"name", "phone", "email", "target_role", "work_experience"},
         "skills": {"items"},  # Skills is flat items format, not categorized dict
@@ -276,6 +429,11 @@ def verify_resume(source: SourceBundle, draft: DraftResume) -> VerifiedResult:
         if draft_items:
             logger.info("ResumeVerifier restored skills from draft (%d items)", len(draft_items))
             parsed["skills"] = draft_skills
+
+    # The LLM verifier is advisory; immutable facts are grounded again in
+    # code against candidate evidence (resume + factual user additions).
+    _ground_fixed_fields(parsed, resume_query_text)
+    _reclassify_non_work(parsed, resume_query_text)
 
     try:
         resume = CanonicalResume(**parsed)

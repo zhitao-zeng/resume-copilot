@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 
@@ -16,7 +17,7 @@ from docx.enum.table import WD_ALIGN_VERTICAL
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Inches, Pt, RGBColor
+from docx.shared import Inches, Mm, Pt, RGBColor
 
 try:
     import fitz  # PyMuPDF
@@ -40,6 +41,17 @@ PDF_BODY_COLOR = (0x22, 0x22, 0x22)
 PDF_MUTED_COLOR = (0x66, 0x66, 0x66)
 PDF_MARGIN_MM = os.getenv("RESUME_PDF_MARGIN_MM", "10mm")
 logger = logging.getLogger(__name__)
+
+_RESUME_SECTION_TITLES = {
+    "个人简介", "个人总结", "基本信息", "求职信息", "工作经历", "工作/实习经历", "实习经历",
+    "科研经历", "校园与志愿经历", "项目经历", "教育经历", "专业技能",
+    "论文成果", "荣誉与奖项", "个人技能",
+}
+
+
+def _is_empty_profile_framework(resume_data: Any) -> bool:
+    framework = resume_data.get("framework") if isinstance(resume_data, dict) else None
+    return isinstance(framework, dict) and framework.get("mode") == "empty_profile"
 
 
 def _safe_filename(value: str) -> str:
@@ -127,7 +139,7 @@ def _collect_experience_bullets(exp: dict[str, Any]) -> list[str]:
             continue
         seen.add(item)
         deduped.append(item)
-    return deduped[:4]
+    return deduped
 
 
 def _collect_text_entries(payload: Any, keys: tuple[str, ...]) -> list[str]:
@@ -154,57 +166,78 @@ def _collect_project_bullets(project: dict[str, Any]) -> list[str]:
 
 
 def _compress_resume_data_for_docx(resume_data: dict[str, Any]) -> dict[str, Any]:
-    """Compress dense content to fit <= 3 pages while preserving all entries."""
-    data = copy.deepcopy(resume_data) if isinstance(resume_data, dict) else {}
-    # Summary: max 80 chars (fits 2-3 lines in DOCX)
-    if isinstance(data.get("summary"), str):
-        s = data["summary"].strip()
-        if len(s) > 80:
-            s = s[:77].rstrip("，,；; ") + "..."
-        data["summary"] = s
+    """Normalize render data without silently deleting verified content.
 
-    def _cap_texts(values: Any, limit: int) -> list[str]:
+    Page count is a layout signal, not a content budget.  Any optional
+    compaction happens only after inspecting a real rendered document.
+    """
+    data = copy.deepcopy(resume_data) if isinstance(resume_data, dict) else {}
+    if isinstance(data.get("summary"), str):
+        data["summary"] = data["summary"].strip()
+
+    def _clean_texts(values: Any) -> list[str]:
         items = _normalize_text_items(values)
         result: list[str] = []
         for item in items:
             text = re.sub(r"\s+", " ", item).strip()
-            # More aggressive cap: 100 chars per bullet to fit 3 pages
-            if len(text) > 100:
-                text = text[:97].rstrip("，,；; ") + "..."
             if text and text not in result:
                 result.append(text)
-            if len(result) >= limit:
-                break
         return result
 
-    # Experience: cap to 1-2 bullets max, merge from all sources
-    for exp in data.get("experience", []) if isinstance(data.get("experience"), list) else []:
-        if not isinstance(exp, dict):
-            continue
-        merged = _collect_experience_bullets(exp)
-        exp["bullets"] = _cap_texts(merged, 2)
-        exp["responsibilities"] = _cap_texts(exp.get("responsibilities"), 1)
-        exp["achievements"] = _cap_texts(exp.get("achievements"), 1)
-        for proj in exp.get("projects", []) if isinstance(exp.get("projects"), list) else []:
-            if isinstance(proj, dict):
-                proj["bullets"] = _cap_texts(_collect_project_bullets(proj), 3)
+    for section_key in ("experience", "research", "campus_experience"):
+        for exp in data.get(section_key, []) if isinstance(data.get(section_key), list) else []:
+            if not isinstance(exp, dict):
+                continue
+            merged = _collect_experience_bullets(exp)
+            exp["bullets"] = _clean_texts(merged)
+            for proj in exp.get("projects", []) if isinstance(exp.get("projects"), list) else []:
+                if isinstance(proj, dict):
+                    proj["bullets"] = _clean_texts(_collect_project_bullets(proj))
 
-    # Projects: cap to 3 bullets each
     for proj in data.get("projects", []) if isinstance(data.get("projects"), list) else []:
         if isinstance(proj, dict):
-            proj["bullets"] = _cap_texts(_collect_project_bullets(proj), 3)
+            proj["bullets"] = _clean_texts(_collect_project_bullets(proj))
 
     skills = data.get("skills")
     if isinstance(skills, dict):
         for key, values in list(skills.items()):
             if isinstance(values, list):
-                skills[key] = [str(item).strip() for item in values if str(item).strip()][:8]
+                skills[key] = _clean_texts(values)
 
-    # Publications/honors: cap to 4 entries to save space
     for key in ("publications", "honors", "awards", "certifications", "personal_skills"):
         value = data.get(key)
         if isinstance(value, list):
-            data[key] = [item for item in value if str(item).strip()][:4]
+            # Publication objects must keep their typed structure.
+            if key == "publications":
+                data[key] = [item for item in value if str(item).strip()]
+            else:
+                data[key] = _clean_texts(value)
+    return data
+
+
+def _tighten_resume_data_for_layout(resume_data: dict[str, Any]) -> dict[str, Any]:
+    """Conservative fallback used only for genuinely excessive documents."""
+
+    data = copy.deepcopy(resume_data)
+    summary = str(data.get("summary", "") or "").strip()
+    if len(summary) > 80:
+        boundary = max(summary.rfind(mark, 0, 81) for mark in "。！？；")
+        data["summary"] = summary[:boundary + 1] if boundary >= 45 else summary[:77].rstrip("，,；; ") + "..."
+    # Preserve substantially more core evidence than the old global two-item
+    # cap.  Peripheral campus content is shortened first.
+    limits = {"experience": 5, "research": 5, "projects": 5, "campus_experience": 3}
+    for section, limit in limits.items():
+        records = data.get(section, [])
+        if not isinstance(records, list):
+            continue
+        for record in records:
+            if isinstance(record, dict) and isinstance(record.get("bullets"), list):
+                record["bullets"] = record["bullets"][:limit]
+    skills = data.get("skills")
+    if isinstance(skills, dict):
+        for key, values in skills.items():
+            if isinstance(values, list):
+                skills[key] = values[:10]
     return data
 
 
@@ -402,7 +435,7 @@ def _collect_projects_from_experience(experience: Any) -> list[dict[str, Any]]:
                 {
                     "name": name,
                     "affiliation": affiliation,
-                    "bullets": bullets[:4],
+                    "bullets": bullets,
                     "tech_stack": tech_stack,
                 }
             )
@@ -440,7 +473,7 @@ def _collect_projects_from_top_level(resume_data: Any) -> list[dict[str, Any]]:
                 {
                     "name": name,
                     "affiliation": affiliation,
-                    "bullets": bullets[:4],
+                    "bullets": bullets,
                     "tech_stack": tech_stack,
                 }
             )
@@ -673,7 +706,10 @@ def _build_resume_html(resume_data: dict[str, Any], template: str = "classic") -
             "frameworks": "框架工具",
             "tools": "开发工具",
             "domains": "业务领域",
+            "methodologies": "方法与流程",
+            "certifications": "证书与资质",
             "natural_languages": "语言能力",
+            "others": "其他专业技能",
         }
         for key, label in labels.items():
             items = skills.get(key, [])
@@ -980,6 +1016,151 @@ def _pdf_has_middle_blank_pages(pdf_path: Path) -> bool:
         doc.close()
 
 
+def analyze_pdf_layout(pdf_path: Path) -> dict[str, Any]:
+    """Inspect real rendered PDF pages for pagination problems.
+
+    This is intentionally deterministic: no vision model and no quality score.
+    It reports concrete pass/fail conditions that can trigger layout tightening.
+    """
+
+    report: dict[str, Any] = {
+        "available": False,
+        "page_count": 0,
+        "page_char_counts": [],
+        "blank_pages": [],
+        "orphan_headings": [],
+        "sparse_last_page": False,
+        "first_page_has_core_section": False,
+        "issues": [],
+    }
+    if fitz is None or not pdf_path.exists():
+        report["issues"].append("pdf_layout_inspection_unavailable")
+        return report
+    try:
+        doc = fitz.open(str(pdf_path))
+    except Exception:
+        report["issues"].append("pdf_open_failed")
+        return report
+
+    try:
+        report["available"] = True
+        report["page_count"] = doc.page_count
+        page_texts: list[str] = []
+        for index in range(doc.page_count):
+            text = (doc.load_page(index).get_text("text") or "").strip()
+            page_texts.append(text)
+            count = len(re.sub(r"\s+", "", text))
+            report["page_char_counts"].append(count)
+            if count < 12:
+                report["blank_pages"].append(index + 1)
+
+        if page_texts:
+            report["first_page_has_core_section"] = any(
+                title in page_texts[0]
+                for title in ("工作经历", "工作/实习经历", "实习经历", "科研经历", "项目经历")
+            )
+        for index, text in enumerate(page_texts[:-1]):
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
+            if lines and lines[-1] in _RESUME_SECTION_TITLES:
+                report["orphan_headings"].append({"page": index + 1, "heading": lines[-1]})
+
+        if len(report["page_char_counts"]) > 1:
+            previous = max(report["page_char_counts"][:-1] or [1])
+            last = report["page_char_counts"][-1]
+            report["sparse_last_page"] = last < 140 or last < previous * 0.22
+
+        if report["page_count"] > 3:
+            report["issues"].append("more_than_three_pages")
+        if report["blank_pages"]:
+            report["issues"].append("blank_page")
+        if report["orphan_headings"]:
+            report["issues"].append("orphan_heading")
+        if report["sparse_last_page"]:
+            report["issues"].append("sparse_last_page")
+        if report["page_count"] > 1 and not report["first_page_has_core_section"]:
+            report["issues"].append("core_experience_not_on_first_page")
+        return report
+    finally:
+        doc.close()
+
+
+def _preview_visual_layout(resume_data: dict[str, Any], template: str) -> dict[str, Any]:
+    if os.getenv("ENABLE_RESUME_VISUAL_QA", "1").strip().lower() in {"0", "false", "no"}:
+        return {"available": False, "issues": ["visual_qa_disabled"]}
+    if WeasyHTML is None or fitz is None:
+        return {"available": False, "issues": ["pdf_layout_inspection_unavailable"]}
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            preview_path = Path(directory) / "layout-preview.pdf"
+            if not _render_pdf_via_weasyprint(resume_data, preview_path, template=template):
+                return {"available": False, "issues": ["preview_render_failed"]}
+            return analyze_pdf_layout(preview_path)
+    except Exception as exc:
+        logger.warning("Visual layout preview failed: %s", exc)
+        return {"available": False, "issues": ["preview_render_failed"]}
+
+
+def inspect_docx_layout(docx_path: Path) -> dict[str, Any]:
+    """Convert the actual DOCX with LibreOffice and inspect its real pages."""
+
+    if os.getenv("ENABLE_RESUME_VISUAL_QA", "1").strip().lower() in {"0", "false", "no"}:
+        return {"available": False, "renderer": "docx", "issues": ["visual_qa_disabled"]}
+    if not shutil.which("libreoffice"):
+        return {"available": False, "renderer": "docx", "issues": ["libreoffice_unavailable"]}
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            pdf_path = Path(directory) / "docx-layout.pdf"
+            if not _convert_docx_to_pdf(docx_path, pdf_path):
+                return {"available": False, "renderer": "docx", "issues": ["docx_conversion_failed"]}
+            report = analyze_pdf_layout(pdf_path)
+            report["renderer"] = "libreoffice"
+            return report
+    except Exception as exc:
+        logger.warning("Actual DOCX layout inspection failed: %s", exc)
+        return {"available": False, "renderer": "docx", "issues": ["docx_conversion_failed"]}
+
+
+def _layout_needs_tightening(report: dict[str, Any]) -> bool:
+    return bool(report.get("available")) and any(
+        issue in report.get("issues", [])
+        for issue in (
+            "more_than_three_pages", "core_experience_not_on_first_page",
+            "blank_page", "sparse_last_page",
+        )
+    )
+
+
+def _layout_retry_data(
+    resume_data: dict[str, Any],
+    report: dict[str, Any],
+) -> dict[str, Any]:
+    """Choose whether a retry may compact content or typography only."""
+
+    issues = set(report.get("issues", []))
+    if issues & {"more_than_three_pages", "core_experience_not_on_first_page"}:
+        return _tighten_resume_data_for_layout(resume_data)
+    # Sparse/blank tail pages are pagination problems.  Preserve every item
+    # and let the retry use slightly tighter typography instead.
+    return copy.deepcopy(resume_data)
+
+
+def _apply_docx_compact_typography(doc: "DocxDocument") -> None:
+    """Fit a nearly empty tail page without deleting resume content."""
+
+    for section in doc.sections:
+        section.top_margin = Inches(0.48)
+        section.bottom_margin = Inches(0.48)
+        section.left_margin = Inches(0.66)
+        section.right_margin = Inches(0.66)
+    for paragraph in doc.paragraphs:
+        paragraph.paragraph_format.space_before = Pt(0)
+        paragraph.paragraph_format.space_after = Pt(0.5)
+        paragraph.paragraph_format.line_spacing = 1.08
+        for run in paragraph.runs:
+            if run.font.size is not None and run.font.size.pt >= 9.5:
+                run.font.size = Pt(max(9.0, run.font.size.pt - 0.5))
+
+
 def _fitz_font_for_text(text: str) -> str:
     if _contains_cjk(text):
         # CJK fallback font name used by PyMuPDF on many platforms.
@@ -1023,6 +1204,8 @@ def _wrap_fitz_text(text: str, max_width: float, fontname: str, fontsize: float)
 
 def _add_section_heading(doc: DocxDocument, title: str, template: str) -> None:
     p = doc.add_paragraph()
+    p.paragraph_format.keep_with_next = True
+    p.paragraph_format.keep_together = True
     run = p.add_run(title)
 
     if template == "minimal":
@@ -1050,6 +1233,26 @@ def _add_section_heading(doc: DocxDocument, title: str, template: str) -> None:
     p.space_after = Pt(4)
 
 
+def _apply_docx_pagination_guards(doc: DocxDocument) -> None:
+    """Prevent section/record headings and bullets from being split poorly."""
+
+    paragraphs = list(doc.paragraphs)
+    for index, paragraph in enumerate(paragraphs):
+        text = paragraph.text.strip()
+        style_name = str(getattr(paragraph.style, "name", "") or "")
+        if text in _RESUME_SECTION_TITLES:
+            paragraph.paragraph_format.keep_with_next = True
+            paragraph.paragraph_format.keep_together = True
+        if "List Bullet" in style_name:
+            paragraph.paragraph_format.keep_together = True
+        if index + 1 < len(paragraphs):
+            next_style = str(getattr(paragraphs[index + 1].style, "name", "") or "")
+            # A non-bullet immediately followed by a bullet is normally a
+            # company/project heading and should stay with its first detail.
+            if text and "List Bullet" not in style_name and "List Bullet" in next_style:
+                paragraph.paragraph_format.keep_with_next = True
+
+
 def _append_docx_profile_section(doc: DocxDocument, meta: Any, template: str) -> None:
     items = _collect_profile_items(meta)
     if not items:
@@ -1070,6 +1273,83 @@ def _append_docx_text_section(doc: DocxDocument, title: str, items: list[str], t
     for item in clean:
         p = doc.add_paragraph(style="List Bullet")
         p.add_run(item)
+
+
+def _render_docx_empty_profile_framework(
+    doc: DocxDocument,
+    resume_data: dict[str, Any],
+    template: str,
+) -> None:
+    """Render a useful skeleton while keeping placeholders outside fact fields."""
+
+    framework = resume_data.get("framework", {})
+    target_role = str(
+        framework.get("target_role")
+        or (resume_data.get("meta", {}) or {}).get("target_role", "")
+    ).strip()
+    _append_docx_header_block(
+        doc,
+        meta={"target_role": target_role},
+        template=template,
+        name="个人简历框架",
+        summary=str(framework.get("notice", "以下内容均为待填写结构，不代表候选人已有事实。")),
+    )
+    sections = framework.get("sections", [])
+    if not isinstance(sections, list):
+        return
+    detail_prompts = {
+        "summary": "建议用2–4个完整句子概括真实背景、核心优势和目标方向。",
+        "experience": "建议填写3–5条：个人职责、采取的方法、交付物和可核验结果。",
+        "projects": "建议填写2–4条：项目背景、个人动作、使用方法和真实成果。",
+        "skills": "仅填写实际掌握的工具、技术、行业方法、证书和语言能力。",
+    }
+    for section in sections:
+        if not isinstance(section, dict):
+            continue
+        title = str(section.get("title", "")).strip()
+        fields = [str(item).strip() for item in section.get("fields", []) if str(item).strip()]
+        if not title:
+            continue
+        _add_section_heading(doc, title, template)
+        paragraph = doc.add_paragraph()
+        run = paragraph.add_run("[待填写] " + " ｜ ".join(fields))
+        run.italic = True
+        run.font.size = Pt(9.8)
+        run.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
+        key = str(section.get("key", ""))
+        if key in detail_prompts:
+            hint = doc.add_paragraph(style="List Bullet")
+            hint_run = hint.add_run(detail_prompts[key])
+            hint_run.font.size = Pt(9.5)
+            hint_run.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
+
+
+def _append_docx_record_section(
+    doc: DocxDocument,
+    resume_data: dict[str, Any],
+    key: str,
+    title: str,
+    template: str,
+) -> None:
+    records = resume_data.get(key, []) if isinstance(resume_data, dict) else []
+    if not isinstance(records, list) or not records:
+        return
+    _add_section_heading(doc, title, template)
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        company = str(record.get("company") or record.get("organization") or "").strip()
+        role = str(record.get("role") or record.get("topic") or "").strip()
+        period = str(record.get("period") or "").strip()
+        heading = " | ".join(item for item in (company, role, period) if item)
+        if heading:
+            paragraph = doc.add_paragraph()
+            run = paragraph.add_run(heading)
+            run.bold = True
+            run.font.size = Pt(10.5)
+        for bullet in _collect_experience_bullets(record):
+            paragraph = doc.add_paragraph(style="List Bullet")
+            paragraph.add_run(str(bullet))
 
 
 def _render_docx_minimal(doc: DocxDocument, resume_data: dict[str, Any]) -> None:
@@ -1096,6 +1376,9 @@ def _render_docx_minimal(doc: DocxDocument, resume_data: dict[str, Any]) -> None
             for bullet in _collect_experience_bullets(exp):
                 pb = doc.add_paragraph(style="List Bullet")
                 pb.add_run(str(bullet))
+
+    _append_docx_record_section(doc, resume_data, "research", "科研经历", "minimal")
+    _append_docx_record_section(doc, resume_data, "campus_experience", "校园与志愿经历", "minimal")
 
     if project_items:
         _add_section_heading(doc, "项目经历", "minimal")
@@ -1176,6 +1459,9 @@ def _render_docx_classic(doc: DocxDocument, resume_data: dict[str, Any]) -> None
                 run.font.size = Pt(10)
                 p_bullet.space_after = Pt(1)
 
+    _append_docx_record_section(doc, resume_data, "research", "科研经历", "classic")
+    _append_docx_record_section(doc, resume_data, "campus_experience", "校园与志愿经历", "classic")
+
     if project_items:
         _add_section_heading(doc, "项目经历", "classic")
         for proj in project_items:
@@ -1254,7 +1540,10 @@ def _render_docx_classic(doc: DocxDocument, resume_data: dict[str, Any]) -> None
             "frameworks": "框架工具",
             "tools": "基础设施",
             "domains": "专业领域",
+            "methodologies": "方法与流程",
+            "certifications": "证书与资质",
             "natural_languages": "语言能力",
+            "others": "其他专业技能",
         }
 
         for key, label in label_map.items():
@@ -1353,6 +1642,9 @@ def _render_docx_modern(doc: DocxDocument, resume_data: dict[str, Any]) -> None:
                 for br in p_bullet.runs:
                     br.font.size = Pt(10)
 
+    _append_docx_record_section(doc, resume_data, "research", "科研经历", "modern")
+    _append_docx_record_section(doc, resume_data, "campus_experience", "校园与志愿经历", "modern")
+
     if project_items:
         _add_section_heading(doc, "项目经历", "modern")
         for proj in project_items:
@@ -1427,7 +1719,10 @@ def _render_docx_modern(doc: DocxDocument, resume_data: dict[str, Any]) -> None:
             "frameworks": "框架工具",
             "tools": "开发工具",
             "domains": "业务领域",
+            "methodologies": "方法与流程",
+            "certifications": "证书与资质",
             "natural_languages": "语言能力",
+            "others": "其他专业技能",
         }.items():
             items = skills.get(key, [])
             if isinstance(items, list) and items:
@@ -1473,12 +1768,18 @@ def _render_docx_modern(doc: DocxDocument, resume_data: dict[str, Any]) -> None:
     )
 
 
-def render_docx(resume_data: dict[str, Any], output_path: Path, template: str = "classic") -> None:
+def render_docx(
+    resume_data: dict[str, Any],
+    output_path: Path,
+    template: str = "classic",
+    _layout_retry: bool = False,
+) -> None:
     tpl = _normalize_template(template)
     resume_data = _compress_resume_data_for_docx(resume_data)
+    framework_mode = _is_empty_profile_framework(resume_data)
 
     # Custom template: load as source doc and merge resume data
-    if "/" in tpl or "\\" in tpl:
+    if not framework_mode and ("/" in tpl or "\\" in tpl):
         template_path = Path(tpl)
         if template_path.is_file() and template_path.suffix.lower() == ".docx":
             doc = DocxDocument(str(template_path))
@@ -1493,13 +1794,50 @@ def render_docx(resume_data: dict[str, Any], output_path: Path, template: str = 
                     break
             if _has_tables or _has_placeholders:
                 _apply_resume_data_to_template(doc, resume_data)
+                if _layout_retry:
+                    _apply_docx_compact_typography(doc)
+                _apply_docx_pagination_guards(doc)
                 doc.save(str(output_path))
+                actual_report = inspect_docx_layout(output_path)
+                logger.info("DOCX Visual QA: renderer=%s pages=%s issues=%s",
+                            actual_report.get("renderer"), actual_report.get("page_count"), actual_report.get("issues"))
+                if _layout_needs_tightening(actual_report) and not _layout_retry:
+                    render_docx(
+                        _layout_retry_data(resume_data, actual_report), output_path,
+                        template=template, _layout_retry=True,
+                    )
                 return
             # Style-guide template: fall through to built-in renderer
             logger.info(
                 "Template %s has no tables/placeholders; using built-in renderer instead",
                 template_path.name,
             )
+
+    visual_report = (
+        {"available": False, "issues": ["actual_docx_check_pending"]}
+        if shutil.which("libreoffice")
+        else _preview_visual_layout(resume_data, tpl if tpl in SUPPORTED_TEMPLATES else "classic")
+    )
+    if _layout_needs_tightening(visual_report):
+        tightened = _tighten_resume_data_for_layout(resume_data)
+        tightened_report = _preview_visual_layout(tightened, tpl)
+        before_pages = int(visual_report.get("page_count", 0) or 0)
+        after_pages = int(tightened_report.get("page_count", 0) or 0)
+        before_issues = len(visual_report.get("issues", []))
+        after_issues = len(tightened_report.get("issues", []))
+        if tightened_report.get("available") and (
+            after_pages < before_pages or after_issues < before_issues
+        ):
+            resume_data = tightened
+            visual_report = tightened_report
+            logger.info("Visual QA tightened layout: pages %d -> %d", before_pages, after_pages)
+    if visual_report.get("available"):
+        logger.info(
+            "Visual QA: pages=%s chars=%s issues=%s",
+            visual_report.get("page_count"),
+            visual_report.get("page_char_counts"),
+            visual_report.get("issues"),
+        )
 
     # Built-in templates
     doc = DocxDocument()
@@ -1511,23 +1849,45 @@ def render_docx(resume_data: dict[str, Any], output_path: Path, template: str = 
     normal_style.paragraph_format.line_spacing = 1.2
 
     section = doc.sections[0]
+    section.page_width = Mm(210)
+    section.page_height = Mm(297)
     section.top_margin = Inches(0.6)
     section.bottom_margin = Inches(0.6)
     section.left_margin = Inches(0.75)
     section.right_margin = Inches(0.75)
 
-    if tpl == "minimal":
+    if framework_mode:
+        _render_docx_empty_profile_framework(
+            doc, resume_data, tpl if tpl in SUPPORTED_TEMPLATES else "classic"
+        )
+    elif tpl == "minimal":
         _render_docx_minimal(doc, resume_data)
     elif tpl == "modern":
         _render_docx_modern(doc, resume_data)
     else:
         _render_docx_classic(doc, resume_data)
 
+    _apply_docx_pagination_guards(doc)
+    if _layout_retry:
+        _apply_docx_compact_typography(doc)
     doc.save(str(output_path))
 
-    # Estimate page count for logging. The compression in
-    # _compress_resume_data_for_docx keeps content tight to fit <= 3 pages.
-    # We no longer add a note paragraph (that would make it worse).
+    actual_report = inspect_docx_layout(output_path)
+    if actual_report.get("available"):
+        logger.info(
+            "DOCX Visual QA: renderer=%s pages=%s chars=%s issues=%s",
+            actual_report.get("renderer"), actual_report.get("page_count"),
+            actual_report.get("page_char_counts"), actual_report.get("issues"),
+        )
+        if _layout_needs_tightening(actual_report) and not _layout_retry:
+            render_docx(
+                _layout_retry_data(resume_data, actual_report), output_path,
+                template=template, _layout_retry=True,
+            )
+            return
+
+    # Estimate page count for logging only.  Multi-page resumes are allowed;
+    # actual visual QA handles blank pages and pagination defects.
     doc_reloaded = DocxDocument(str(output_path))
     estimated = _estimate_docx_pages(doc_reloaded)
     if estimated > 3.0:
@@ -1747,7 +2107,10 @@ def _build_renderable_sections(resume_data: dict[str, Any]) -> list[tuple[str, l
         skill_items = []
         for key, label in [("languages", "编程语言"), ("frameworks", "框架"),
                            ("tools", "工具"), ("domains", "领域"),
-                           ("natural_languages", "语言能力")]:
+                           ("methodologies", "方法与流程"),
+                           ("certifications", "证书与资质"),
+                           ("natural_languages", "语言能力"),
+                           ("others", "其他专业技能")]:
             items = skills.get(key, [])
             if isinstance(items, list) and items:
                 skill_items.append(f"{label}: " + " · ".join(str(x) for x in items))
@@ -1821,8 +2184,20 @@ def _convert_docx_to_pdf(docx_path: Path, pdf_path: Path) -> bool:
         return False
 
     with tempfile.TemporaryDirectory() as temp_out:
+        # Every request gets an isolated LibreOffice profile.  Without this,
+        # concurrent headless conversions can contend for the default profile
+        # lock and silently fail to produce a PDF.
+        profile_dir = Path(temp_out) / "lo-profile"
+        profile_dir.mkdir(parents=True, exist_ok=True)
         result = subprocess.run(
-            [libreoffice, "--headless", "--convert-to", "pdf", "--outdir", temp_out, str(docx_path)],
+            [
+                libreoffice,
+                "--headless",
+                f"-env:UserInstallation={profile_dir.as_uri()}",
+                "--convert-to", "pdf",
+                "--outdir", temp_out,
+                str(docx_path),
+            ],
             capture_output=True,
             text=True,
             timeout=90,
@@ -1957,7 +2332,10 @@ def _fallback_render_pdf(resume_data: dict[str, Any], output_path: Path, templat
             "frameworks": "框架工具",
             "tools": "开发工具",
             "domains": "业务领域",
+            "methodologies": "方法与流程",
+            "certifications": "证书与资质",
             "natural_languages": "语言能力",
+            "others": "其他专业技能",
         }.items():
             items = skills.get(key, [])
             if isinstance(items, list) and items:
@@ -2135,8 +2513,11 @@ def export_resume_files(
         raise ValueError("output_format must be docx/pdf/both")
 
     meta = resume_data.get("meta", {}) if isinstance(resume_data, dict) else {}
-    name = meta.get("name", "候选人") if isinstance(meta, dict) else "候选人"
-    prefix = _safe_filename(file_prefix or f"简历_{name}_优化版")
+    name = str(meta.get("name", "") or "").strip() if isinstance(meta, dict) else ""
+    target_role = str(meta.get("target_role", "") or "").strip() if isinstance(meta, dict) else ""
+    identity = name or target_role or "候选人"
+    unique = uuid.uuid4().hex[:8]
+    prefix = _safe_filename(file_prefix or f"简历_{identity}_优化版_{unique}")
 
     docx_path: Optional[Path] = None
     pdf_path: Optional[Path] = None

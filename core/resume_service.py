@@ -34,6 +34,15 @@ from schemas import AuditAndOptimizeRequest, AuditAndOptimizeResponse
 from server_runtime import DEFAULT_TEMPLATE, DRAFTS_DIR, FIXED_OUTPUT_FORMAT, MAX_FILE_SIZE, OUTPUT_DIR, logger
 
 
+def _allowed_server_file(value: Optional[str], field: str) -> Optional[str]:
+    if not value:
+        return None
+    path = Path(value).resolve()
+    if not path.is_relative_to(OUTPUT_DIR.resolve()) or not path.is_file():
+        raise HTTPException(status_code=403, detail=f"{field} must reference a generated output file")
+    return str(path)
+
+
 async def resume_audit_and_optimize_service(request: AuditAndOptimizeRequest) -> AuditAndOptimizeResponse:
     request_started = time.perf_counter()
     perf: dict[str, float] = {}
@@ -56,12 +65,13 @@ async def resume_audit_and_optimize_service(request: AuditAndOptimizeRequest) ->
         did_content_revision = False
         current_audit: Optional[dict[str, Any]] = None
         t_stage = time.perf_counter()
-        resume_text = resolve_resume_text(request.resume_content, request.file_path)
+        safe_file_path = _allowed_server_file(request.file_path, "file_path")
+        resume_text = resolve_resume_text(request.resume_content, safe_file_path)
         _add_stage("resolve_resume_text_s", t_stage)
-        avatar_path = str(request.avatar_path or "").strip() or None
-        if not avatar_path and request.file_path:
+        avatar_path = _allowed_server_file(str(request.avatar_path or "").strip() or None, "avatar_path")
+        if not avatar_path and safe_file_path:
             t_avatar = time.perf_counter()
-            avatar_path = _extract_avatar_from_file_path(request.file_path)
+            avatar_path = _extract_avatar_from_file_path(safe_file_path)
             _add_stage("avatar_extract_s", t_avatar)
         _log_parse_text_debug(
             stage="pipeline_input_text",
@@ -544,7 +554,7 @@ async def resume_audit_and_optimize_upload_service(
 
 async def download_output_file_service(path: str):
     file_path = Path(path).resolve()
-    if not str(file_path).startswith(str(OUTPUT_DIR.resolve())):
+    if not file_path.is_relative_to(OUTPUT_DIR.resolve()):
         raise HTTPException(status_code=403, detail="Access denied: path outside output directory")
     if not file_path.exists() or not file_path.is_file():
         raise HTTPException(status_code=404, detail="File not found")

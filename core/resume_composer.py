@@ -31,11 +31,17 @@ def _build_source_text(source: SourceBundle) -> str:
 
     # Section 1: Candidate Evidence (resume + query)
     evidence_parts = []
-    resume_texts = [b.text for b in source.blocks if b.source_type == "resume"]
+    resume_texts = [
+        f"[{b.block_id}{'|section=' + b.section_hint if b.section_hint else ''}] {b.text}"
+        for b in source.blocks if b.source_type == "resume"
+    ]
     if resume_texts:
         evidence_parts.append("-- CANDIDATE RESUME --\n" + "\n".join(resume_texts))
 
-    query_texts = [b.text for b in source.blocks if b.source_type == "query"]
+    query_texts = [
+        f"[{b.block_id}{'|section=' + b.section_hint if b.section_hint else ''}] {b.text}"
+        for b in source.blocks if b.source_type == "query"
+    ]
     if query_texts:
         evidence_parts.append("-- USER QUERY --\n" + "\n".join(query_texts))
 
@@ -43,7 +49,10 @@ def _build_source_text(source: SourceBundle) -> str:
         parts.append("## CANDIDATE EVIDENCE (facts)\n" + "\n\n".join(evidence_parts))
 
     # Section 2: Target Context (JD only)
-    jd_texts = [b.text for b in source.blocks if b.source_type == "jd"]
+    jd_texts = [
+        f"[{b.block_id}{'|section=' + b.section_hint if b.section_hint else ''}] {b.text}"
+        for b in source.blocks if b.source_type == "jd"
+    ]
     if jd_texts:
         parts.append("## TARGET CONTEXT (reference only — NOT candidate facts)\n"
                      + "\n".join(jd_texts))
@@ -59,7 +68,7 @@ def compose_resume(source: SourceBundle) -> DraftResume:
     source_text = _build_source_text(source)
 
     prompt = (
-        "请从以下材料中提取简历信息。注意材料分为两部分：\n"
+        "请从以下材料中完整提取简历信息。注意材料分为两部分：\n"
         "1) CANDIDATE EVIDENCE：候选人的简历原文和用户补充，这是事实来源。\n"
         "2) TARGET CONTEXT：目标岗位描述，只做参考。\n\n"
         "【材料】\n"

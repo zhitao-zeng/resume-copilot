@@ -8,9 +8,11 @@ No behavior change — pure code movement.
 from __future__ import annotations
 
 import copy
+import asyncio
 import json
 import re
 import time
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -50,9 +52,11 @@ from server_runtime import (
     AVATAR_DIR,
     DEFAULT_TEMPLATE,
     DRAFTS_DIR,
+    DATA_RETENTION_SECONDS,
     MAX_FILE_SIZE,
     OUTPUT_DIR,
     REQUEST_TIMEOUT_SECONDS,
+    ENABLE_LLM_REPLY,
     call_llm_text,
     call_llm_typed,
     llm_enabled,
@@ -60,7 +64,67 @@ from server_runtime import (
     sanitize_user_text,
 )
 from prompts import REPLY_GENERATION_SYSTEM_PROMPT
-from resume_product_logic import INDUSTRY_LABELS
+from input_normalization import (
+    html_to_visible_text,
+    is_pure_http_url,
+    merge_fetched_jd,
+    split_url_and_text,
+)
+from security_utils import (
+    cleanup_old_files,
+    is_forbidden_ip,
+    private_file_mode,
+    read_upload_limited,
+    validate_public_http_url,
+)
+
+
+if aiohttp is not None:
+    class _PublicOnlyResolver(aiohttp.abc.AbstractResolver):
+        async def resolve(self, host: str, port: int = 0, family: int = 0):
+            import socket
+            infos = await asyncio.to_thread(
+                socket.getaddrinfo,
+                host,
+                port,
+                family,
+                socket.SOCK_STREAM,
+            )
+            results = []
+            for resolved_family, _, proto, _, address in infos:
+                ip = address[0]
+                if is_forbidden_ip(ip):
+                    raise OSError("resolved address is not public")
+                results.append({
+                    "hostname": host,
+                    "host": ip,
+                    "port": port,
+                    "family": resolved_family,
+                    "proto": proto,
+                    "flags": 0,
+                })
+            if not results:
+                raise OSError("host has no public address")
+            return results
+
+        async def close(self) -> None:
+            return None
+
+
+_cleanup_lock = threading.Lock()
+_last_cleanup_at = 0.0
+
+
+def _maybe_cleanup_outputs() -> None:
+    global _last_cleanup_at
+    now = time.monotonic()
+    with _cleanup_lock:
+        if now - _last_cleanup_at < 3600:
+            return
+        _last_cleanup_at = now
+    removed = cleanup_old_files(OUTPUT_DIR, DATA_RETENTION_SECONDS)
+    if removed:
+        logger.info("Expired %d retained output files", removed)
 
 # ── Template watermark patterns ──
 _TEMPLATE_WATERMARK_PATTERNS: dict[str, re.Pattern] = {
@@ -101,7 +165,7 @@ def _clean_template_watermarks(
         # They are expected to come from query/JD.  Never treat as leakage.
         if ".meta.target_role" in path or ".meta.job_intention" in path:
             return False
-        if len(value) < 3:
+        if len(value) < 12:
             return False
         v = value.lower().strip()
         # Core fact fields are exempt from query-leak clearing: the CV is the
@@ -112,10 +176,14 @@ def _clean_template_watermarks(
         # not a copy of the query.
         if _cv_lower and v in _cv_lower:
             return False
-        # Field value is a verbatim substring of query (no length limit)
-        if v in _query_lower:
-            return True
-        return False
+        # Query is also a legitimate fact source in V2.  Only remove a value
+        # when it is clearly an instruction copied wholesale into a content
+        # field; short facts such as Python/PyTorch/school names must survive.
+        instruction_markers = (
+            "帮我", "请帮", "请根据", "希望你", "按照", "输出", "生成简历",
+            "优化简历", "整理简历", "不要编造", "不要增加", "想投", "应聘",
+        )
+        return v in _query_lower and any(marker in v for marker in instruction_markers)
 
     def _scan_value(value: Any, path: str = "") -> Any:
         if isinstance(value, str):
@@ -141,6 +209,34 @@ def _clean_template_watermarks(
     resume_data.clear()
     resume_data.update(cleaned)
     return warnings
+
+
+def _prune_empty_resume_values(resume_data: dict) -> None:
+    """Remove blank list items/records after all safety cleaners have run."""
+
+    def _clean(value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, list):
+            cleaned = []
+            for item in value:
+                normalized = _clean(item)
+                if normalized in ("", None, [], {}):
+                    continue
+                if isinstance(normalized, dict) and not any(
+                    child not in ("", None, [], {}) for child in normalized.values()
+                ):
+                    continue
+                if normalized not in cleaned:
+                    cleaned.append(normalized)
+            return cleaned
+        if isinstance(value, dict):
+            return {key: _clean(item) for key, item in value.items()}
+        return value
+
+    cleaned = _clean(resume_data)
+    resume_data.clear()
+    resume_data.update(cleaned)
 
 
 
@@ -257,7 +353,7 @@ def _dicts(items: list[Any]) -> list[dict[str, Any]]:
 
 
 def _looks_like_url(value: str) -> bool:
-    return bool(re.match(r"^https?://", str(value or "").strip(), re.IGNORECASE))
+    return is_pure_http_url(value)
 
 
 def _file_ext(filename: str) -> str:
@@ -309,8 +405,9 @@ def _check_ocr_quality(text: str) -> Optional[dict[str, Any]]:
 
 async def _extract_upload_text(upload: UploadFile, purpose: str, perf: dict[str, float], warnings: list[dict[str, Any]]) -> str:
     started = time.perf_counter()
-    raw = await upload.read()
-    if len(raw) > MAX_FILE_SIZE:
+    try:
+        raw = await read_upload_limited(upload, MAX_FILE_SIZE)
+    except ValueError:
         raise HTTPException(status_code=400, detail=f"{purpose} file too large (> {MAX_FILE_SIZE // (1024 * 1024)} MB)")
     filename = upload.filename or f"{purpose}.bin"
     ext = _file_ext(filename)
@@ -320,7 +417,7 @@ async def _extract_upload_text(upload: UploadFile, purpose: str, perf: dict[str,
             "message": "已对图片执行本地 OCR；如识别不完整，请补充清晰图片或文本。",
         })
     try:
-        text = extract_text_from_bytes(raw, filename)
+        text = await asyncio.to_thread(extract_text_from_bytes, raw, filename)
     except HTTPException as exc:
         if ext in IMAGE_EXTENSIONS:
             warnings.append({
@@ -344,24 +441,43 @@ async def _fetch_jd_url(url: str, warnings: list[dict[str, Any]]) -> str:
         warnings.append({"source": "target_jd", "message": "缺少 aiohttp 依赖，无法解析 JD 链接。"})
         return ""
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
-                if resp.status != 200:
-                    warnings.append({"source": "target_jd", "message": f"JD 链接请求失败：HTTP {resp.status}"})
-                    return ""
-                content_type = resp.headers.get("Content-Type", "")
-                payload = await resp.read()
-                if len(payload) > MAX_FILE_SIZE:
-                    warnings.append({"source": "target_jd", "message": "JD 链接内容超过大小限制，已忽略。"})
-                    return ""
-                if "pdf" in content_type:
-                    return extract_text_from_bytes(payload, "target_jd.pdf")
-                text = payload.decode("utf-8", errors="ignore")
-                text = re.sub(r"<[^>]+>", "\n", text)
-                text = re.sub(r"&nbsp;", " ", text)
-                return re.sub(r"\n\s*\n", "\n\n", text).strip()
+        current_url = await validate_public_http_url(url)
+        timeout = aiohttp.ClientTimeout(total=20, connect=5, sock_read=10)
+        connector = aiohttp.TCPConnector(resolver=_PublicOnlyResolver(), use_dns_cache=False)
+        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+            for _redirect in range(4):
+                async with session.get(
+                    current_url,
+                    allow_redirects=False,
+                    headers={"User-Agent": "resume-copilot/3.0"},
+                ) as resp:
+                    if 300 <= resp.status < 400 and resp.headers.get("Location"):
+                        from urllib.parse import urljoin
+                        current_url = await validate_public_http_url(
+                            urljoin(current_url, resp.headers["Location"])
+                        )
+                        continue
+                    if resp.status != 200:
+                        warnings.append({"source": "target_jd", "message": f"JD 链接请求失败：HTTP {resp.status}"})
+                        return ""
+                    content_type = resp.headers.get("Content-Type", "")
+                    chunks: list[bytes] = []
+                    total = 0
+                    async for chunk in resp.content.iter_chunked(64 * 1024):
+                        total += len(chunk)
+                        if total > MAX_FILE_SIZE:
+                            warnings.append({"source": "target_jd", "message": "JD 链接内容超过大小限制，已忽略。"})
+                            return ""
+                        chunks.append(chunk)
+                    payload = b"".join(chunks)
+                    if "pdf" in content_type:
+                        return await asyncio.to_thread(extract_text_from_bytes, payload, "target_jd.pdf")
+                    return html_to_visible_text(payload)
+            warnings.append({"source": "target_jd", "message": "JD 链接重定向次数过多。"})
+            return ""
     except Exception as exc:
-        warnings.append({"source": "target_jd", "message": f"JD 链接解析失败：{exc}"})
+        logger.warning("JD URL rejected or failed: %s", type(exc).__name__)
+        warnings.append({"source": "target_jd", "message": "JD 链接不安全、不可访问或内容无效。"})
         return ""
 
 
@@ -374,10 +490,11 @@ async def _resolve_jd_text(
         value = str(candidate or "").strip()
         if not value:
             continue
-        if _looks_like_url(value):
-            resolved = await _fetch_jd_url(value, warnings)
+        url, supplied_text = split_url_and_text(value)
+        if url:
+            resolved = await _fetch_jd_url(url, warnings)
             perf["jd_resolve_s"] = round(time.perf_counter() - started, 3)
-            return resolved
+            return merge_fetched_jd(resolved, supplied_text)
         perf["jd_resolve_s"] = round(time.perf_counter() - started, 3)
         return value
     url = str(target_jd_url or jd_url or "").strip()
@@ -396,8 +513,9 @@ async def _resolve_jd_text(
 async def _resolve_template_path(upload: Optional[UploadFile], warnings: list[dict[str, Any]], template: str = DEFAULT_TEMPLATE) -> str:
     if upload is None:
         return template
-    raw = await upload.read()
-    if len(raw) > MAX_FILE_SIZE:
+    try:
+        raw = await read_upload_limited(upload, MAX_FILE_SIZE)
+    except ValueError:
         raise HTTPException(status_code=400, detail="cv_template file too large")
     filename = upload.filename or "template"
     ext = _file_ext(filename)
@@ -405,6 +523,7 @@ async def _resolve_template_path(upload: Optional[UploadFile], warnings: list[di
         AVATAR_DIR.mkdir(parents=True, exist_ok=True)
         path = AVATAR_DIR / f"template_{datetime.utcnow().strftime('%Y%m%d_%H%M%S_%f')}.docx"
         path.write_bytes(raw)
+        private_file_mode(path)
         return str(path)
     if ext in {".pdf", *IMAGE_EXTENSIONS}:
         warnings.append({
@@ -431,12 +550,111 @@ def _build_user_report(
     return report
 
 
+def _build_targeted_suggestions(
+    jd_text: str,
+    resume_data: dict | None,
+    target_role: str = "",
+) -> list[str]:
+    """Create evidence-aware advice without treating JD requirements as facts."""
+
+    data = copy.deepcopy(resume_data or {})
+    data.pop("framework", None)
+    if isinstance(data.get("meta"), dict):
+        # Target intent is not evidence that the candidate has performed the
+        # corresponding JD responsibility.
+        data["meta"].pop("target_role", None)
+        data["meta"].pop("job_intention", None)
+    resume_blob = json.dumps(data, ensure_ascii=False).casefold()
+    suggestions: list[str] = []
+    focus_items: list[str] = []
+    advice_jd = str(jd_text or "")
+    # When a URL was accompanied by user-pasted JD text, advice must follow
+    # the explicit user text rather than unrelated navigation/page content.
+    if "【链接页面正文（仅作补充）】" in advice_jd:
+        advice_jd = advice_jd.split("【链接页面正文（仅作补充）】", 1)[0]
+    for raw_line in re.split(r"[\r\n]+", advice_jd):
+        line = re.sub(r"^\s*(?:[-*•]|\d+[.、)）])\s*", "", raw_line).strip()
+        if not line or line in {"岗位职责", "任职要求", "职位描述", "岗位要求"}:
+            continue
+        line = re.sub(r"^【[^】]+】\s*", "", line).strip()
+        if len(line) < 8 or line.lower().startswith(("http://", "https://")):
+            continue
+        if any(marker in line for marker in (
+            "职位详情", "招聘官网", "工作地点", "公司介绍", "立即申请", "职位类别",
+        )):
+            continue
+        if not any(marker in line for marker in (
+            "负责", "参与", "输出", "推动", "规划", "分析", "设计", "管理",
+            "学历", "经验", "能力", "熟悉", "具备", "要求",
+        )):
+            continue
+        if line not in focus_items:
+            focus_items.append(line[:90])
+        if len(focus_items) >= 2:
+            break
+
+    for focus in focus_items:
+        keywords = [item for item in extract_jd_keywords(focus) if len(item.strip()) >= 2]
+        matched = [item for item in keywords if item.casefold() in resume_blob]
+        if matched:
+            suggestions.append(
+                f"围绕JD重点“{focus}”，当前已有部分相关表述；建议补充个人具体动作、交付物和可核验结果。"
+            )
+        else:
+            suggestions.append(
+                f"JD重点包含“{focus}”，当前简历缺少对应证据；若确有相关经历，请补充，未参与则不要写入。"
+            )
+
+    projects = data.get("projects", []) if isinstance(data, dict) else []
+    project_names = [
+        str(item.get("name", "")).strip()
+        for item in projects if isinstance(item, dict) and str(item.get("name", "")).strip()
+    ][:3]
+    role = str(target_role or (data.get("meta", {}) or {}).get("target_role", "")).strip()
+    if len(suggestions) < 3 and project_names:
+        suggestions.append(
+            f"针对{role or '目标岗位'}，建议为{'、'.join(project_names)}补充项目时间、个人职责、方法/工具及真实评估结果。"
+        )
+    elif len(suggestions) < 3 and role:
+        suggestions.append(
+            f"围绕{role}补充1–2段最相关的真实经历，写清背景、个人动作、交付物和可核验结果。"
+        )
+    research = data.get("research", []) if isinstance(data, dict) else []
+    research_names = [
+        str(item.get("role") or item.get("topic") or item.get("company") or "").strip()
+        for item in research if isinstance(item, dict)
+        and str(item.get("role") or item.get("topic") or item.get("company") or "").strip()
+    ][:2]
+    if len(suggestions) < 3 and research_names:
+        suggestions.append(
+            f"为{'、'.join(research_names)}科研经历补充数据来源、采用方法、个人贡献和真实评估指标，以支撑{role or '目标岗位'}匹配度。"
+        )
+    return suggestions[:3]
+
+
+def _reply_detail_block(
+    missing_fields: list[dict[str, Any]],
+    targeted_suggestions: list[str],
+) -> str:
+    lines: list[str] = []
+    if missing_fields:
+        lines.append(f"缺失或待补充信息（{len(missing_fields)}项）：")
+        for item in missing_fields:
+            label = str(item.get("label") or item.get("field") or "字段").strip()
+            reason = str(item.get("reason", "")).strip()
+            lines.append(f"- {label}：{reason}" if reason else f"- {label}")
+    if targeted_suggestions:
+        lines.append("针对岗位的建议：")
+        lines.extend(f"- {item}" for item in targeted_suggestions)
+    return "\n".join(lines)
+
+
 def _build_llm_reply(
     *, audit_report, score, missing_fields, changes,
     jd_text: str = "", resume_data: dict | None = None,
 ) -> str:
     """Generate reply_text via LLM. Returns empty string on failure."""
-    if not llm_enabled():
+    if not ENABLE_LLM_REPLY or not llm_enabled():
         return ""
     try:
         summary_parts = []
@@ -482,8 +700,8 @@ def _build_llm_reply(
 
         # Missing fields — be specific
         if missing_fields:
-            labels = [item.get("label", "") for item in missing_fields[:5] if item.get("label")]
-            reasons = [item.get("reason", "") for item in missing_fields[:3] if item.get("reason")]
+            labels = [item.get("label", "") for item in missing_fields if item.get("label")]
+            reasons = [item.get("reason", "") for item in missing_fields if item.get("reason")]
             if labels:
                 summary_parts.append(f"缺失字段：{'、'.join(labels)}")
             if reasons:
@@ -495,7 +713,14 @@ def _build_llm_reply(
         if changes:
             actions = [c for c in changes if isinstance(c, dict)]
             if actions:
-                summary_parts.append(f"校验阶段处理了 {len(actions)} 处修正")
+                rewrite_count = _rewrite_change_count(actions)
+                if rewrite_count:
+                    summary_parts.append(
+                        f"已在不新增事实的前提下优化 {rewrite_count} 条经历/项目表述"
+                    )
+                correction_count = len(actions) - rewrite_count
+                if correction_count:
+                    summary_parts.append(f"校验阶段处理了 {correction_count} 处修正")
                 for c in actions[:3]:
                     reason = c.get("reason", "")
                     if reason:
@@ -507,16 +732,23 @@ def _build_llm_reply(
             summary_parts.append(f"目标岗位参考：{jd_snippet}")
             summary_parts.append("请根据目标岗位给出 1-2 条针对性建议")
 
+        targeted_suggestions = _build_targeted_suggestions(
+            jd_text, resume_data, str((resume_data or {}).get("meta", {}).get("target_role", ""))
+        )
+
         user_prompt = "请根据以下简历处理结果生成面向用户的自然语言回复（不要提及具体评分数值）：\n\n" + "\n".join(summary_parts)
         reply = call_llm_text(
             system_prompt=REPLY_GENERATION_SYSTEM_PROMPT,
             user_prompt=user_prompt,
             temperature=0.3, max_tokens=768,
         )
-        if reply and missing_fields:
-            _mf_labels = "、".join(item.get("label", "") for item in missing_fields[:5] if item.get("label"))
-            if _mf_labels and _mf_labels not in reply:
-                reply += f"\n\n需要补充的信息：{_mf_labels}"
+        detail_block = _reply_detail_block(missing_fields, targeted_suggestions)
+        if reply and detail_block and "缺失或待补充信息（" not in reply:
+            reply += "\n\n" + detail_block
+        rewrite_count = _rewrite_change_count(changes)
+        rewrite_message = f"已在不新增事实的前提下优化 {rewrite_count} 条经历/项目表述。"
+        if reply and rewrite_count and f"优化 {rewrite_count} 条" not in reply:
+            reply += "\n\n" + rewrite_message
         if reply:
             logger.info("回复信息: %s", reply)
         return reply if reply else ""
@@ -525,9 +757,20 @@ def _build_llm_reply(
         return ""
 
 
+def _rewrite_change_count(changes) -> int:
+    return sum(
+        1
+        for item in (changes or [])
+        if isinstance(item, dict)
+        and item.get("action") == "replace"
+        and "bullets[" in str(item.get("path", ""))
+    )
+
+
 def build_reply_text(
     *, scenario, industry, user_stage, missing_fields, conflicts,
-    ocr_warnings, direction, score_total
+    ocr_warnings, direction, score_total, changes=None,
+    targeted_suggestions=None,
 ) -> str:
     scenario_label = {
         "scenario1": "原始简历与目标 JD 优化",
@@ -535,14 +778,18 @@ def build_reply_text(
         "scenario3": "原始简历按目标岗位优化",
         "scenario4": "个人信息结合目标 JD 生成简历",
     }.get(scenario, "简历生成/优化")
-    header = "已按\"" + scenario_label + "\"完成一版可编辑 DOCX，识别方向为" + INDUSTRY_LABELS.get(industry, "综合") + "，用户阶段为" + user_stage + "。"
+    header = "已按\"" + scenario_label + "\"完成一版可编辑 DOCX，识别方向为" + product_logic.display_industry(industry) + "，用户阶段为" + product_logic.display_user_stage(user_stage) + "。"
     parts = [header, direction]
+    rewrite_count = _rewrite_change_count(changes)
+    if rewrite_count:
+        parts.append(f"已在不新增事实的前提下优化 {rewrite_count} 条经历/项目表述。")
     if missing_fields:
-        reasons = "; ".join(item.get("reason", "") for item in missing_fields[:5] if item.get("reason"))
-        if reasons:
-            parts.append("需要补充: " + reasons)
+        parts.append(_reply_detail_block(missing_fields, targeted_suggestions or []))
+        parts.append("建议补齐上述信息后再用于正式投递。")
     else:
-        parts.append("请核对联系方式、教育时间、经历成果等关键信息是否完整。")
+        parts.append("未检测到必填信息缺失；正式投递前请人工复核联系方式、时间和成果表述。")
+        if targeted_suggestions:
+            parts.append(_reply_detail_block([], targeted_suggestions))
     if conflicts:
         reasons = "; ".join(item.get("description", "") for item in conflicts[:3] if item.get("description"))
         if reasons:
@@ -550,7 +797,6 @@ def build_reply_text(
     if ocr_warnings:
         warnings = "; ".join(item.get("message", "") for item in ocr_warnings[:3] if item.get("message"))
         parts.append("OCR/文件提示: " + warnings)
-    parts.append("建议优先补齐联系方式、教育时间、经历成果和可量化结果，再用于正式投递。")
     return "\n".join(part for part in parts if part)
 
 def final_fact_guard(
@@ -811,6 +1057,7 @@ async def stage_ingest(
     """Stage 0: Extract CV text, JD text, template path. Quality-gate OCR."""
     ctx = PipelineContext()
     ctx.started = time.perf_counter()
+    await asyncio.to_thread(_maybe_cleanup_outputs)
     ctx.query_text = str(query or "").strip()
     # Init debug output dir if configured (with unique request ID per run
     # to prevent cross-contamination between concurrent requests)
@@ -869,13 +1116,13 @@ async def stage_ingest(
     # Diagnostic log
     cv_text_len = len(ctx.cv_text.strip()) if ctx.cv_text else 0
     logger.info(
-        "CV\xe2\x90\xa4\xe2\x90\xa4extraction summary | has_cv=%s | cv_text_chars=%d | ocr_quality=%s | _low_ocr_quality=%s | query_chars=%d | has_jd=%s",
+        "CV extraction summary | has_cv=%s | cv_text_chars=%d | ocr_quality=%s | low_ocr_quality=%s | query_chars=%d | has_jd=%s",
         ctx.has_cv, cv_text_len,
         ctx.ocr_quality.get("score") if ctx.ocr_quality else "N/A",
         ctx._low_ocr_quality, len(ctx.query_text), ctx.has_jd,
     )
     if ctx.cv_text and ctx.cv_text.strip():
-        logger.info("OCR结果: %s", ctx.cv_text.strip())
+        logger.info("CV extraction succeeded | chars=%d", len(ctx.cv_text))
 
     # Template
     effective_template = await _resolve_template_path(cv_template, ctx.ocr_warnings, template)
@@ -916,10 +1163,10 @@ async def stage_classify(ctx: PipelineContext) -> PipelineContext:
         raise HTTPException(status_code=400, detail="query or cv is required")
 
     t_classify = time.perf_counter()
-    classification = classify_resume_request(
+    classification = await asyncio.to_thread(
+        classify_resume_request,
         query=ctx.query_text, cv_text=ctx.cv_text, jd_text=ctx.jd_text,
-        has_cv=ctx.has_cv, has_jd=ctx.has_jd,
-        resume_data=None,
+        has_cv=ctx.has_cv, has_jd=ctx.has_jd, resume_data=None,
     )
     ctx.target_role = classification.target_role
     ctx.industry = classification.industry
@@ -1367,28 +1614,8 @@ async def generate_path(ctx: PipelineContext) -> PipelineContext:
     return ctx
 
 async def stage_score(ctx: PipelineContext) -> PipelineContext:
-    """Stage 5: Score + build user_report."""
-    if not ctx._has_audit:
-        try:
-            ctx.audit_report = audit_resume_core(
-                resume_data_to_text(ctx.resume_data),
-                ctx.jd_text or ctx.target_role,
-                resume_data=ctx.resume_data,
-            )
-            ctx._has_audit = True
-        except Exception as exc:
-            logger.warning("Audit failed in stage_score, using fallback: %s", exc)
-            ctx.audit_report = {"overall_score": 0, "issues": [], "summary": ""}
-
-    direction = _build_generation_direction(ctx.industry, ctx.target_role) or "建议明确目标岗位方向以优化简历。"
-    missing_dict = _dicts(ctx.missing_fields)
-    conflict_dict = _dicts(ctx.conflicts)
-    fab_dict = ctx.fabrication_report.model_dump() if hasattr(ctx.fabrication_report, "model_dump") else {}
-    ctx.user_report = _build_user_report(
-        missing_fields=missing_dict, conflicts=conflict_dict,
-        fabrication=fab_dict, direction=direction,
-        ocr_warnings=ctx.ocr_warnings, template_notes=ctx.template_notes,
-    )
+    """Legacy scoring stage retained for older API callers."""
+    ctx = await stage_prepare_report(ctx)
     score_obj = score_resume(
         ctx.resume_data, original_text=ctx.source_truth_text,
         user_report=ctx.user_report, job_family=ctx.industry,
@@ -1398,13 +1625,49 @@ async def stage_score(ctx: PipelineContext) -> PipelineContext:
     )
     ctx.score_breakdown = score_obj.model_dump() if hasattr(score_obj, "model_dump") else score_obj.__dict__
     ctx.score = float(ctx.score_breakdown.get("total", 0.0))
-    logger.info("评分: 总分=%.1f | 可读性=%s | 完整度=%s | 表达=%s | 反馈=%s",
-        ctx.score,
-        ctx.score_breakdown.get("readability", "?"),
-        ctx.score_breakdown.get("completeness", "?"),
-        ctx.score_breakdown.get("expression", "?"),
-        ctx.score_breakdown.get("response", "?"),
+    return ctx
+
+
+async def stage_prepare_report(ctx: PipelineContext) -> PipelineContext:
+    """Build actionable output metadata without assigning a synthetic score."""
+    if not ctx._has_audit:
+        try:
+            ctx.audit_report = await asyncio.to_thread(
+                audit_resume_core,
+                resume_data_to_text(ctx.resume_data),
+                ctx.jd_text or ctx.target_role,
+                resume_data=ctx.resume_data,
+            )
+            ctx._has_audit = True
+        except Exception as exc:
+            logger.warning("Audit failed while preparing report, using fallback: %s", exc)
+            ctx.audit_report = {"overall_score": 0, "issues": [], "summary": ""}
+
+    if isinstance(ctx.resume_data.get("framework"), dict):
+        direction = (
+            f"未收到可写入简历的个人事实，已按{ctx.target_role or '目标岗位'}方向生成待填写框架。"
+        )
+    else:
+        direction = _build_generation_direction(ctx.industry, ctx.target_role) or "建议明确目标岗位方向以优化简历。"
+    missing_dict = _dicts(ctx.missing_fields)
+    conflict_dict = _dicts(ctx.conflicts)
+    fab_dict = ctx.fabrication_report.model_dump() if hasattr(ctx.fabrication_report, "model_dump") else {}
+    ctx.user_report = _build_user_report(
+        missing_fields=missing_dict, conflicts=conflict_dict,
+        fabrication=fab_dict, direction=direction,
+        ocr_warnings=ctx.ocr_warnings, template_notes=ctx.template_notes,
     )
+    targeted_suggestions = _build_targeted_suggestions(
+        ctx.jd_text, ctx.resume_data, ctx.target_role,
+    )
+    if targeted_suggestions:
+        ctx.user_report["targeted_suggestions"] = targeted_suggestions
+    if isinstance(ctx.resume_data.get("framework"), dict):
+        ctx.user_report["framework_mode"] = True
+    if ctx.changes:
+        ctx.user_report["changes"] = ctx.changes
+    ctx.score = 0.0
+    ctx.score_breakdown = {}
     return ctx
 
 
@@ -1423,8 +1686,10 @@ async def stage_render(ctx: PipelineContext) -> PipelineContext:
         logger.info("已清除 %d 个水印/泄漏项:", len(_watermark_warnings))
         for _w in _watermark_warnings:
             logger.info("  清除: %s", _w)
+    _prune_empty_resume_values(ctx.resume_data)
 
-    reply_text = _build_llm_reply(
+    reply_text = await asyncio.to_thread(
+        _build_llm_reply,
         audit_report=ctx.audit_report, score=ctx.score,
         missing_fields=missing_dict, changes=ctx.changes,
         jd_text=ctx.jd_text, resume_data=ctx.resume_data,
@@ -1436,23 +1701,29 @@ async def stage_render(ctx: PipelineContext) -> PipelineContext:
             conflicts=conflict_dict, ocr_warnings=ctx.ocr_warnings,
             direction=ctx.user_report.get("generation_direction", ""),
             score_total=ctx.score,
+            changes=ctx.changes,
+            targeted_suggestions=ctx.user_report.get("targeted_suggestions", []),
         )
     ctx.reply_text = reply_text
 
     t_export = time.perf_counter()
-    ctx.files = export_resume_files(
+    ctx.files = await asyncio.to_thread(
+        export_resume_files,
         resume_data=ctx.resume_data, output_dir=OUTPUT_DIR,
         output_format="docx", template=ctx.template_path,
     )
+    for generated_path in ctx.files.values():
+        if generated_path:
+            private_file_mode(Path(generated_path))
     ctx.perf["export_files_s"] = round(time.perf_counter() - t_export, 3)
     _ensure_time_budget(ctx.started, "export_files")
 
     t_draft = time.perf_counter()
-    ctx.draft_id, ctx.version = create_new_draft(
+    ctx.draft_id, ctx.version = await asyncio.to_thread(
+        create_new_draft,
         drafts_dir=DRAFTS_DIR, resume_data=ctx.resume_data,
         audit_report=ctx.audit_report, jd_text=ctx.jd_text,
-        template=ctx.template_path, output_format="docx",
-        changes=ctx.changes,
+        template=ctx.template_path, output_format="docx", changes=ctx.changes,
     )
     ctx.perf["draft_s"] = round(time.perf_counter() - t_draft, 3)
     ctx.perf["total_s"] = round(time.perf_counter() - ctx.started, 3)

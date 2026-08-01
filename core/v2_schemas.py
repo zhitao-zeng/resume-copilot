@@ -4,6 +4,8 @@ SourceBundle, DraftResume (with GroundedValue), CanonicalResume (clean fields).
 """
 from __future__ import annotations
 
+import re
+
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from typing import Any, Literal, Optional
 
@@ -50,7 +52,25 @@ class Meta(BaseModel):
     def normalize_work_experience(cls, v: Any) -> str:
         if isinstance(v, list):
             return ""
-        return str(v) if v else ""
+        value = str(v or "").strip()
+        if not value:
+            return ""
+        # A model sometimes copies an employment period into this duration
+        # field (for example "2024.07-2024.12").  A date range is not work
+        # experience and is already represented on the experience record.
+        date_tokens = re.findall(r"(?:19|20)\d{2}(?:[./年-]\d{1,2})?", value)
+        if len(date_tokens) >= 2 or re.search(
+            r"(?:19|20)\d{2}[./-]\d{1,2}\s*[-—~至到]\s*(?:19|20)\d{2}[./-]\d{1,2}",
+            value,
+        ):
+            return ""
+        # Keep explicit duration statements only.  Ambiguous values such as a
+        # lone year are safer left blank than rendered as seniority.
+        if re.search(r"\d+(?:\.\d+)?\s*(?:年|个月|月)(?:工作|从业|实习)?(?:经验|经历)?", value):
+            return value
+        if value in {"应届", "应届生", "无工作经验"}:
+            return value
+        return ""
 
 
 class Education(BaseModel):
@@ -90,6 +110,15 @@ class Research(BaseModel):
     bullets: list[str] = Field(default_factory=list)
 
 
+class Activity(BaseModel):
+    """Campus, association and volunteer experience kept out of employment."""
+    model_config = ConfigDict(extra="forbid")
+    organization: str = ""
+    role: str = ""
+    period: str = ""
+    bullets: list[str] = Field(default_factory=list)
+
+
 class SkillItem(BaseModel):
     model_config = ConfigDict(extra="ignore")
     name: str = ""
@@ -107,8 +136,16 @@ class SkillsDraft(BaseModel):
         if isinstance(v, dict):
             # Old format: {"languages": [...], "tools": [...]}
             items = []
-            cat_map = {"languages": "language", "frameworks": "framework",
-                       "tools": "tool", "domains": "domain"}
+            cat_map = {
+                "languages": "language",
+                "frameworks": "framework",
+                "tools": "tool",
+                "domains": "domain",
+                "methodologies": "methodology",
+                "certifications": "certification",
+                "natural_languages": "natural_language",
+                "others": "other",
+            }
             for cat, names in v.items():
                 target_cat = cat_map.get(cat, cat)
                 if isinstance(names, list):
@@ -127,6 +164,7 @@ class CanonicalResume(BaseModel):
     education: list[Education] = Field(default_factory=list)
     experience: list[Experience] = Field(default_factory=list)
     research: list[Research] = Field(default_factory=list)
+    activities: list[Activity] = Field(default_factory=list)
     projects: list[Project] = Field(default_factory=list)
     skills: SkillsDraft = Field(default_factory=SkillsDraft)
     summary: str = ""
@@ -141,6 +179,7 @@ class DraftResume(BaseModel):
     education: list[Education] = Field(default_factory=list)
     experience: list[Experience] = Field(default_factory=list)
     research: list[Research] = Field(default_factory=list)
+    activities: list[Activity] = Field(default_factory=list)
     projects: list[Project] = Field(default_factory=list)
     skills: SkillsDraft = Field(default_factory=SkillsDraft)
     summary: str = ""
@@ -154,8 +193,20 @@ class Change(BaseModel):
     reason: str
 
 
+class EvidenceBinding(BaseModel):
+    """Internal trace from one final resume path to candidate source text."""
+
+    model_config = ConfigDict(extra="forbid")
+    path: str
+    block_id: str
+    quote: str
+    mode: Literal["direct", "normalized", "rewritten", "derived"]
+    similarity: float = 1.0
+
+
 class VerifiedResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
     resume: CanonicalResume
     changes: list[Change] = Field(default_factory=list)
     resume_dict: dict = Field(default_factory=dict)
+    evidence_bindings: list[EvidenceBinding] = Field(default_factory=list)

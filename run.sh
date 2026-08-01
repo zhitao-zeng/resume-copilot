@@ -1,7 +1,12 @@
 
-MODELHUB_API_KEY="667cf82cdaec4ca7afb5ac179de9853a" \
-MODELHUB_BASE_URL="http://modelhub.4pd.io/learnware/models/openai/4pd/api/v1" \
-MODELHUB_MODEL_NAME="public/qwen2-5-72b-instruct-awq@main" \
+#!/bin/bash
+set -euo pipefail
+
+: "${MODELHUB_API_KEY:?Set MODELHUB_API_KEY in the environment or secret manager}"
+: "${MODELHUB_BASE_URL:?Set MODELHUB_BASE_URL in the environment}"
+: "${MODELHUB_MODEL_NAME:?Set MODELHUB_MODEL_NAME in the environment}"
+export MODELHUB_API_KEY MODELHUB_BASE_URL MODELHUB_MODEL_NAME
+
 ENABLE_HEURISTIC_AUDIT_FALLBACK=0 \
 ENABLE_RESUME_SHRINK_GUARD=1 \
 DEFAULT_OUTPUT_FORMAT="both" \

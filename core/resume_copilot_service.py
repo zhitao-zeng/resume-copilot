@@ -8,6 +8,7 @@ natural-language reply + scoring metadata.
 from __future__ import annotations
 
 import copy
+import asyncio
 import os
 import re
 import time
@@ -32,6 +33,12 @@ from resume_optimization import optimize_resume_core, run_single_optimize_with_a
 from resume_parsing import cleanup_ocr_text, resume_data_to_text, structured_resume_from_text
 from resume_renderer import export_resume_files
 from resume_scoring import score_resume
+from input_normalization import (
+    html_to_visible_text,
+    is_pure_http_url,
+    merge_fetched_jd,
+    split_url_and_text,
+)
 from resume_validator import (
     calculate_experience_years,
     check_fabrication_heuristic,
@@ -44,7 +51,6 @@ from resume_validator import (
 from schemas import ResumeCopilotResponse, StructuredResumeLLMOutput
 from server_runtime import AVATAR_DIR, DEFAULT_TEMPLATE, DRAFTS_DIR, MAX_FILE_SIZE, OUTPUT_DIR, REQUEST_TIMEOUT_SECONDS, call_llm_text, call_llm_typed, llm_enabled, logger, sanitize_user_text
 from prompts import REPLY_GENERATION_SYSTEM_PROMPT
-from resume_product_logic import INDUSTRY_LABELS
 
 
 def _dicts(items: list[Any]) -> list[dict[str, Any]]:
@@ -60,7 +66,7 @@ def _dicts(items: list[Any]) -> list[dict[str, Any]]:
 
 
 def _looks_like_url(value: str) -> bool:
-    return bool(re.match(r"^https?://", str(value or "").strip(), re.IGNORECASE))
+    return is_pure_http_url(value)
 
 
 def _file_ext(filename: str) -> str:
@@ -134,10 +140,7 @@ async def _fetch_jd_url(url: str, warnings: list[dict[str, Any]]) -> str:
                     return ""
                 if "pdf" in content_type:
                     return extract_text_from_bytes(payload, "target_jd.pdf")
-                text = payload.decode("utf-8", errors="ignore")
-                text = re.sub(r"<[^>]+>", "\n", text)
-                text = re.sub(r"&nbsp;", " ", text)
-                return re.sub(r"\n\s*\n", "\n\n", text).strip()
+                return html_to_visible_text(payload)
     except Exception as exc:
         warnings.append({"source": "target_jd", "message": f"JD 链接解析失败：{exc}"})
         return ""
@@ -159,10 +162,11 @@ async def _resolve_jd_text(
         value = str(candidate or "").strip()
         if not value:
             continue
-        if _looks_like_url(value):
-            resolved = await _fetch_jd_url(value, warnings)
+        url, supplied_text = split_url_and_text(value)
+        if url:
+            resolved = await _fetch_jd_url(url, warnings)
             perf["jd_resolve_s"] = round(time.perf_counter() - started, 3)
-            return resolved
+            return merge_fetched_jd(resolved, supplied_text)
         perf["jd_resolve_s"] = round(time.perf_counter() - started, 3)
         return value
 
@@ -531,6 +535,7 @@ def build_reply_text(
     ocr_warnings: list[dict[str, Any]],
     direction: str,
     score_total: float,
+    changes: Optional[list[dict[str, Any]]] = None,
 ) -> str:
     scenario_label = {
         "scenario1": "原始简历与目标 JD 优化",
@@ -538,15 +543,24 @@ def build_reply_text(
         "scenario3": "原始简历按目标岗位优化",
         "scenario4": "个人信息结合目标 JD 生成简历",
     }.get(scenario, "简历生成/优化")
-    header = "已按"" + scenario_label + ""完成一版可编辑 DOCX，识别方向为" + INDUSTRY_LABELS.get(industry, "综合") + "，用户阶段为" + user_stage + "。"
+    header = "已按\"" + scenario_label + "\"完成一版可编辑 DOCX，识别方向为" + product_logic.display_industry(industry) + "，用户阶段为" + product_logic.display_user_stage(user_stage) + "。"
     parts = [header, direction]
+    rewrite_count = sum(
+        1 for item in (changes or [])
+        if isinstance(item, dict)
+        and item.get("action") == "replace"
+        and "bullets[" in str(item.get("path", ""))
+    )
+    if rewrite_count:
+        parts.append(f"已在不新增事实的前提下优化 {rewrite_count} 条经历/项目表述。")
     # Missing fields: always remind user
     if missing_fields:
         reasons = "; ".join(item.get("reason", "") for item in missing_fields[:5] if item.get("reason"))
         if reasons:
             parts.append("需要补充: " + reasons)
+        parts.append("建议补齐上述信息后再用于正式投递。")
     else:
-        parts.append("请核对联系方式、教育时间、经历成果等关键信息是否完整。")
+        parts.append("未检测到必填信息缺失；正式投递前请人工复核联系方式、时间和成果表述。")
     if conflicts:
         reasons = "; ".join(item.get("description", "") for item in conflicts[:3] if item.get("description"))
         if reasons:
@@ -554,7 +568,6 @@ def build_reply_text(
     if ocr_warnings:
         warnings = "; ".join(item.get("message", "") for item in ocr_warnings[:3] if item.get("message"))
         parts.append("OCR/文件提示: " + warnings)
-    parts.append("建议优先补齐联系方式、教育时间、经历成果和可量化结果，再用于正式投递。")
     return "\n".join(part for part in parts if part)
 
 
@@ -703,7 +716,7 @@ def generate_resume_with_llm_from_profile(
         "2) 【目标JD】只能用于确定表达方向、关键词侧重和个人总结，不得写成候选人已具备事实。\n"
         "3) 缺失的姓名、电话、邮箱、学校、学历、时间、岗位、成果、技能必须留空或保留原文弱表达，不得猜测。\n"
         "4) 原文没有数字结果时，不得编造百分比、金额、人数、病例数、学生数、客户数。\n"
-        "5) 个人总结必须不超过100字，且要匹配目标行业。\n"
+        "5) 个人总结使用2-4个完整句子，建议120-180字，不得从句中截断，且要匹配目标行业。\n"
         "6) 输出必须是结构化简历 JSON，不要输出解释或 markdown。\n"
         "7) 输出语言必须与用户输入保持一致：用户用中文，则全部字段用中文输出。\n"
         "8) 不得使用知页、WonderCV 等模板网站的示例占位数据，必须使用描述中真实的用户信息。"
@@ -734,7 +747,7 @@ def generate_resume_with_llm_from_profile(
     return parsed if isinstance(parsed, dict) else {}
 
 
-async def resume_copilot_service(
+async def _resume_copilot_service_impl(
     *,
     query: Optional[str],
     cv: Optional[UploadFile],
@@ -749,8 +762,9 @@ async def resume_copilot_service(
     """Two-strategy pipeline: rewrite-path (scenario 1/3) vs generate-path (scenario 2/4)."""
     from resume_copilot_pipeline import (
         stage_ingest, stage_classify, rewrite_path, generate_path,
-        stage_score, stage_render,
+        stage_prepare_report, stage_render,
     )
+    from resume_classifier import normalize_target_role, reconcile_user_stage
 
     ctx = await stage_ingest(
         query=query, cv=cv, cv_template=cv_template,
@@ -763,9 +777,38 @@ async def resume_copilot_service(
     # V2 pipeline — synchronous call (handles both CV and no-CV cases)
     t_v2 = time.perf_counter()
     from v2_pipeline import run_v2_pipeline
-    v2_result = run_v2_pipeline(ctx.cv_text, ctx.query_text, ctx.jd_text)
+    v2_result = await asyncio.to_thread(run_v2_pipeline, ctx.cv_text, ctx.query_text, ctx.jd_text)
     ctx.resume_data = v2_result.resume_dict
-    ctx.fabrication_report = None
+    ctx.perf["evidence_bindings"] = float(len(v2_result.evidence_bindings))
+    ctx._write_debug(
+        "07_evidence_bindings.json",
+        [binding.model_dump() for binding in v2_result.evidence_bindings],
+    )
+    meta = ctx.resume_data.setdefault("meta", {})
+    final_target_role = normalize_target_role(
+        ctx.target_role or str(meta.get("target_role", "") or "")
+    )
+    ctx.target_role = final_target_role
+    if final_target_role:
+        meta["target_role"] = final_target_role
+    else:
+        meta.pop("target_role", None)
+    candidate_truth = "\n".join(
+        part for part in (ctx.cv_text, ctx.query_text) if str(part or "").strip()
+    )
+    # Classification happens before the resume is parsed.  Reconcile it with
+    # grounded structured fields so a degree mention cannot outweigh several
+    # years of full-time work (and internships still remain student evidence).
+    ctx.user_stage = reconcile_user_stage(
+        ctx.user_stage, ctx.resume_data, candidate_truth,
+    )
+    fact_resume_data = dict(ctx.resume_data)
+    fact_resume_data.pop("framework", None)
+    ctx.fabrication_report = (
+        check_fabrication_heuristic(candidate_truth, fact_resume_data)
+        if candidate_truth.strip()
+        else FabricationReport(fabrication_found=False, details=[])
+    )
 
     # Pass V2 changes for reply context
     ctx.changes = [
@@ -786,9 +829,7 @@ async def resume_copilot_service(
     ctx._has_audit = True
     ctx.audit_report = {"overall_score": 0, "issues": [], "summary": ""}
 
-    t_score = time.perf_counter()
-    ctx = await stage_score(ctx)
-    logger.info("stage_score done in %.1fs", time.perf_counter() - t_score)
+    ctx = await stage_prepare_report(ctx)
 
     t_render = time.perf_counter()
     ctx = await stage_render(ctx)
@@ -812,3 +853,35 @@ async def resume_copilot_service(
         version=ctx.version,
     )
 
+
+async def resume_copilot_service(
+    *,
+    query: Optional[str],
+    cv: Optional[UploadFile],
+    cv_template: Optional[UploadFile],
+    target_jd: Optional[str],
+    target_jd_file: Optional[UploadFile],
+    target_jd_url: Optional[str],
+    jd_text: Optional[str],
+    jd_url: Optional[str],
+    template: str = DEFAULT_TEMPLATE,
+) -> ResumeCopilotResponse:
+    """Run the complete pipeline under a real wall-clock request deadline."""
+    try:
+        async with asyncio.timeout(REQUEST_TIMEOUT_SECONDS):
+            return await _resume_copilot_service_impl(
+                query=query,
+                cv=cv,
+                cv_template=cv_template,
+                target_jd=target_jd,
+                target_jd_file=target_jd_file,
+                target_jd_url=target_jd_url,
+                jd_text=jd_text,
+                jd_url=jd_url,
+                template=template,
+            )
+    except TimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail=f"resume-copilot exceeded the {REQUEST_TIMEOUT_SECONDS}s request budget",
+        ) from exc

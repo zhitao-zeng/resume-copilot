@@ -6,13 +6,20 @@ Run with: PYTHONPATH=core python -m pytest tests/test_v2_badcases.py -v -s
 import json
 import os
 from pathlib import Path
+import pytest
 
 FIXTURES = Path(__file__).parent / "fixtures" / "badcase_0715"
 
-# Point to vLLM
-os.environ.setdefault("MODELHUB_BASE_URL", "http://localhost:8000/v1")
-os.environ.setdefault("MODELHUB_API_KEY", "not-needed")
-os.environ.setdefault("MODELHUB_MODEL_NAME", "/models/Qwen3.5-8B")
+RUN_LLM_INTEGRATION = os.getenv("RUN_LLM_INTEGRATION", "0") == "1"
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.skipif(not RUN_LLM_INTEGRATION, reason="set RUN_LLM_INTEGRATION=1 with a running backend"),
+]
+
+if RUN_LLM_INTEGRATION:
+    os.environ.setdefault("MODELHUB_BASE_URL", "http://localhost:8000/v1")
+    os.environ.setdefault("MODELHUB_API_KEY", "not-needed")
+    os.environ.setdefault("MODELHUB_MODEL_NAME", "/models/Qwen3.5-8B")
 
 from v2_pipeline import run_v2_pipeline
 

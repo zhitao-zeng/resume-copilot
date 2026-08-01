@@ -1,85 +1,164 @@
-"""ResumeOptimizer: LLM Call 3 — optimize verified resume for target role.
+"""Evidence-preserving bullet optimizer for the V2 resume pipeline.
 
-V2 Layer 4. Takes verified CanonicalResume + JD, outputs optimized version.
-- Rewrites weak bullets into STAR format (action verb + context + result)
-- Reorders experiences by JD relevance
-- Does NOT fabricate new facts — only restructures/rephrases existing content
+The optimizer returns patches instead of a complete resume.  Immutable fields
+never cross the LLM boundary a second time, which prevents role/company/date
+drift and makes a rejected bullet independent from the rest of the document.
 """
+
 from __future__ import annotations
 
+import json
 import logging
+import re
+from collections import Counter
+from typing import Any
 
-from server_runtime import call_llm_text, llm_enabled
 from llm_gateway import parse_json_content
+from server_runtime import call_llm_text, llm_enabled
 from v2_schemas import CanonicalResume
 
 logger = logging.getLogger(__name__)
 
-OPTIMIZER_SYSTEM_PROMPT = """你是一位简历优化专家。对已校验的简历做针对性优化，输出优化后的完整 JSON。
 
-【输出结构不变】：
+_STRONG_ACTIONS = ("主导", "统筹", "牵头", "独立负责", "全权负责", "从0到1", "从零到一")
+_MEDIUM_ACTIONS = ("负责", "组织", "推动", "管理", "设计", "开发", "构建", "实现", "制定")
+_WEAK_ACTIONS = ("参与", "协助", "支持", "配合", "接触", "了解", "学习")
+_UNSUPPORTED_RESULT_TERMS = (
+    "显著提升", "大幅提升", "提升了", "降低了", "减少了", "增长了", "增强了",
+    "确保", "保障", "关键依据", "高质量交付", "打通", "性能达标", "降低成本",
+    "提高准确率", "提升准确率", "提升效率", "提升用户体验",
+)
+
+
+OPTIMIZER_SYSTEM_PROMPT = """你是一位保守的简历编辑，只输出局部文字补丁，不得重写整份简历。
+
+输出 JSON：
 {
-  "meta": {"name": "", "phone": "", "email": "", "target_role": "", "work_experience": ""},
-  "summary": "",
-  "education": [{"school": "", "degree": "", "major": "", "period": ""}],
-  "experience": [{"organization": "", "role": "", "period": "", "bullets": [""]}],
-  "research": [{"institution": "", "topic": "", "period": "", "bullets": [""]}],
-  "projects": [{"name": "", "organization": "", "role": "", "period": "", "bullets": [""]}],
-  "skills": {"items": [{"name": "", "category": ""}]},
-  "awards": [""]
+  "experience": [{"index": 0, "bullets": ["与原数组一一对应"]}],
+  "research": [{"index": 0, "bullets": ["与原数组一一对应"]}],
+  "activities": [{"index": 0, "bullets": ["与原数组一一对应"]}],
+  "projects": [{"index": 0, "bullets": ["与原数组一一对应"]}]
 }
 
-【优化规则】
-1. bullets 改写：
-   - 弱 bullet（无动词开头、无具体成果）→ 改为"动词 + 做了什么 + 怎么做的 + 结果"
-   - 例：「参与用户调研」→「主导用户调研，通过问卷+访谈覆盖N名用户，输出需求文档推动X功能上线」
-   - 但绝不能编造原文没有的数字或成果。如果原文没有数据，用定性描述代替
-   - 每条 bullet 控制在 1-2 句话
+硬约束：
+1. 每个 bullets 数组长度和顺序必须与输入完全相同，一条原文对应一条改写。
+2. 只能改 bullets；不得输出或修改 summary、公司、组织、岗位、学校、日期、技能、奖项。
+3. 责任级别必须保持：原文“参与/协助/支持”不得升级，原文“独立负责/主导/负责”也不得降级。
+4. 原文没有结果时，不得添加提升、降低、增长、确保、高质量交付等结果。
+5. 不得新增数字、工具、技术、业务领域或项目事实。
+6. 重点是压缩重复、改善句式和按目标岗位突出已有事实；不需要为了 STAR 强行补结果。
+7. 保留原文中的关键过程、方法、交付物和结果，不得把多项事实压成空泛短句。
+只输出 JSON，不要解释。"""
 
-2. 相关性排序：
-   - 与目标岗位最相关的经历排最前面
-   - 明显无关的经历（如志愿者对技术岗）排到最后，但不要删除
-   - projects 也按相关性排序
 
-3. summary 优化：
-   - 重写为 2-3 句，突出与目标岗位的匹配点
-   - 用原文有的事实，不要编造
+def _numeric_facts(value: Any) -> Counter:
+    text = value if isinstance(value, str) else str(value)
+    return Counter(re.findall(
+        r"(?<![A-Za-z])\d+(?:\.\d+)?(?:%|万|w|k|人|次|个|条|元|年|月|日)?",
+        text,
+        re.IGNORECASE,
+    ))
 
-4. 硬约束：
-   - 不能新增原文没有的经历、项目、技能
-   - 不能编造数字（百分比、金额、人数）
-   - 不能改变 organization/school/name 等事实字段
-   - 不能删除任何经历或项目（只能调顺序）
-   - awards 保持不变
 
-输出 JSON，不要额外解释。"""
+def _action_level(text: str) -> int:
+    if any(token in text for token in _STRONG_ACTIONS):
+        return 3
+    if any(token in text for token in _MEDIUM_ACTIONS):
+        return 2
+    if any(token in text for token in _WEAK_ACTIONS):
+        return 1
+    return 0
+
+
+def _safe_rewrite(original: str, rewritten: str) -> bool:
+    original = str(original or "").strip()
+    rewritten = str(rewritten or "").strip()
+    if not original or not rewritten or len(rewritten) > max(220, len(original) * 3):
+        return False
+    original_action = _action_level(original)
+    rewritten_action = _action_level(rewritten)
+    # Ownership is a candidate fact: it may neither be inflated nor weakened.
+    if original_action and rewritten_action != original_action:
+        return False
+    if len(original) >= 20 and len(rewritten) < max(12, int(len(original) * 0.58)):
+        return False
+    original_numbers = _numeric_facts(original)
+    if any(count > original_numbers[token] for token, count in _numeric_facts(rewritten).items()):
+        return False
+    # Product/model/tool names are commonly Latin tokens.  A rewritten bullet
+    # may normalize case, but it must not introduce a new named token that was
+    # absent from its grounded input bullet.
+    latin_pattern = re.compile(r"[A-Za-z][A-Za-z0-9+.#/_-]*")
+    original_latin = {token.casefold() for token in latin_pattern.findall(original)}
+    rewritten_latin = {token.casefold() for token in latin_pattern.findall(rewritten)}
+    if not rewritten_latin.issubset(original_latin):
+        return False
+    for term in _UNSUPPORTED_RESULT_TERMS:
+        if term in rewritten and term not in original:
+            return False
+    return True
+
+
+def _apply_section_patches(
+    optimized: CanonicalResume,
+    section: str,
+    patches: Any,
+) -> int:
+    records = getattr(optimized, section, None)
+    if not isinstance(records, list) or not isinstance(patches, list):
+        return 0
+    accepted = 0
+    for patch in patches:
+        if not isinstance(patch, dict) or not isinstance(patch.get("index"), int):
+            continue
+        index = patch["index"]
+        if index < 0 or index >= len(records):
+            continue
+        proposed = patch.get("bullets")
+        original = list(records[index].bullets)
+        if not isinstance(proposed, list) or len(proposed) != len(original):
+            continue
+        merged: list[str] = []
+        for before, after in zip(original, proposed):
+            after_text = str(after or "").strip()
+            if _safe_rewrite(before, after_text):
+                merged.append(after_text)
+                accepted += int(after_text != before)
+            else:
+                merged.append(before)
+        records[index].bullets = merged
+    return accepted
 
 
 def optimize_resume(resume: CanonicalResume, jd_text: str = "") -> CanonicalResume:
-    """Optimize verified resume for target role. Returns optimized copy."""
     if not llm_enabled():
         return resume
 
-    # Skip optimization if resume is mostly empty
-    total_bullets = sum(len(e.bullets) for e in resume.experience) + \
-                    sum(len(e.bullets) for e in resume.projects) + \
-                    sum(len(r.bullets) for r in resume.research)
-    if total_bullets < 2:
+    total_bullets = sum(
+        len(item.bullets)
+        for section in (resume.experience, resume.research, resume.activities, resume.projects)
+        for item in section
+    )
+    if total_bullets < 1:
         logger.info("Optimizer skipped: only %d bullets", total_bullets)
         return resume
 
-    resume_json = resume.model_dump_json(exclude_none=True)
-
-    prompt = "请优化以下简历，使其更匹配目标岗位。\n\n"
+    payload = {
+        "experience": [item.model_dump() for item in resume.experience],
+        "research": [item.model_dump() for item in resume.research],
+        "activities": [item.model_dump() for item in resume.activities],
+        "projects": [item.model_dump() for item in resume.projects],
+    }
+    prompt = "请优化以下已校验简历的文字。\n\n"
     if jd_text.strip():
-        prompt += f"【目标岗位】\n{jd_text.strip()[:500]}\n\n"
-    prompt += f"【待优化简历】\n{resume_json}"
+        prompt += f"【目标岗位，仅用于排序和措辞】\n{jd_text.strip()[:1200]}\n\n"
+    prompt += "【只读事实与原始 bullets】\n" + json.dumps(payload, ensure_ascii=False)
 
     try:
         content = call_llm_text(
             OPTIMIZER_SYSTEM_PROMPT,
             prompt,
-            temperature=0.2,
+            temperature=0.0,
             max_tokens=4096,
         )
     except Exception as exc:
@@ -88,36 +167,13 @@ def optimize_resume(resume: CanonicalResume, jd_text: str = "") -> CanonicalResu
 
     parsed = parse_json_content(content)
     if not isinstance(parsed, dict) or not parsed:
-        logger.warning("Optimizer JSON parse failed, len=%d", len(content))
+        logger.warning("Optimizer patch JSON parse failed, len=%d", len(content))
         return resume
 
-    # Strip wrapper key if present
-    if len(parsed) == 1:
-        key = next(iter(parsed))
-        if key in ("resume", "data", "result"):
-            inner = parsed[key]
-            if isinstance(inner, dict):
-                parsed = inner
+    optimized = resume.model_copy(deep=True)
+    accepted = 0
+    for section in ("experience", "research", "activities", "projects"):
+        accepted += _apply_section_patches(optimized, section, parsed.get(section))
 
-    try:
-        optimized = CanonicalResume(**parsed)
-    except Exception as exc:
-        logger.warning("Optimizer output validation failed: %s", exc)
-        return resume
-
-    # Safety check: don't lose content
-    orig_exp = len(resume.experience)
-    opt_exp = len(optimized.experience)
-    orig_proj = len(resume.projects)
-    opt_proj = len(optimized.projects)
-    if opt_exp < orig_exp or opt_proj < orig_proj:
-        logger.warning("Optimizer lost content: exp %d→%d, proj %d→%d, reverting",
-                       orig_exp, opt_exp, orig_proj, opt_proj)
-        return resume
-
-    logger.info("Optimizer done: exp %d, proj %d, bullets %d→%d",
-                opt_exp, opt_proj, total_bullets,
-                sum(len(e.bullets) for e in optimized.experience) +
-                sum(len(e.bullets) for e in optimized.projects) +
-                sum(len(r.bullets) for r in optimized.research))
+    logger.info("Optimizer patches applied: %d/%d bullets", accepted, total_bullets)
     return optimized

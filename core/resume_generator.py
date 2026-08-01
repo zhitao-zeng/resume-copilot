@@ -86,7 +86,7 @@ def generate_resume_from_profile(
     if not resume_data.get("summary") or len(resume_data.get("summary", "").strip()) < 20:
         summary = _build_summary(resume_data, job_family, target_description)
         if summary:
-            resume_data["summary"] = summary[:100]
+            resume_data["summary"] = summary
 
     # Validate
     missing_fields = check_required_fields(resume_data, user_stage)
