@@ -96,6 +96,8 @@ python main.py
 
 ## Docker
 
+本地 API-only 镜像（LLM 由外部服务提供）：
+
 ```bash
 docker build -t resume-copilot-server:acceptance .
 docker run --rm -p 8001:8001 \
@@ -103,6 +105,13 @@ docker run --rm -p 8001:8001 \
   -e MODELHUB_API_KEY=not-needed \
   -e MODELHUB_MODEL_NAME=/models/Qwen3.5-9B-AWQ-4bit \
   resume-copilot-server:acceptance
+```
+
+生产一体化镜像会从 `/model` 自动加载模型，并在容器内依次启动 vLLM 和 API，
+不需要配置 `MODELHUB_BASE_URL`、`MODELHUB_API_KEY` 或 `MODELHUB_MODEL_NAME`：
+
+```bash
+bash build.sh latest
 ```
 
 本地同时启动 vLLM 和业务服务：

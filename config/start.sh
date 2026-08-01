@@ -95,7 +95,7 @@ if ! kill -0 $VLLM_PID 2>/dev/null; then
     exit 1
 fi
 
-# ═══ 模型就绪后启动 Flask ═══
+# ═══ 模型就绪后启动 API ═══
 export MODELHUB_BASE_URL="http://localhost:8000/v1"
 export MODELHUB_API_KEY=not-needed
 export MODELHUB_MODEL_NAME="$MODEL_FOUND"
