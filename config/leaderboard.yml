@@ -1,8 +1,10 @@
+# 最新平台提交配置。
+# 与仓库根目录 leaderboard.yml 保持一致；自动测试会阻止两者漂移。
 inferenceVolumeMounts:
   - name: model
     mountPoint: /model
     source: ceph_customer
-    srcRelativePath: zengzhitao/resume-copilot/models/Qwen3.6-35B-A3B-AWQ
+    srcRelativePath: zengzhitao/resume-copilot/models/Qwen3.5-27B-AWQ
 
 inferenceImage:
   repository: "harbor-contest.4pd.io/zengzhitao/resume-copilot"

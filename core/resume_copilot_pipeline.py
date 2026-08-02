@@ -565,6 +565,22 @@ def _build_targeted_suggestions(
         data["meta"].pop("target_role", None)
         data["meta"].pop("job_intention", None)
     resume_blob = json.dumps(data, ensure_ascii=False).casefold()
+    normalized_resume = re.sub(r"[^\w\u4e00-\u9fff]+", "", resume_blob)
+
+    def keyword_supported(keyword: str) -> bool:
+        normalized = re.sub(r"[^\w\u4e00-\u9fff]+", "", keyword.casefold())
+        if len(normalized) < 2:
+            return False
+        if normalized in normalized_resume:
+            return True
+        target_bigrams = {normalized[index:index + 2] for index in range(len(normalized) - 1)}
+        if not target_bigrams:
+            return False
+        resume_bigrams = {
+            normalized_resume[index:index + 2]
+            for index in range(max(0, len(normalized_resume) - 1))
+        }
+        return len(target_bigrams & resume_bigrams) / len(target_bigrams) >= 0.72
     suggestions: list[str] = []
     focus_items: list[str] = []
     advice_jd = str(jd_text or "")
@@ -595,10 +611,17 @@ def _build_targeted_suggestions(
 
     for focus in focus_items:
         keywords = [item for item in extract_jd_keywords(focus) if len(item.strip()) >= 2]
-        matched = [item for item in keywords if item.casefold() in resume_blob]
-        if matched:
+        matched = [item for item in keywords if keyword_supported(item)]
+        unmatched = [item for item in keywords if item not in matched]
+        if matched and unmatched:
             suggestions.append(
-                f"围绕JD重点“{focus}”，当前已有部分相关表述；建议补充个人具体动作、交付物和可核验结果。"
+                f"JD重点“{focus}”已匹配{'、'.join(matched[:3])}；"
+                f"仍缺{'、'.join(unmatched[:3])}的直接证据，请仅在确有经历时补充具体动作、交付物和结果。"
+            )
+        elif matched:
+            suggestions.append(
+                f"JD重点“{focus}”已有对应证据（{'、'.join(matched[:3])}）；"
+                "建议把最相关的一条经历前置，并补清个人动作、交付物和可核验结果。"
             )
         else:
             suggestions.append(
@@ -638,9 +661,21 @@ def _reply_detail_block(
 ) -> str:
     lines: list[str] = []
     if missing_fields:
-        lines.append(f"缺失或待补充信息（{len(missing_fields)}项）：")
+        unique_items: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
         for item in missing_fields:
+            key = (str(item.get("field", "")), str(item.get("reason", "")))
+            if key not in seen:
+                seen.add(key)
+                unique_items.append(item)
+        lines.append(f"缺失或待补充信息（{len(unique_items)}项）：")
+        for item in unique_items:
             label = str(item.get("label") or item.get("field") or "字段").strip()
+            field = str(item.get("field", ""))
+            indexed = re.match(r"(education|experience|projects)\[(\d+)]", field)
+            if indexed:
+                noun = {"education": "段教育", "experience": "段经历", "projects": "个项目"}[indexed.group(1)]
+                label += f"（第{int(indexed.group(2)) + 1}{noun}）"
             reason = str(item.get("reason", "")).strip()
             lines.append(f"- {label}：{reason}" if reason else f"- {label}")
     if targeted_suggestions:

@@ -10,13 +10,13 @@ import time
 import unicodedata
 
 from v2_schemas import VerifiedResult, CanonicalResume, DraftResume, Meta, Change
-from source_adapter import build_source_bundle
+from source_adapter import build_source_bundle, candidate_blocks
 from resume_composer import compose_resume, compose_from_query
 from resume_verifier import verify_resume
 from resume_verifier import _ground_fixed_fields, _reclassify_non_work
-from resume_optimizer import optimize_resume
+from resume_optimizer import optimize_resume, _introduces_unsupported_fact
 from v2_validator import validate_resume
-from evidence_binding import bind_resume_evidence, enforce_resume_evidence
+from evidence_binding import bind_resume_evidence, enforce_resume_evidence, measure_source_coverage
 import resume_product_logic as product_logic
 
 logger = logging.getLogger(__name__)
@@ -34,6 +34,37 @@ def _is_empty_resume(resume: CanonicalResume) -> bool:
         resume.projects,
         resume.skills.items,
         resume.summary,
+        resume.awards,
+        resume.publications,
+        resume.patents,
+        resume.certifications,
+        resume.training,
+        resume.teaching,
+        resume.additional_sections,
+    ))
+
+
+def _has_candidate_profile(resume: CanonicalResume) -> bool:
+    """Whether any candidate fact remains after grounding and evidence gates."""
+
+    return any((
+        resume.meta.name,
+        resume.meta.phone,
+        resume.meta.email,
+        resume.meta.work_experience,
+        resume.education,
+        resume.experience,
+        resume.research,
+        resume.activities,
+        resume.projects,
+        resume.skills.items,
+        resume.awards,
+        resume.publications,
+        resume.patents,
+        resume.certifications,
+        resume.training,
+        resume.teaching,
+        resume.additional_sections,
     ))
 
 
@@ -157,7 +188,8 @@ def _ground_bullets(resume: CanonicalResume, evidence_text: str) -> CanonicalRes
                     continue
                 upgraded = _action_level(value) > _action_level(source)
                 unsupported_result = any(term in value and term not in source for term in _RESULT_CLAIMS)
-                if upgraded or unsupported_result:
+                unsupported_fact = _introduces_unsupported_fact(source, value)
+                if upgraded or unsupported_result or unsupported_fact:
                     logger.info("Restored source wording for over-claimed bullet: %s", value[:80])
                     value = source
                 if value not in safe_bullets:
@@ -195,7 +227,13 @@ def _bullet_priority(text: str, target_context: str = "") -> tuple[int, int, int
     quantified_change = int(bool(_QUANTIFIED_CHANGE.search(value)))
     result_signal = int(bool(_RESULT_SIGNAL.search(value)))
     numeric = int(bool(re.search(r"\d", value)))
-    evidence_density = quantified_change * 4 + result_signal * 2 + numeric
+    percentage = int(bool(re.search(r"\d+(?:\.\d+)?\s*%", value)))
+    monetary = int(bool(re.search(r"\d+(?:\.\d+)?\s*(?:万|亿)?元", value)))
+    multiple_metrics = int(len(re.findall(r"\d+(?:\.\d+)?", value)) >= 2)
+    evidence_density = (
+        quantified_change * 4 + result_signal * 2 + numeric
+        + percentage * 3 + monetary * 3 + multiple_metrics * 2
+    )
     # A verified before/after result should normally lead a project even when
     # a descriptive bullet repeats more JD keywords.  Very strong relevance
     # can still win through the combined score.
@@ -261,9 +299,7 @@ def _deterministic_verify_draft(
 ) -> VerifiedResult | None:
     """Accept a clean Composer draft without paying for a second LLM call."""
 
-    candidate_evidence = "\n".join(
-        block.text for block in source.blocks if block.source_type in {"resume", "query"}
-    )
+    candidate_evidence = "\n".join(block.text for block in candidate_blocks(source))
     data = draft.model_dump()
     _ground_fixed_fields(data, candidate_evidence)
     _reclassify_non_work(data, candidate_evidence)
@@ -275,6 +311,15 @@ def _deterministic_verify_draft(
     resume, bindings, removed = enforce_resume_evidence(resume, source)
     resume = _compact_canonical(resume)
     if _is_empty_resume(resume) or len(bindings) < 3:
+        return None
+    coverage, missing_blocks = measure_source_coverage(source, bindings)
+    content_block_count = len({binding.block_id for binding in bindings}) + len(missing_blocks)
+    if content_block_count >= 5 and coverage < 0.75:
+        logger.info(
+            "V2 | Deterministic verifier rejected draft: source coverage %.1f%%, missing=%s",
+            coverage * 100,
+            missing_blocks[:8],
+        )
         return None
     if len(removed) > max(2, int(len(bindings) * 0.15)):
         logger.info("V2 | Deterministic verifier rejected draft: %d unbound claims", len(removed))
@@ -321,6 +366,12 @@ def _build_evidence_summary(resume: CanonicalResume) -> str:
         resume.activities,
         resume.projects,
         resume.awards,
+        resume.publications,
+        resume.patents,
+        resume.certifications,
+        resume.training,
+        resume.teaching,
+        resume.additional_sections,
     )):
         return ""
 
@@ -328,8 +379,8 @@ def _build_evidence_summary(resume: CanonicalResume) -> str:
     if resume.education:
         edu = resume.education[0]
         school = edu.school.strip()
-        qualification = "".join(part.strip() for part in (edu.major, edu.degree) if part.strip())
-        education_text = "".join(part for part in (school, qualification) if part)
+        qualification = "、".join(part.strip() for part in (edu.major, edu.degree) if part.strip())
+        education_text = "，".join(part for part in (school, qualification) if part)
         if education_text:
             candidates.append(education_text)
 
@@ -356,6 +407,13 @@ def _build_evidence_summary(resume: CanonicalResume) -> str:
     achievement = _best_achievement(resume)
     if achievement:
         candidates.append("代表成果：" + achievement)
+
+    if resume.publications:
+        candidates.append(f"论文成果{len(resume.publications)}项")
+    if resume.patents:
+        candidates.append(f"专利成果{len(resume.patents)}项")
+    if resume.certifications:
+        candidates.append("持有" + "、".join(resume.certifications[:2]))
 
     if not experience_bits and not research_bits:
         activity_bits = list(dict.fromkeys(
@@ -395,7 +453,19 @@ def _compact_canonical(resume: CanonicalResume) -> CanonicalResume:
     """Remove blank records/items left by model repair or leakage cleanup."""
 
     data = resume.model_dump()
-    data["awards"] = list(dict.fromkeys(str(v).strip() for v in data.get("awards", []) if str(v).strip()))
+    for section in ("awards", "publications", "patents", "certifications", "training", "teaching"):
+        data[section] = list(dict.fromkeys(
+            str(v).strip() for v in data.get(section, []) if str(v).strip()
+        ))
+    additional = data.get("additional_sections") or {}
+    if isinstance(additional, dict):
+        data["additional_sections"] = {
+            str(title).strip(): list(dict.fromkeys(
+                str(v).strip() for v in values if str(v).strip()
+            ))
+            for title, values in additional.items()
+            if str(title).strip() and isinstance(values, list)
+        }
     skills = data.get("skills") or {}
     if isinstance(skills, dict):
         item_indexes: dict[str, int] = {}
@@ -531,6 +601,12 @@ def _deterministic_fallback(cv_text: str, query_text: str, jd_text: str) -> Cano
         "skills": {"items": skill_items},
         "summary": raw.get("summary", ""),
         "awards": raw.get("awards") or raw.get("honors") or [],
+        "publications": raw.get("publications") or [],
+        "patents": raw.get("patents") or [],
+        "certifications": raw.get("certifications") or [],
+        "training": raw.get("training") or [],
+        "teaching": raw.get("teaching") or [],
+        "additional_sections": raw.get("additional_sections") or {},
     })
 
 
@@ -553,6 +629,13 @@ def _canonical_to_v1_format(canonical: CanonicalResume) -> dict:
     for item in data["campus_experience"]:
         if isinstance(item, dict) and "organization" in item:
             item["company"] = item.pop("organization")
+    # Reuse the renderer's research-output section while retaining the patent
+    # type explicitly in display text.
+    if data.get("patents"):
+        data["publications"] = list(data.get("publications") or []) + [
+            value if str(value).startswith("专利") else f"专利：{value}"
+            for value in data.get("patents", []) if str(value).strip()
+        ]
     # Convert flat skills.items to V1 categorized format
     skills = data.get("skills", {})
     if isinstance(skills, dict):
@@ -640,11 +723,7 @@ def run_v2_pipeline(
         # With no structured candidate facts, a polished-sounding summary is
         # misleading.  Keep the target role and ask for missing information in
         # reply_text instead of manufacturing a resume profile.
-        has_profile_records = any((
-            resume.meta.name, resume.meta.phone, resume.meta.email,
-            resume.education, resume.experience, resume.research,
-            resume.activities, resume.projects,
-        ))
+        has_profile_records = _has_candidate_profile(resume)
         if not has_profile_records:
             resume.summary = ""
 
@@ -666,10 +745,16 @@ def run_v2_pipeline(
         evidence_source = build_source_bundle("", query_text, jd_text)
         resume, evidence_bindings, evidence_removed = enforce_resume_evidence(resume, evidence_source)
         resume = _compact_canonical(resume)
+        # Recompute only after unsupported JD-derived records have been
+        # removed. Otherwise temporary model output suppresses the framework
+        # and produces an almost blank document.
+        has_profile_records = _has_candidate_profile(resume)
+        if not has_profile_records:
+            resume.summary = ""
         evidence_bindings = bind_resume_evidence(resume, evidence_source)
         logger.info("V2 | Evidence bindings: %d", len(evidence_bindings))
         resume_dict = _canonical_to_v1_format(resume)
-        if not has_profile_records and jd_text.strip():
+        if not has_profile_records:
             resume_dict["framework"] = _empty_profile_framework(resume.meta.target_role)
         return VerifiedResult(
             resume=resume,
@@ -704,9 +789,7 @@ def run_v2_pipeline(
         result = verify_resume(source, draft)
     else:
         logger.info("V2 | LLM Verifier skipped")
-    candidate_evidence = "\n".join(
-        block.text for block in source.blocks if block.source_type in {"resume", "query"}
-    )
+    candidate_evidence = "\n".join(block.text for block in candidate_blocks(source))
     result.resume = _ground_bullets(result.resume, candidate_evidence)
     if _is_empty_resume(result.resume):
         logger.warning("V2 verifier produced an empty resume; using deterministic source fallback")
@@ -747,8 +830,39 @@ def run_v2_pipeline(
         for path in evidence_removed
     )
     result.resume = _compact_canonical(result.resume)
-    result.resume_dict = _canonical_to_v1_format(result.resume)
     result.evidence_bindings = bind_resume_evidence(result.resume, source)
+    coverage, missing_blocks = measure_source_coverage(source, result.evidence_bindings)
+    content_block_count = len({binding.block_id for binding in result.evidence_bindings}) + len(missing_blocks)
+    if content_block_count >= 5 and coverage < 0.62:
+        # Prefer a less polished deterministic parse only when it demonstrably
+        # preserves substantially more of the source. This prevents a valid
+        # long resume from collapsing to a few attractive bullets.
+        try:
+            fallback = _deterministic_fallback(cv_text, query_text, jd_text)
+            fallback = _ground_bullets(fallback, candidate_evidence)
+            fallback, fallback_bindings, _ = enforce_resume_evidence(fallback, source)
+            fallback = _compact_canonical(fallback)
+            fallback_bindings = bind_resume_evidence(fallback, source)
+            fallback_coverage, _ = measure_source_coverage(source, fallback_bindings)
+            if fallback_coverage >= coverage + 0.10:
+                logger.warning(
+                    "V2 | Replaced low-coverage result with source-preserving fallback: %.1f%% -> %.1f%%",
+                    coverage * 100,
+                    fallback_coverage * 100,
+                )
+                result.resume = fallback
+                result.evidence_bindings = fallback_bindings
+                result.changes.append(Change(
+                    path="*",
+                    action="replace",
+                    reason="Source coverage repair used the more complete deterministic parse",
+                ))
+                coverage = fallback_coverage
+        except Exception as exc:
+            logger.warning("V2 | Source coverage fallback failed: %s", exc)
+    if missing_blocks:
+        logger.info("V2 | Final source coverage %.1f%%, missing=%s", coverage * 100, missing_blocks[:8])
+    result.resume_dict = _canonical_to_v1_format(result.resume)
     logger.info("V2 | Evidence bindings: %d", len(result.evidence_bindings))
 
     logger.info("V2 | Total: %.1fs (Composer+Verifier+Validate+Format)",

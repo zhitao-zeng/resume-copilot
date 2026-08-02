@@ -13,6 +13,7 @@ from typing import Any
 
 from prompts import RESUME_COMPOSER_SYSTEM_PROMPT, GEN_COMPOSER_SYSTEM_PROMPT
 from server_runtime import call_llm_typed, llm_enabled
+from source_adapter import candidate_blocks
 from v2_schemas import SourceBundle, DraftResume, CanonicalResume
 
 logger = logging.getLogger(__name__)
@@ -40,13 +41,21 @@ def _build_source_text(source: SourceBundle) -> str:
 
     query_texts = [
         f"[{b.block_id}{'|section=' + b.section_hint if b.section_hint else ''}] {b.text}"
-        for b in source.blocks if b.source_type == "query"
+        for b in candidate_blocks(source) if b.source_type == "query"
     ]
     if query_texts:
-        evidence_parts.append("-- USER QUERY --\n" + "\n".join(query_texts))
+        evidence_parts.append("-- EXPLICIT CANDIDATE FACT ADDITIONS --\n" + "\n".join(query_texts))
 
     if evidence_parts:
         parts.append("## CANDIDATE EVIDENCE (facts)\n" + "\n\n".join(evidence_parts))
+
+    direction_texts = [
+        f"[{b.block_id}] {b.text}"
+        for b in source.blocks if b.source_type == "query" and not b.fact_eligible
+    ]
+    if direction_texts:
+        parts.append("## USER DIRECTIONS (instructions only — NOT candidate facts)\n"
+                     + "\n".join(direction_texts))
 
     # Section 2: Target Context (JD only)
     jd_texts = [
@@ -60,41 +69,102 @@ def _build_source_text(source: SourceBundle) -> str:
     return "\n\n".join(parts)
 
 
+def _split_source_bundle(source: SourceBundle, max_fact_chars: int = 6000) -> list[SourceBundle]:
+    """Chunk long candidate evidence without splitting individual source lines."""
+
+    factual = [block for block in source.blocks if block in candidate_blocks(source)]
+    context = [block for block in source.blocks if block not in factual]
+    if sum(len(block.text) for block in factual) <= max_fact_chars:
+        return [source]
+    chunks: list[list] = []
+    current: list = []
+    current_chars = 0
+    for block in factual:
+        size = len(block.text) + 1
+        if current and current_chars + size > max_fact_chars:
+            chunks.append(current)
+            current = []
+            current_chars = 0
+        current.append(block)
+        current_chars += size
+    if current:
+        chunks.append(current)
+    # Target/instruction context is capped and repeated so every extraction
+    # chunk applies the same source-isolation rules and target direction.
+    shared_context = []
+    context_chars = 0
+    for block in context:
+        if context_chars + len(block.text) > 1800:
+            break
+        shared_context.append(block)
+        context_chars += len(block.text) + 1
+    return [SourceBundle(blocks=list(chunk) + shared_context) for chunk in chunks]
+
+
+def _merge_drafts(drafts: list[DraftResume]) -> DraftResume:
+    """Merge independently extracted chunks without inventing cross-chunk facts."""
+
+    if not drafts:
+        return DraftResume()
+    merged = drafts[0].model_copy(deep=True)
+    for draft in drafts[1:]:
+        for field in ("name", "phone", "email", "target_role", "work_experience"):
+            if not getattr(merged.meta, field) and getattr(draft.meta, field):
+                setattr(merged.meta, field, getattr(draft.meta, field))
+        for section in ("education", "experience", "research", "activities", "projects"):
+            getattr(merged, section).extend(getattr(draft, section))
+        merged.skills.items.extend(draft.skills.items)
+        for section in ("awards", "publications", "patents", "certifications", "training", "teaching"):
+            getattr(merged, section).extend(getattr(draft, section))
+        for title, items in draft.additional_sections.items():
+            merged.additional_sections.setdefault(title, []).extend(items)
+        if not merged.summary and draft.summary:
+            merged.summary = draft.summary
+    return merged
+
+
 def compose_resume(source: SourceBundle) -> DraftResume:
     """Call LLM to extract structured resume from source material."""
     if not llm_enabled():
         return DraftResume()
 
-    source_text = _build_source_text(source)
-
-    prompt = (
-        "请从以下材料中完整提取简历信息。注意材料分为两部分：\n"
-        "1) CANDIDATE EVIDENCE：候选人的简历原文和用户补充，这是事实来源。\n"
-        "2) TARGET CONTEXT：目标岗位描述，只做参考。\n\n"
-        "【材料】\n"
-        f"{source_text}"
-    )
-
-    try:
-        parsed = call_llm_typed(
-            DraftResume,
-            RESUME_COMPOSER_SYSTEM_PROMPT,
-            prompt,
-            temperature=0.0,
-            max_tokens=4096,
+    drafts: list[DraftResume] = []
+    chunks = _split_source_bundle(source)
+    for chunk_index, chunk in enumerate(chunks):
+        source_text = _build_source_text(chunk)
+        prompt = (
+            "请从以下材料中完整提取简历信息。注意材料分为两部分：\n"
+            "1) CANDIDATE EVIDENCE：候选人的简历原文和用户明确补充，这是事实来源。\n"
+            "2) USER DIRECTIONS/TARGET CONTEXT：只做编辑和目标参考，不是候选人事实。\n\n"
+            "【材料】\n"
+            f"{source_text}"
         )
-    except Exception as exc:
-        logger.warning("ResumeComposer LLM call failed: %s", exc)
+        try:
+            parsed = call_llm_typed(
+                DraftResume,
+                RESUME_COMPOSER_SYSTEM_PROMPT,
+                prompt,
+                temperature=0.0,
+                max_tokens=4096,
+            )
+        except Exception as exc:
+            logger.warning("ResumeComposer chunk %d/%d failed: %s", chunk_index + 1, len(chunks), exc)
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        try:
+            drafts.append(DraftResume(**parsed))
+        except Exception as exc:
+            logger.warning(
+                "ResumeComposer chunk %d/%d validation failed: %s",
+                chunk_index + 1,
+                len(chunks),
+                exc,
+            )
+    if not drafts:
         return DraftResume()
-
-    if not isinstance(parsed, dict):
-        return DraftResume()
-
-    try:
-        return DraftResume(**parsed)
-    except Exception as exc:
-        logger.warning("ResumeComposer output validation failed: %s", exc)
-        return DraftResume()
+    logger.info("ResumeComposer extracted %d chunk(s)", len(drafts))
+    return _merge_drafts(drafts)
 
 
 def compose_from_query(query_text: str, jd_text: str) -> CanonicalResume:

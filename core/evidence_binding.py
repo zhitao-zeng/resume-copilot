@@ -8,7 +8,25 @@ from __future__ import annotations
 import re
 import unicodedata
 
+from source_adapter import candidate_blocks
 from v2_schemas import CanonicalResume, EvidenceBinding, SourceBlock, SourceBundle
+
+
+_SOURCE_HEADINGS = {
+    "个人总结", "个人简介", "职业概述", "自我评价", "教育经历", "教育背景", "学历信息",
+    "工作经历", "实习经历", "任职经历", "职业经历", "科研经历", "研究经历", "实验室经历",
+    "项目经历", "项目经验", "课程项目", "个人项目", "开源项目", "校园经历", "社团经历",
+    "志愿经历", "社会实践", "学生工作", "专业技能", "技能清单", "技术栈", "工具", "语言能力",
+    "荣誉奖项", "荣誉与奖项", "获奖经历", "奖项", "论文", "论文发表", "论文成果", "学术成果",
+    "出版物", "专利", "专利成果", "证书", "证书与资质", "职业资格", "执业资格", "执照",
+    "培训经历", "进修经历", "教学经历", "授课经历", "培养经历",
+    "学术会议", "会议经历", "专业会员", "专业组织", "专著", "作品集", "作品经历",
+}
+
+_NON_RECORD_SECTION_HINTS = {
+    "summary", "skills", "awards", "publications", "patents",
+    "certifications", "training", "teaching",
+}
 
 
 def _normalize(value: str) -> str:
@@ -91,10 +109,99 @@ def _bind(path: str, value: str, blocks: list[SourceBlock], *, minimum: float = 
     )
 
 
+def _record_scope_key(
+    block: SourceBlock,
+    source: SourceBundle,
+    section: str,
+) -> str | None:
+    """Resolve a source block to the surrounding dated record.
+
+    Resume extraction keeps one source line per block. A record header usually
+    contains its period, while following lines contain bullets. Assigning every
+    block to the nearest preceding dated header lets us detect impossible
+    combinations such as an organization from one job and a role from the next
+    job. Lines before the first dated header belong to that first record so
+    layouts with organization/title above the date remain supported.
+    """
+
+    eligible = candidate_blocks(source)
+    section_blocks = [
+        item for item in eligible
+        if item.source_type == block.source_type and item.section_hint == section
+    ]
+    if not section_blocks:
+        # Without structural hints, record boundaries are too ambiguous to
+        # enforce safely. Field-level grounding still applies.
+        return None
+    anchors = [item for item in section_blocks if _date_signature(item.text)]
+    if not anchors:
+        return None
+    order = {item.block_id: index for index, item in enumerate(source.blocks)}
+    block_index = order.get(block.block_id, -1)
+    preceding = [item for item in anchors if order.get(item.block_id, -1) <= block_index]
+    anchor = preceding[-1] if preceding else anchors[0]
+    return f"{block.source_type}:{section}:{anchor.block_id}"
+
+
+def _find_incoherent_records(
+    resume: CanonicalResume,
+    source: SourceBundle,
+    blocks: list[SourceBlock],
+) -> dict[str, set[int]]:
+    """Find records whose identity fields resolve to different source records."""
+
+    block_by_id = {block.block_id: block for block in blocks}
+    section_fields = {
+        "education": ("school", "degree", "major", "period"),
+        "experience": ("organization", "role", "period"),
+        "research": ("institution", "topic", "period"),
+        "activities": ("organization", "role", "period"),
+        "projects": ("name", "organization", "role", "period"),
+    }
+    incoherent: dict[str, set[int]] = {section: set() for section in section_fields}
+    for section, fields in section_fields.items():
+        for index, record in enumerate(getattr(resume, section)):
+            scopes: set[str] = set()
+            explicit_hints: set[str] = set()
+            for field in fields:
+                value = str(getattr(record, field, "") or "").strip()
+                if not value:
+                    continue
+                binding = _bind(f"{section}[{index}].{field}", value, blocks, minimum=0.65)
+                if binding is None:
+                    continue
+                source_block = block_by_id.get(binding.block_id)
+                if source_block is None:
+                    continue
+                if source_block.section_hint:
+                    explicit_hints.add(source_block.section_hint)
+                scope = _record_scope_key(source_block, source, section)
+                if scope:
+                    scopes.add(scope)
+            if hasattr(record, "bullets"):
+                for bullet_index, value in enumerate(record.bullets):
+                    binding = _bind(
+                        f"{section}[{index}].bullets[{bullet_index}]",
+                        str(value),
+                        blocks,
+                        minimum=0.30,
+                    )
+                    source_block = block_by_id.get(binding.block_id) if binding else None
+                    if source_block and source_block.section_hint:
+                        explicit_hints.add(source_block.section_hint)
+            if len(scopes) > 1:
+                incoherent[section].add(index)
+            elif explicit_hints and explicit_hints.issubset(_NON_RECORD_SECTION_HINTS):
+                # A publication/certificate/training line may not be duplicated
+                # as a fabricated work, project, or research record.
+                incoherent[section].add(index)
+    return incoherent
+
+
 def bind_resume_evidence(resume: CanonicalResume, source: SourceBundle) -> list[EvidenceBinding]:
     """Bind final fields and bullets to Resume/Query blocks, never JD blocks."""
 
-    blocks = [block for block in source.blocks if block.source_type in {"resume", "query"}]
+    blocks = candidate_blocks(source)
     bindings: list[EvidenceBinding] = []
 
     def add(path: str, value: str, minimum: float = 0.22) -> None:
@@ -124,6 +231,12 @@ def bind_resume_evidence(resume: CanonicalResume, source: SourceBundle) -> list[
         add(f"skills.items[{index}].name", skill.name, 0.8)
     for index, award in enumerate(resume.awards):
         add(f"awards[{index}]", award, 0.8)
+    for section in ("publications", "patents", "certifications", "training", "teaching"):
+        for index, value in enumerate(getattr(resume, section)):
+            add(f"{section}[{index}]", value, 0.65)
+    for title, items in resume.additional_sections.items():
+        for index, value in enumerate(items):
+            add(f"additional_sections.{title}[{index}]", value, 0.65)
     return bindings
 
 
@@ -141,10 +254,8 @@ def enforce_resume_evidence(
     gated = resume.model_copy(deep=True)
     initial = bind_resume_evidence(gated, source)
     bound_paths = {binding.path for binding in initial}
-    candidate_blocks = [
-        block for block in source.blocks
-        if block.source_type in {"resume", "query"}
-    ]
+    eligible_blocks = candidate_blocks(source)
+    incoherent_records = _find_incoherent_records(gated, source, eligible_blocks)
     removed: list[str] = []
 
     for key in ("name", "phone", "email", "work_experience"):
@@ -162,6 +273,9 @@ def enforce_resume_evidence(
     }
     for section, fields in section_fields.items():
         for index, record in enumerate(getattr(gated, section)):
+            if index in incoherent_records[section]:
+                removed.append(f"{section}[{index}]")
+                continue
             for field in fields:
                 path = f"{section}[{index}].{field}"
                 if getattr(record, field) and path not in bound_paths:
@@ -172,12 +286,18 @@ def enforce_resume_evidence(
             kept_bullets: list[str] = []
             for bullet_index, bullet in enumerate(record.bullets):
                 path = f"{section}[{index}].bullets[{bullet_index}]"
-                binding = _bind(path, bullet, candidate_blocks, minimum=0.30)
+                binding = _bind(path, bullet, eligible_blocks, minimum=0.30)
                 if binding is None:
                     removed.append(path)
                 else:
                     kept_bullets.append(bullet)
             record.bullets = kept_bullets
+
+        if incoherent_records[section]:
+            setattr(gated, section, [
+                record for index, record in enumerate(getattr(gated, section))
+                if index not in incoherent_records[section]
+            ])
 
     kept_skills = []
     for index, skill in enumerate(gated.skills.items):
@@ -197,5 +317,55 @@ def enforce_resume_evidence(
             removed.append(path)
     gated.awards = kept_awards
 
+    for section in ("publications", "patents", "certifications", "training", "teaching"):
+        kept_values: list[str] = []
+        for index, value in enumerate(getattr(gated, section)):
+            path = f"{section}[{index}]"
+            if path in bound_paths:
+                kept_values.append(value)
+            else:
+                removed.append(path)
+        setattr(gated, section, kept_values)
+
+    kept_additional: dict[str, list[str]] = {}
+    for title, items in gated.additional_sections.items():
+        kept_items: list[str] = []
+        for index, value in enumerate(items):
+            path = f"additional_sections.{title}[{index}]"
+            if path in bound_paths:
+                kept_items.append(value)
+            else:
+                removed.append(path)
+        if kept_items:
+            kept_additional[title] = kept_items
+    gated.additional_sections = kept_additional
+
     bindings = bind_resume_evidence(gated, source)
     return gated, bindings, removed
+
+
+def measure_source_coverage(
+    source: SourceBundle,
+    bindings: list[EvidenceBinding],
+) -> tuple[float, list[str]]:
+    """Measure source-line coverage in the generated resume.
+
+    This is the reverse of hallucination checking: it detects factual source
+    lines that disappeared entirely. Headings are excluded because they are
+    structure rather than candidate facts.
+    """
+
+    content_blocks: list[SourceBlock] = []
+    for block in candidate_blocks(source):
+        compact = re.sub(r"[\s:：|｜/\\【】\[\]()（）]+", "", block.text)
+        if not compact or compact in _SOURCE_HEADINGS:
+            continue
+        if len(compact) < 3:
+            continue
+        content_blocks.append(block)
+    if not content_blocks:
+        return 1.0, []
+    covered = {binding.block_id for binding in bindings}
+    missing = [block.block_id for block in content_blocks if block.block_id not in covered]
+    ratio = (len(content_blocks) - len(missing)) / len(content_blocks)
+    return round(ratio, 4), missing

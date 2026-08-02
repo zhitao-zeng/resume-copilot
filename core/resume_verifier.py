@@ -12,6 +12,7 @@ import unicodedata
 from prompts import RESUME_VERIFIER_SYSTEM_PROMPT
 from server_runtime import call_llm_text, llm_enabled
 from llm_gateway import parse_json_content
+from source_adapter import candidate_blocks
 from v2_schemas import (
     SourceBundle, DraftResume, VerifiedResult, CanonicalResume,
     Change, Meta, Education, Experience, Project,
@@ -131,6 +132,23 @@ def _ground_fixed_fields(parsed: dict, evidence_text: str) -> None:
             str(item).strip() for item in awards
             if str(item).strip() and _has_positive_evidence(str(item), evidence_text)
         ]
+    for section in ("publications", "patents", "certifications", "training", "teaching"):
+        values = parsed.get(section)
+        if isinstance(values, list):
+            parsed[section] = [
+                str(item).strip() for item in values
+                if str(item).strip() and _has_positive_evidence(str(item), evidence_text)
+            ]
+    additional = parsed.get("additional_sections")
+    if isinstance(additional, dict):
+        parsed["additional_sections"] = {
+            str(title).strip(): [
+                str(item).strip() for item in values
+                if str(item).strip() and _has_positive_evidence(str(item), evidence_text)
+            ]
+            for title, values in additional.items()
+            if str(title).strip() and isinstance(values, list)
+        }
 
 
 def _reclassify_non_work(parsed: dict, evidence_text: str) -> None:
@@ -233,7 +251,11 @@ def verify_resume(source: SourceBundle, draft: DraftResume) -> VerifiedResult:
                 logger.info("ResumeVerifier unwrapped key %s", wrapped_key)
 
     # Detect if LLM nested all content under meta (e.g. {"meta": {"name":"", "education":[...]}})
-    TOP_LEVEL_KEYS = {"education", "experience", "research", "activities", "projects", "skills", "summary"}
+    TOP_LEVEL_KEYS = {
+        "education", "experience", "research", "activities", "projects", "skills", "summary",
+        "awards", "publications", "patents", "certifications", "training", "teaching",
+        "additional_sections",
+    }
     meta = parsed.get("meta")
     if isinstance(meta, dict):
         for key in TOP_LEVEL_KEYS:
@@ -330,7 +352,7 @@ def verify_resume(source: SourceBundle, draft: DraftResume) -> VerifiedResult:
 
     # ── JD isolation: values only in JD text → clear ──
     jd_text = "\n".join(b.text for b in source.blocks if b.source_type == "jd")
-    resume_query_text = "\n".join(b.text for b in source.blocks if b.source_type in ("resume", "query"))
+    resume_query_text = "\n".join(b.text for b in candidate_blocks(source))
     if jd_text.strip():
         for entry in parsed.get("experience", []):
             if not isinstance(entry, dict):
@@ -429,6 +451,13 @@ def verify_resume(source: SourceBundle, draft: DraftResume) -> VerifiedResult:
         if draft_items:
             logger.info("ResumeVerifier restored skills from draft (%d items)", len(draft_items))
             parsed["skills"] = draft_skills
+    for section in (
+        "publications", "patents", "certifications", "training", "teaching", "additional_sections",
+    ):
+        draft_value = getattr(draft, section)
+        if draft_value and not parsed.get(section):
+            parsed[section] = draft_value
+            logger.info("ResumeVerifier restored %s from draft", section)
 
     # The LLM verifier is advisory; immutable facts are grounded again in
     # code against candidate evidence (resume + factual user additions).

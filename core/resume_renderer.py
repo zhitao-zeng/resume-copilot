@@ -216,29 +216,14 @@ def _compress_resume_data_for_docx(resume_data: dict[str, Any]) -> dict[str, Any
 
 
 def _tighten_resume_data_for_layout(resume_data: dict[str, Any]) -> dict[str, Any]:
-    """Conservative fallback used only for genuinely excessive documents."""
+    """Return retry data without deleting verified resume content.
 
-    data = copy.deepcopy(resume_data)
-    summary = str(data.get("summary", "") or "").strip()
-    if len(summary) > 80:
-        boundary = max(summary.rfind(mark, 0, 81) for mark in "。！？；")
-        data["summary"] = summary[:boundary + 1] if boundary >= 45 else summary[:77].rstrip("，,；; ") + "..."
-    # Preserve substantially more core evidence than the old global two-item
-    # cap.  Peripheral campus content is shortened first.
-    limits = {"experience": 5, "research": 5, "projects": 5, "campus_experience": 3}
-    for section, limit in limits.items():
-        records = data.get(section, [])
-        if not isinstance(records, list):
-            continue
-        for record in records:
-            if isinstance(record, dict) and isinstance(record.get("bullets"), list):
-                record["bullets"] = record["bullets"][:limit]
-    skills = data.get("skills")
-    if isinstance(skills, dict):
-        for key, values in skills.items():
-            if isinstance(values, list):
-                skills[key] = values[:10]
-    return data
+    Multi-page resumes are valid. Layout retries may tighten typography and
+    pagination rules, but must never shorten summaries, bullets, skills, or
+    sections behind the user's back.
+    """
+
+    return copy.deepcopy(resume_data)
 
 
 def _collect_profile_items(meta: Any) -> list[tuple[str, str]]:
@@ -775,6 +760,12 @@ def _build_resume_html(resume_data: dict[str, Any], template: str = "classic") -
     if personal_skill_items:
         rows = "".join(f"<li>{_html_escape(item)}</li>" for item in personal_skill_items)
         section_personal_skills = f'<section><h2>个人技能</h2><ul class="bullets">{rows}</ul></section>'
+    section_additional = "".join(
+        f'<section><h2>{_html_escape(title)}</h2><ul class="bullets">'
+        + "".join(f"<li>{_html_escape(item)}</li>" for item in items)
+        + "</ul></section>"
+        for title, items in _collect_additional_sections(resume_data)
+    )
 
     return f"""<!doctype html>
 <html lang="en">
@@ -972,6 +963,7 @@ def _build_resume_html(resume_data: dict[str, Any], template: str = "classic") -
     {section_pubs}
     {section_honors}
     {section_personal_skills}
+    {section_additional}
   </main>
 </body>
 </html>"""
@@ -1069,8 +1061,6 @@ def analyze_pdf_layout(pdf_path: Path) -> dict[str, Any]:
             last = report["page_char_counts"][-1]
             report["sparse_last_page"] = last < 140 or last < previous * 0.22
 
-        if report["page_count"] > 3:
-            report["issues"].append("more_than_three_pages")
         if report["blank_pages"]:
             report["issues"].append("blank_page")
         if report["orphan_headings"]:
@@ -1124,7 +1114,7 @@ def _layout_needs_tightening(report: dict[str, Any]) -> bool:
     return bool(report.get("available")) and any(
         issue in report.get("issues", [])
         for issue in (
-            "more_than_three_pages", "core_experience_not_on_first_page",
+            "core_experience_not_on_first_page",
             "blank_page", "sparse_last_page",
         )
     )
@@ -1137,10 +1127,8 @@ def _layout_retry_data(
     """Choose whether a retry may compact content or typography only."""
 
     issues = set(report.get("issues", []))
-    if issues & {"more_than_three_pages", "core_experience_not_on_first_page"}:
-        return _tighten_resume_data_for_layout(resume_data)
-    # Sparse/blank tail pages are pagination problems.  Preserve every item
-    # and let the retry use slightly tighter typography instead.
+    # All layout problems are typography/pagination problems. Preserve every
+    # verified item and let the retry use slightly tighter typography instead.
     return copy.deepcopy(resume_data)
 
 
@@ -1273,6 +1261,27 @@ def _append_docx_text_section(doc: DocxDocument, title: str, items: list[str], t
     for item in clean:
         p = doc.add_paragraph(style="List Bullet")
         p.add_run(item)
+
+
+def _collect_additional_sections(resume_data: dict[str, Any]) -> list[tuple[str, list[str]]]:
+    """Collect extensible, evidence-backed sections for every renderer."""
+
+    sections: list[tuple[str, list[str]]] = []
+    for key, title in (("training", "培训与进修"), ("teaching", "教学经历")):
+        values = resume_data.get(key, []) if isinstance(resume_data, dict) else []
+        if isinstance(values, list):
+            clean = [str(value).strip() for value in values if str(value).strip()]
+            if clean:
+                sections.append((title, clean))
+    additional = resume_data.get("additional_sections", {}) if isinstance(resume_data, dict) else {}
+    if isinstance(additional, dict):
+        for title, values in additional.items():
+            if not str(title).strip() or not isinstance(values, list):
+                continue
+            clean = [str(value).strip() for value in values if str(value).strip()]
+            if clean:
+                sections.append((str(title).strip(), clean))
+    return sections
 
 
 def _render_docx_empty_profile_framework(
@@ -1411,6 +1420,8 @@ def _render_docx_minimal(doc: DocxDocument, resume_data: dict[str, Any]) -> None
         _collect_text_entries(resume_data, ("personal_skills",)),
         "minimal",
     )
+    for title, items in _collect_additional_sections(resume_data):
+        _append_docx_text_section(doc, title, items, "minimal")
 
 
 def _render_docx_classic(doc: DocxDocument, resume_data: dict[str, Any]) -> None:
@@ -1592,6 +1603,8 @@ def _render_docx_classic(doc: DocxDocument, resume_data: dict[str, Any]) -> None
         _collect_text_entries(resume_data, ("personal_skills",)),
         "classic",
     )
+    for title, items in _collect_additional_sections(resume_data):
+        _append_docx_text_section(doc, title, items, "classic")
 
 
 def _render_docx_modern(doc: DocxDocument, resume_data: dict[str, Any]) -> None:
@@ -1766,6 +1779,8 @@ def _render_docx_modern(doc: DocxDocument, resume_data: dict[str, Any]) -> None:
         _collect_text_entries(resume_data, ("personal_skills",)),
         "modern",
     )
+    for title, items in _collect_additional_sections(resume_data):
+        _append_docx_text_section(doc, title, items, "modern")
 
 
 def render_docx(
@@ -1818,19 +1833,6 @@ def render_docx(
         if shutil.which("libreoffice")
         else _preview_visual_layout(resume_data, tpl if tpl in SUPPORTED_TEMPLATES else "classic")
     )
-    if _layout_needs_tightening(visual_report):
-        tightened = _tighten_resume_data_for_layout(resume_data)
-        tightened_report = _preview_visual_layout(tightened, tpl)
-        before_pages = int(visual_report.get("page_count", 0) or 0)
-        after_pages = int(tightened_report.get("page_count", 0) or 0)
-        before_issues = len(visual_report.get("issues", []))
-        after_issues = len(tightened_report.get("issues", []))
-        if tightened_report.get("available") and (
-            after_pages < before_pages or after_issues < before_issues
-        ):
-            resume_data = tightened
-            visual_report = tightened_report
-            logger.info("Visual QA tightened layout: pages %d -> %d", before_pages, after_pages)
     if visual_report.get("available"):
         logger.info(
             "Visual QA: pages=%s chars=%s issues=%s",
@@ -2117,6 +2119,14 @@ def _build_renderable_sections(resume_data: dict[str, Any]) -> list[tuple[str, l
         if skill_items:
             sections.append(("专业技能", skill_items))
 
+    publications = resume_data.get("publications", [])
+    if isinstance(publications, list):
+        publication_items = [
+            _publication_line(item) for item in publications if _has_publication_content(item)
+        ]
+        if publication_items:
+            sections.append(("论文与专利成果", publication_items))
+
     # Honors
     honors = []
     for key in ("honors", "awards", "certifications"):
@@ -2132,6 +2142,8 @@ def _build_renderable_sections(resume_data: dict[str, Any]) -> list[tuple[str, l
         personal_skills = [s for s in personal_skills if s]
     if personal_skills:
         sections.append(("个人技能", personal_skills))
+
+    sections.extend(_collect_additional_sections(resume_data))
 
     return sections
 
@@ -2341,6 +2353,15 @@ def _fallback_render_pdf(resume_data: dict[str, Any], output_path: Path, templat
             if isinstance(items, list) and items:
                 lines.append(("body", f"{label}: " + " · ".join(str(x) for x in items)))
 
+    publications = resume_data.get("publications", []) if isinstance(resume_data, dict) else []
+    if isinstance(publications, list):
+        publication_items = [
+            _publication_line(item) for item in publications if _has_publication_content(item)
+        ]
+        if publication_items:
+            lines.append(("section", "论文与专利成果"))
+            lines.extend(("bullet", f"• {item}") for item in publication_items)
+
     honor_items = _collect_text_entries(resume_data, ("honors", "awards", "certifications"))
     if honor_items:
         lines.append(("section", "荣誉与奖项"))
@@ -2352,6 +2373,10 @@ def _fallback_render_pdf(resume_data: dict[str, Any], output_path: Path, templat
         lines.append(("section", "个人技能"))
         for item in personal_skill_items:
             lines.append(("bullet", f"• {item}"))
+
+    for title, items in _collect_additional_sections(resume_data):
+        lines.append(("section", title))
+        lines.extend(("bullet", f"• {item}") for item in items)
 
     pdf = fitz.open()
     page = pdf.new_page(width=595, height=842)

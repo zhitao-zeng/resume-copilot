@@ -793,9 +793,9 @@ async def _resume_copilot_service_impl(
         meta["target_role"] = final_target_role
     else:
         meta.pop("target_role", None)
-    candidate_truth = "\n".join(
-        part for part in (ctx.cv_text, ctx.query_text) if str(part or "").strip()
-    )
+    from source_adapter import build_source_bundle, candidate_blocks
+    truth_bundle = build_source_bundle(ctx.cv_text, ctx.query_text, ctx.jd_text)
+    candidate_truth = "\n".join(block.text for block in candidate_blocks(truth_bundle))
     # Classification happens before the resume is parsed.  Reconcile it with
     # grounded structured fields so a degree mention cannot outweigh several
     # years of full-time work (and internships still remain student evidence).
@@ -820,7 +820,7 @@ async def _resume_copilot_service_impl(
     ctx.missing_fields = check_required_fields(
         ctx.resume_data,
         user_stage=ctx.user_stage,
-        source_text=ctx.cv_text,
+        source_text=candidate_truth,
     )
     logger.info("V2 pipeline done in %.1fs (has_cv=%s), %d missing fields",
                  time.perf_counter() - t_v2, ctx.has_cv, len(ctx.missing_fields))

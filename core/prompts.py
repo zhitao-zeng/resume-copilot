@@ -492,7 +492,13 @@ RESUME_COMPOSER_SYSTEM_PROMPT = """从材料中提取候选人简历信息，输
   "activities": [{"organization": "", "role": "", "period": "", "bullets": ["bullet1"]}],
   "projects": [{"name": "", "organization": "", "role": "", "period": "", "bullets": ["bullet1"]}],
   "skills": {"items": [{"name": "Python", "category": "language"}]},
-  "awards": ["奖项1"]
+  "awards": ["奖项1"],
+  "publications": ["论文原文条目"],
+  "patents": ["专利原文条目"],
+  "certifications": ["证书或执照原文条目"],
+  "training": ["培训或进修原文条目"],
+  "teaching": ["教学原文条目"],
+  "additional_sections": {"其它原文版块名": ["原文条目"]}
 }
 
 【字段类型】
@@ -514,6 +520,8 @@ RESUME_COMPOSER_SYSTEM_PROMPT = """从材料中提取候选人简历信息，输
 - activities：学生会、社团、校园组织、志愿服务等非雇佣经历，不能放入 experience。
 - projects：独立的项目经历（课程设计、个人项目、竞赛项目等）。每个 project 必须有 bullets 描述具体工作内容和成果。
 - awards：奖学金、竞赛获奖、荣誉称号等（如"校级一等奖学金""优秀学生干部""全国大学生创新创业大赛三等奖"）。
+- publications/patents/certifications/training/teaching：按原文逐条保留，不得塞入工作或科研 bullets。
+- additional_sections：用于作品集、会议、专业会员、专著、行业特有资质等无法高置信归类的真实版块；保留原版块名和原文条目。
 - dates：只提取原文明确出现的日期。不要根据学历时间推断项目日期。project/research 的 period 必须有直接来源，不能从 education period 复制。
 - summary：只概括候选人已提供的教育、任职、项目、科研和技能事实。TARGET CONTEXT 中的要求不能写成候选人已有经验；禁用“扎实、敏锐、优秀、热爱、致力于、较强能力”等无证据评价。
 - bullets：保留原文的完整描述，包括具体数字、技术名称、项目细节、成果指标。不要压缩、简化或概括原文内容。原文有多详细就保留多详细。表达优化由后续逐条编辑器完成，本阶段只负责完整抽取。
@@ -534,7 +542,13 @@ GEN_COMPOSER_SYSTEM_PROMPT = """你是一位简历生成专家。当用户没有
   "activities": [{"organization": "", "role": "", "period": "", "bullets": ["bullet1"]}],
   "projects": [{"name": "", "organization": "", "role": "", "period": "", "bullets": ["bullet1"]}],
   "skills": {"items": [{"name": "Python", "category": "language"}]},
-  "awards": ["奖项1"]
+  "awards": ["奖项1"],
+  "publications": ["论文原文条目"],
+  "patents": ["专利原文条目"],
+  "certifications": ["证书或执照原文条目"],
+  "training": ["培训或进修原文条目"],
+  "teaching": ["教学原文条目"],
+  "additional_sections": {"其它原文版块名": ["原文条目"]}
 }
 
 【生成规则】
@@ -545,6 +559,7 @@ GEN_COMPOSER_SYSTEM_PROMPT = """你是一位简历生成专家。当用户没有
 5. education.school：学校名不确定就留空，不要编造。学历如未指定也留空
 6. summary：2-3 句中文客观概述用户背景和方向，直接描述不要用「我是一名...」开头
 7. skills：不依赖行业词典，抽取用户明确提到的原始技能名称。category 用：language, framework, tool, domain, methodology, certification, natural_language, other；无法判断时用 other，不要丢弃或猜成 tool
+7a. 论文、专利、证书/执照、培训、教学必须进入对应字段；其它行业特有版块进入 additional_sections，不得丢失或塞进工作职责。
 8. 硬约束：
    - 禁止编造用户没提到的公司名、学校名、数字结果（百分比/金额/人数）
    - 禁止编造姓名、电话、邮箱
@@ -567,7 +582,13 @@ RESUME_VERIFIER_SYSTEM_PROMPT = """校验 DraftResume，输出严格嵌套的 JS
   "activities": [{"organization": "", "role": "", "period": "", "bullets": ["bullet1"]}],
   "projects": [{"name": "", "organization": "", "role": "", "period": "", "bullets": ["bullet1"]}],
   "skills": {"items": [{"name": "Python", "category": "language"}]},
-  "awards": ["奖项1"]
+  "awards": ["奖项1"],
+  "publications": ["论文原文条目"],
+  "patents": ["专利原文条目"],
+  "certifications": ["证书或执照原文条目"],
+  "training": ["培训或进修原文条目"],
+  "teaching": ["教学原文条目"],
+  "additional_sections": {"其它原文版块名": ["原文条目"]}
 }
 
 【来源隔离规则（必须遵守）】
@@ -586,6 +607,7 @@ RESUME_VERIFIER_SYSTEM_PROMPT = """校验 DraftResume，输出严格嵌套的 JS
 - organization/role/school/degree/major：原文 Resume 或 Query 中出现过（含子串）→ 保留原文值。否则清空。
 - bullets/projects/research/activities/skills/summary：保留 DraftResume 原值，不要增减、简化或压缩。bullets 的原始详细程度必须完整保留。
 - skills.items 每条 skill 包含 name + category。category 使用 language/framework/tool/domain/methodology/certification/natural_language/other；不认识的行业术语保留 name 并标为 other。
+- publications/patents/certifications/training/teaching/additional_sections：逐条保留 DraftResume 原值，禁止移入其它经历或压缩。
 - **记录级判定**：一条 experience/education 只要部分字段有证据（如 bullet 内容真实），就保留整条记录，只清空无证据的字段。不要整条删除。
 - 一条 experience 不要拆成多条。
 

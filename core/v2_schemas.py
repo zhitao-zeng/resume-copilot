@@ -16,6 +16,10 @@ class SourceBlock(BaseModel):
     source_type: Literal["resume", "query", "jd"]
     text: str
     section_hint: Optional[str] = None
+    # Query text mixes user instructions with optional factual additions.
+    # Only blocks explicitly classified as candidate facts may support resume
+    # claims. Resume blocks are always eligible; JD blocks never are.
+    fact_eligible: bool = True
 
 
 class SourceBundle(BaseModel):
@@ -169,6 +173,15 @@ class CanonicalResume(BaseModel):
     skills: SkillsDraft = Field(default_factory=SkillsDraft)
     summary: str = ""
     awards: list[str] = Field(default_factory=list)
+    publications: list[str] = Field(default_factory=list)
+    patents: list[str] = Field(default_factory=list)
+    certifications: list[str] = Field(default_factory=list)
+    training: list[str] = Field(default_factory=list)
+    teaching: list[str] = Field(default_factory=list)
+    # Flexible fallback for legitimate long-tail industries and source
+    # sections that do not fit a fixed taxonomy. Keys are original section
+    # titles and values are verbatim factual entries.
+    additional_sections: dict[str, list[str]] = Field(default_factory=dict)
 
 
 # ---- DraftResume (plain strings, no evidence wrapper) ----
@@ -184,6 +197,12 @@ class DraftResume(BaseModel):
     skills: SkillsDraft = Field(default_factory=SkillsDraft)
     summary: str = ""
     awards: list[str] = Field(default_factory=list)
+    publications: list[str] = Field(default_factory=list)
+    patents: list[str] = Field(default_factory=list)
+    certifications: list[str] = Field(default_factory=list)
+    training: list[str] = Field(default_factory=list)
+    teaching: list[str] = Field(default_factory=list)
+    additional_sections: dict[str, list[str]] = Field(default_factory=dict)
 
 
 class Change(BaseModel):

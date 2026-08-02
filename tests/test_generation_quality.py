@@ -4,7 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from input_normalization import html_to_visible_text, split_url_and_text
-from evidence_binding import bind_resume_evidence, enforce_resume_evidence
+from evidence_binding import bind_resume_evidence, enforce_resume_evidence, measure_source_coverage
 from resume_classifier import classify_resume_request
 from resume_classifier import normalize_target_role, reconcile_user_stage
 from resume_optimizer import optimize_resume
@@ -13,6 +13,8 @@ from resume_renderer import (
     _compress_resume_data_for_docx,
     _convert_docx_to_pdf,
     _layout_needs_tightening,
+    _layout_retry_data,
+    _tighten_resume_data_for_layout,
     analyze_pdf_layout,
     render_docx,
     render_pdf,
@@ -20,7 +22,7 @@ from resume_renderer import (
 from resume_validator import check_required_fields
 from resume_copilot_pipeline import build_reply_text, _build_targeted_suggestions
 from resume_verifier import _ground_fixed_fields, _reclassify_non_work
-from source_adapter import build_source_bundle
+from source_adapter import build_source_bundle, candidate_blocks
 from v2_pipeline import (
     _bullet_rewrite_changes,
     _build_evidence_summary,
@@ -311,6 +313,33 @@ def test_sparse_query_does_not_claim_unprovided_experience():
     assert "不代表候选人已有事实" in result.resume_dict["framework"]["notice"]
 
 
+def test_jd_derived_temporary_records_still_produce_structured_framework():
+    generated = CanonicalResume.model_validate({
+        "meta": {"target_role": "IoT智能硬件产品经理"},
+        "experience": [{
+            "organization": "目标公司",
+            "role": "产品经理",
+            "bullets": ["负责智能硬件产品规划和跨团队协同"],
+        }],
+        "projects": [{
+            "name": "智能硬件项目",
+            "bullets": ["开展用户研究并推动产品上市"],
+        }],
+    })
+    with patch("v2_pipeline.compose_from_query", return_value=generated), patch(
+        "v2_pipeline.optimize_resume", side_effect=lambda resume, jd: resume
+    ):
+        result = run_v2_pipeline(
+            "",
+            "申请IoT智能硬件产品经理，请根据JD给我待填写框架，不要编造个人经历",
+            "负责智能硬件产品规划、用户研究和跨团队协同",
+        )
+    assert result.resume.experience == []
+    assert result.resume.projects == []
+    assert result.resume_dict["framework"]["mode"] == "empty_profile"
+    assert len(result.resume_dict["framework"]["sections"]) >= 6
+
+
 def test_empty_profile_framework_renders_structured_docx(tmp_path):
     resume = {
         "meta": {"target_role": "IoT智能硬件产品经理"},
@@ -496,7 +525,12 @@ def test_dense_resume_keeps_verified_content_and_allows_sparse_last_page():
     assert _layout_needs_tightening({
         "available": True,
         "issues": ["more_than_three_pages"],
-    }) is True
+    }) is False
+    assert _tighten_resume_data_for_layout(normalized) == normalized
+    assert _layout_retry_data(normalized, {
+        "available": True,
+        "issues": ["core_experience_not_on_first_page"],
+    }) == normalized
 
     collected_projects = _collect_all_projects(normalized, normalized["experience"])
     assert collected_projects[0]["bullets"] == project_bullets
@@ -591,6 +625,122 @@ def test_optimizer_rejects_new_tool_name_even_when_other_text_overlaps():
     original = "负责整理用户反馈并维护需求文档"
     assert _safe_rewrite(original, "负责整理用户反馈，维护需求文档") is True
     assert _safe_rewrite(original, "使用SQL整理用户反馈并维护需求文档") is False
+    chinese_original = "负责用户调研和需求分析，输出产品文档。"
+    assert _safe_rewrite(
+        chinese_original,
+        "负责用户调研和需求分析，使用六西格玛方法输出产品文档。",
+    ) is False
+
+
+def test_query_instructions_are_not_candidate_evidence():
+    source = build_source_bundle(
+        "甲公司｜产品经理",
+        "不要写管理经验\n不要写我负责团队管理\n补充：我会SQL\n申请数据分析师",
+        "负责数据分析",
+    )
+    facts = [block.text for block in candidate_blocks(source)]
+    assert "甲公司｜产品经理" in facts
+    assert "补充：我会SQL" in facts
+    assert "不要写管理经验" not in facts
+    assert "不要写我负责团队管理" not in facts
+    assert "申请数据分析师" not in facts
+
+
+def test_evidence_gate_rejects_cross_record_identity_splice():
+    source = build_source_bundle(
+        "工作经历\n"
+        "甲公司｜产品经理｜2020.01-2022.01\n"
+        "负责需求分析并输出PRD。\n"
+        "乙公司｜销售经理｜2022.02-2024.01\n"
+        "负责客户开拓与商务谈判。",
+        "",
+        "",
+    )
+    resume = CanonicalResume.model_validate({
+        "experience": [{
+            "organization": "甲公司",
+            "role": "销售经理",
+            "period": "2020.01-2022.01",
+            "bullets": ["负责需求分析并输出PRD。"],
+        }],
+    })
+    gated, _, removed = enforce_resume_evidence(resume, source)
+    assert gated.experience == []
+    assert "experience[0]" in removed
+
+
+def test_source_coverage_detects_composer_omissions():
+    source = build_source_bundle(
+        "姓名：李明\n教育经历\n华南理工大学 材料科学与工程 本科\n"
+        "项目经历\n涂布优化项目\n记录12批次生产参数。\n"
+        "分析异常批次原因。\n输出工艺改进建议。",
+        "",
+        "",
+    )
+    draft = DraftResume.model_validate({
+        "meta": {"name": "李明"},
+        "education": [{"school": "华南理工大学", "major": "材料科学与工程", "degree": "本科"}],
+        "projects": [{"name": "涂布优化项目", "bullets": ["记录12批次生产参数。"]}],
+    })
+    resume = CanonicalResume.model_validate(draft.model_dump())
+    bindings = bind_resume_evidence(resume, source)
+    coverage, missing = measure_source_coverage(source, bindings)
+    assert coverage < 0.75
+    assert {"resume_6", "resume_7"}.issubset(set(missing))
+    assert _deterministic_verify_draft(source, draft) is None
+
+
+def test_cross_industry_sections_remain_typed_and_rendered(tmp_path):
+    source = build_source_bundle(
+        "论文成果\n医学影像分割研究，第一作者，2024\n"
+        "专利成果\n医学图像处理方法发明专利\n"
+        "证书与资质\n医师执业证书\n"
+        "培训经历\n住院医师规范化培训\n"
+        "教学经历\n承担本科生临床带教\n"
+        "专业会员\n中华医学会会员",
+        "",
+        "",
+    )
+    resume = CanonicalResume.model_validate({
+        "publications": ["医学影像分割研究，第一作者，2024"],
+        "patents": ["医学图像处理方法发明专利"],
+        "certifications": ["医师执业证书"],
+        "training": ["住院医师规范化培训"],
+        "teaching": ["承担本科生临床带教"],
+        "additional_sections": {"专业会员": ["中华医学会会员"]},
+    })
+    gated, _, removed = enforce_resume_evidence(resume, source)
+    assert removed == []
+    rendered = _canonical_to_v1_format(gated)
+    output = tmp_path / "cross-industry.docx"
+    render_docx(rendered, output, template="classic")
+    from docx import Document
+    text = "\n".join(paragraph.text for paragraph in Document(output).paragraphs)
+    for expected in (
+        "医学影像分割研究", "医学图像处理方法发明专利", "医师执业证书",
+        "住院医师规范化培训", "承担本科生临床带教", "中华医学会会员",
+    ):
+        assert expected in text
+
+
+def test_publication_evidence_cannot_spawn_duplicate_research_record():
+    source = build_source_bundle(
+        "论文成果\n老年慢病管理研究，核心期刊，2022",
+        "",
+        "",
+    )
+    resume = CanonicalResume.model_validate({
+        "research": [{
+            "topic": "老年慢病管理研究",
+            "period": "2022",
+            "bullets": ["发表核心期刊论文"],
+        }],
+        "publications": ["老年慢病管理研究，核心期刊，2022"],
+    })
+    gated, _, removed = enforce_resume_evidence(resume, source)
+    assert gated.research == []
+    assert gated.publications == ["老年慢病管理研究，核心期刊，2022"]
+    assert "research[0]" in removed
 
 
 def test_optimizer_preserves_ownership_level_and_rejects_overcompression():
@@ -602,6 +752,58 @@ def test_optimizer_preserves_ownership_level_and_rejects_overcompression():
 
     detailed = "负责收集用户反馈、开展竞品分析并维护需求文档，协同研发跟进交付"
     assert _safe_rewrite(detailed, "负责产品工作") is False
+
+
+def test_long_resume_optimizer_batches_keep_global_record_indexes():
+    from resume_optimizer import _build_optimizer_batches
+
+    resume = CanonicalResume.model_validate({
+        "experience": [
+            {
+                "organization": f"公司{index}",
+                "role": "工程师",
+                "bullets": [f"负责第{index}项已验证工作内容"],
+            }
+            for index in range(20)
+        ],
+    })
+    batches = _build_optimizer_batches(resume)
+    assert len(batches) >= 2
+    indexes = [
+        record["index"]
+        for batch in batches
+        for record in batch["experience"]
+    ]
+    assert indexes == list(range(20))
+
+
+def test_long_source_composer_chunks_and_merges_without_losing_typed_sections():
+    from resume_composer import _merge_drafts, _split_source_bundle
+
+    source = build_source_bundle(
+        "工作经历\n" + "\n".join(f"第{index}段真实经历" + "细节" * 60 for index in range(30)),
+        "不要编造数字",
+        "目标岗位：研究员",
+    )
+    chunks = _split_source_bundle(source, max_fact_chars=1000)
+    assert len(chunks) >= 2
+    assert all(any(block.source_type == "jd" for block in chunk.blocks) for chunk in chunks)
+
+    merged = _merge_drafts([
+        DraftResume.model_validate({
+            "experience": [{"organization": "甲公司", "role": "工程师"}],
+            "publications": ["论文A"],
+        }),
+        DraftResume.model_validate({
+            "experience": [{"organization": "乙公司", "role": "研究员"}],
+            "patents": ["专利B"],
+            "additional_sections": {"专业会员": ["协会C"]},
+        }),
+    ])
+    assert [item.organization for item in merged.experience] == ["甲公司", "乙公司"]
+    assert merged.publications == ["论文A"]
+    assert merged.patents == ["专利B"]
+    assert merged.additional_sections == {"专业会员": ["协会C"]}
 
 
 def test_visual_layout_report_uses_real_rendered_pdf(tmp_path):

@@ -1,38 +1,12 @@
+# 最新平台提交配置。
+# 27B 是当前实测的单模型质量/延迟折中；平台仅读取
+# inferenceVolumeMounts 与 inferenceImage，勿在此添加无效 values 配置。
 inferenceVolumeMounts:
   - name: model
     mountPoint: /model
     source: ceph_customer
-    srcRelativePath: zengzhitao/resume-copilot/models/Qwen3-14B-GPTQ-Int4
+    srcRelativePath: zengzhitao/resume-copilot/models/Qwen3.5-27B-AWQ
 
 inferenceImage:
   repository: "harbor-contest.4pd.io/zengzhitao/resume-copilot"
   tag: "latest"
-
-values:
-  command:
-  - ./start.sh
-  volumeMounts:
-  - mountPath: /model
-    name: ceph-customer
-    readOnly: true
-    subPath: zengzhitao/resume-copilot/models/Qwen3-14B-GPTQ-Int4
-  resources:
-    limits:
-      cpu: '4'
-      memory: 16Gi
-      nvidia.com/gpu: '1'
-      nvidia.com/gpucores: '25'
-      nvidia.com/gpumem: '30720'
-    requests:
-      cpu: '4'
-      memory: 16Gi
-      nvidia.com/gpu: '1'
-      nvidia.com/gpucores: '25'
-      nvidia.com/gpumem: '30720'
-  readinessProbe:
-    httpGet:
-      path: /ready
-      port: 80
-    initialDelaySeconds: 300
-    periodSeconds: 10
-    timeoutSeconds: 5

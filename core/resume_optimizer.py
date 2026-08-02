@@ -29,6 +29,15 @@ _UNSUPPORTED_RESULT_TERMS = (
     "提高准确率", "提升准确率", "提升效率", "提升用户体验",
 )
 
+_FACT_INTRODUCER = re.compile(
+    r"(?:使用|采用|基于|借助|运用|利用)\s*"
+    r"(?P<fact>[^，。；,;]{2,24}?)(?=进行|开展|完成|实现|输出|分析|设计|优化|管理|，|。|；|,|;|$)"
+)
+_NAMED_CHINESE_FACT = re.compile(
+    r"[A-Za-z0-9+.#/_-]*[\u4e00-\u9fffA-Za-z0-9+.#/_-]{2,18}"
+    r"(?:方法|工具|技术|系统|平台|模型|框架|算法|软件|数据库|产品|项目)"
+)
+
 
 OPTIMIZER_SYSTEM_PROMPT = """你是一位保守的简历编辑，只输出局部文字补丁，不得重写整份简历。
 
@@ -70,6 +79,25 @@ def _action_level(text: str) -> int:
     return 0
 
 
+def _introduces_unsupported_fact(original: str, rewritten: str) -> bool:
+    """Detect newly introduced Chinese methods/tools/entities.
+
+    Character-overlap scores are unsafe for Chinese: a fabricated phrase can
+    be short relative to a long otherwise-copied bullet. This guard focuses on
+    explicit method/tool constructions while allowing punctuation and sentence
+    restructuring.
+    """
+
+    original_compact = re.sub(r"[^\w\u4e00-\u9fff+.#/_-]+", "", original).casefold()
+    for pattern in (_FACT_INTRODUCER, _NAMED_CHINESE_FACT):
+        for match in pattern.finditer(rewritten):
+            phrase = match.groupdict().get("fact") or match.group(0)
+            compact = re.sub(r"[^\w\u4e00-\u9fff+.#/_-]+", "", phrase).casefold()
+            if len(compact) >= 2 and compact not in original_compact:
+                return True
+    return False
+
+
 def _safe_rewrite(original: str, rewritten: str) -> bool:
     original = str(original or "").strip()
     rewritten = str(rewritten or "").strip()
@@ -92,6 +120,8 @@ def _safe_rewrite(original: str, rewritten: str) -> bool:
     original_latin = {token.casefold() for token in latin_pattern.findall(original)}
     rewritten_latin = {token.casefold() for token in latin_pattern.findall(rewritten)}
     if not rewritten_latin.issubset(original_latin):
+        return False
+    if _introduces_unsupported_fact(original, rewritten):
         return False
     for term in _UNSUPPORTED_RESULT_TERMS:
         if term in rewritten and term not in original:
@@ -130,6 +160,34 @@ def _apply_section_patches(
     return accepted
 
 
+def _build_optimizer_batches(resume: CanonicalResume) -> list[dict[str, list[dict[str, Any]]]]:
+    """Split long resumes into independently recoverable edit batches."""
+
+    batches: list[dict[str, list[dict[str, Any]]]] = []
+    current = {section: [] for section in ("experience", "research", "activities", "projects")}
+    current_bullets = 0
+    current_chars = 0
+    for section in current:
+        for index, record in enumerate(getattr(resume, section)):
+            dumped = record.model_dump()
+            dumped["index"] = index
+            bullet_count = len(record.bullets)
+            char_count = sum(len(str(value)) for value in record.bullets)
+            if current_bullets and (
+                current_bullets + bullet_count > 16 or current_chars + char_count > 6000
+            ):
+                batches.append(current)
+                current = {name: [] for name in current}
+                current_bullets = 0
+                current_chars = 0
+            current[section].append(dumped)
+            current_bullets += bullet_count
+            current_chars += char_count
+    if current_bullets:
+        batches.append(current)
+    return batches
+
+
 def optimize_resume(resume: CanonicalResume, jd_text: str = "") -> CanonicalResume:
     if not llm_enabled():
         return resume
@@ -143,37 +201,40 @@ def optimize_resume(resume: CanonicalResume, jd_text: str = "") -> CanonicalResu
         logger.info("Optimizer skipped: only %d bullets", total_bullets)
         return resume
 
-    payload = {
-        "experience": [item.model_dump() for item in resume.experience],
-        "research": [item.model_dump() for item in resume.research],
-        "activities": [item.model_dump() for item in resume.activities],
-        "projects": [item.model_dump() for item in resume.projects],
-    }
-    prompt = "请优化以下已校验简历的文字。\n\n"
-    if jd_text.strip():
-        prompt += f"【目标岗位，仅用于排序和措辞】\n{jd_text.strip()[:1200]}\n\n"
-    prompt += "【只读事实与原始 bullets】\n" + json.dumps(payload, ensure_ascii=False)
-
-    try:
-        content = call_llm_text(
-            OPTIMIZER_SYSTEM_PROMPT,
-            prompt,
-            temperature=0.0,
-            max_tokens=4096,
-        )
-    except Exception as exc:
-        logger.warning("Optimizer LLM call failed: %s", exc)
-        return resume
-
-    parsed = parse_json_content(content)
-    if not isinstance(parsed, dict) or not parsed:
-        logger.warning("Optimizer patch JSON parse failed, len=%d", len(content))
-        return resume
-
     optimized = resume.model_copy(deep=True)
     accepted = 0
-    for section in ("experience", "research", "activities", "projects"):
-        accepted += _apply_section_patches(optimized, section, parsed.get(section))
+    batches = _build_optimizer_batches(resume)
+    for batch_index, payload in enumerate(batches):
+        prompt = "请优化以下已校验简历的文字。每条记录中的 index 是整份简历的稳定索引，输出时必须原样使用。\n\n"
+        if jd_text.strip():
+            prompt += f"【目标岗位，仅用于排序和措辞】\n{jd_text.strip()[:1600]}\n\n"
+        prompt += "【只读事实与原始 bullets】\n" + json.dumps(payload, ensure_ascii=False)
+        try:
+            content = call_llm_text(
+                OPTIMIZER_SYSTEM_PROMPT,
+                prompt,
+                temperature=0.0,
+                max_tokens=4096,
+            )
+        except Exception as exc:
+            logger.warning("Optimizer batch %d/%d failed: %s", batch_index + 1, len(batches), exc)
+            continue
+        parsed = parse_json_content(content)
+        if not isinstance(parsed, dict) or not parsed:
+            logger.warning(
+                "Optimizer batch %d/%d JSON parse failed, len=%d",
+                batch_index + 1,
+                len(batches),
+                len(content),
+            )
+            continue
+        for section in ("experience", "research", "activities", "projects"):
+            accepted += _apply_section_patches(optimized, section, parsed.get(section))
 
-    logger.info("Optimizer patches applied: %d/%d bullets", accepted, total_bullets)
+    logger.info(
+        "Optimizer patches applied: %d/%d bullets across %d batch(es)",
+        accepted,
+        total_bullets,
+        len(batches),
+    )
     return optimized
