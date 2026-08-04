@@ -32,6 +32,39 @@ app = Flask(__name__)
 app.config["JSON_AS_ASCII"] = False
 app.config["MAX_CONTENT_LENGTH"] = int(os.getenv("MAX_REQUEST_SIZE_BYTES", str(64 * 1024 * 1024)))
 
+
+class _MockUpload:
+    """UploadFile-compatible wrapper with cursor-based reads.
+
+    read(size) advances a cursor so read_upload_limited's chunked loop reads the
+    underlying data exactly once. Previously this class ignored `size` and
+    re-opened the file from byte 0 on every call; read_upload_limited then fell
+    back to the no-arg read() each iteration, re-reading the whole file until
+    the cumulative total tripped MAX_FILE_SIZE and every submission failed with
+    "file too large" (a small 125KB CV, e.g., reported >20MB).
+    """
+
+    def __init__(self, path: str | None, name: str = "", content: str | None = None):
+        self.path = path
+        self.content = content
+        self.filename = Path(path).name if path else name
+        self.content_type = None
+        self._offset = 0
+
+    async def read(self, size: int | None = None) -> bytes:
+        if self.content is not None:
+            data = self.content.encode("utf-8")
+            result = data[self._offset:] if size is None else data[self._offset:self._offset + size]
+            self._offset += len(result)
+            return result
+        if not self.path:
+            return b""
+        with open(self.path, "rb") as f:
+            f.seek(self._offset)
+            result = f.read() if size is None else f.read(size)
+            self._offset += len(result)
+            return result
+
 # ── 压制 werkzeug 噪声(polling/health) ────────────────────────────
 import logging as _logging
 _werkzeug_log = _logging.getLogger("werkzeug")
@@ -291,30 +324,19 @@ def _process_resume(task_id: str, form_data: Any) -> None:
         from http_compat import HTTPException
         from resume_copilot_service import _ensure_time_budget
 
-        class _MockUpload:
-            def __init__(self, path: str | None, name: str = "", content: str | None = None):
-                self.path = path
-                self.content = content
-                self.filename = Path(path).name if path else name
-                self.content_type = None
-
-            async def read(self) -> bytes:
-                if self.content is not None:
-                    return self.content.encode("utf-8")
-                if not self.path:
-                    return b""
-                with open(self.path, "rb") as f:
-                    return f.read()
-
-        cv_upload = _MockUpload(cv_path, "cv") if cv_path else None
-
-        # Fallback: if cv was sent as a text field (JSON mode or form text field)
-        # rather than a file upload. Two sub-cases:
-        #   1. cv_text is a real file path string  → read that file
-        #   2. cv_text is the CV content itself    → use it directly as text CV
-        # Guard the path check: CV text can be long; calling .exists() on it
-        # raises FileNameTooLong (OSError 36), so only stat short path-like strings.
-        if cv_upload is None and cv_text and len(cv_text) > 5:
+        # cv: prefer already-extracted text so images are OCR'd once (here),
+        # not a second time by the main pipeline. Path mode is a fallback for
+        # extractions that returned no text.
+        cv_upload = None
+        if cv_text and len(cv_text.strip()) > 5:
+            _json_logger.info("[%s] cv uses pre-extracted text (%d chars)", task_id, len(cv_text))
+            cv_upload = _MockUpload(None, "cv.txt", content=cv_text)
+        elif cv_path:
+            cv_upload = _MockUpload(cv_path, "cv")
+        elif cv_text and len(cv_text) > 5:
+            # Fallback: cv field may be a persisted file path string (JSON mode).
+            # Guard: CV text can be long; calling .exists() on it raises
+            # FileNameTooLong (OSError 36), so only stat short path-like strings.
             _cv_candidate = cv_text.strip()
             _looks_like_path = (
                 len(_cv_candidate) < 500
@@ -333,9 +355,6 @@ def _process_resume(task_id: str, form_data: Any) -> None:
                     cv_path = str(_cv_text_path)  # for logging
                 else:
                     _json_logger.warning("[%s] cv_text=%s does not exist as file, cv_upload=None", task_id, cv_text[:100])
-            else:
-                _json_logger.info("[%s] cv received as plain text content (%d chars), using directly", task_id, len(cv_text))
-                cv_upload = _MockUpload(None, "cv.txt", content=cv_text)
 
         cv_template_upload = _MockUpload(cv_template_path, "template") if cv_template_path else None
         jd_upload = _MockUpload(jd_path, "target_jd") if jd_path else None
