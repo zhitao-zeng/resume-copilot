@@ -10,13 +10,23 @@ import time
 import unicodedata
 
 from v2_schemas import VerifiedResult, CanonicalResume, DraftResume, Meta, Change
-from source_adapter import build_source_bundle, candidate_blocks
+from source_adapter import (
+    _is_section_heading,
+    _looks_like_record_body,
+    build_source_bundle,
+    candidate_blocks,
+)
 from resume_composer import compose_resume, compose_from_query
 from resume_verifier import verify_resume
 from resume_verifier import _ground_fixed_fields, _reclassify_non_work
 from resume_optimizer import optimize_resume, _introduces_unsupported_fact
 from v2_validator import validate_resume
-from evidence_binding import bind_resume_evidence, enforce_resume_evidence, measure_source_coverage
+from evidence_binding import (
+    bind_resume_evidence,
+    enforce_resume_evidence,
+    measure_source_coverage,
+    source_fact_units,
+)
 import resume_product_logic as product_logic
 
 logger = logging.getLogger(__name__)
@@ -133,6 +143,11 @@ _RESULT_SIGNAL = re.compile(
     r"(?:降至|提升至|提高到|增长至|减少到|缩短至|达到|完成|上线|交付|录用|获奖|复核|验证)",
     re.IGNORECASE,
 )
+_SUMMARY_SUBJECTIVE = re.compile(
+    r"(?:扎实|敏锐|优秀|热爱|致力于|较强|出色|卓越|丰富的|良好(?:的)?(?:能力|素养)|"
+    r"责任心|学习能力|抗压能力|团队精神|积极主动|自驱力|"
+    r"清晰的问题拆解|执行闭环|以真实岗位职责和结果为准)"
+)
 
 
 def _action_level(text: str) -> int:
@@ -155,19 +170,46 @@ def _source_sentences(text: str) -> list[str]:
     return [item for item in values if len(item) >= 6]
 
 
-def _closest_source_sentence(bullet: str, sentences: list[str]) -> tuple[str, float]:
+def _closest_source_sentence(bullet: str, sentences: list[str]) -> tuple[str, float, float]:
     target = _char_bigrams(bullet)
     if not target:
-        return "", 0.0
-    best, score = "", 0.0
+        return "", 0.0, 0.0
+    best, score, best_recall = "", 0.0, 0.0
     for sentence in sentences:
         candidate = _char_bigrams(sentence)
         if not candidate:
             continue
-        overlap = len(target & candidate) / max(1, min(len(target), len(candidate)))
-        if overlap > score:
-            best, score = sentence, overlap
-    return best, score
+        shared = len(target & candidate)
+        generated_coverage = shared / max(1, len(target))
+        source_recall = shared / max(1, len(candidate))
+        if (generated_coverage, source_recall) > (score, best_recall):
+            best, score, best_recall = sentence, generated_coverage, source_recall
+    return best, score, best_recall
+
+
+def _ground_bullet_value(value: str, sentences: list[str]) -> tuple[str, str]:
+    """Return ``(text, status)`` where status is accepted/restored/dropped."""
+
+    source, generated_coverage, source_recall = _closest_source_sentence(value, sentences)
+    if not source:
+        logger.info("Dropped ungrounded bullet: %s", value[:80])
+        return "", "dropped"
+    # If the model retained a recognizable source clause but added unsupported
+    # material, restore the complete source sentence. Very weak matches are
+    # dropped instead of being legitimized by a common verb such as “负责”.
+    if generated_coverage < 0.58:
+        if generated_coverage >= 0.18 and source_recall >= 0.45:
+            logger.info("Restored source wording for weakly grounded bullet: %s", value[:80])
+            return source, "restored"
+        logger.info("Dropped weakly grounded bullet: %s", value[:80])
+        return "", "dropped"
+    upgraded = _action_level(value) > _action_level(source)
+    unsupported_result = any(term in value and term not in source for term in _RESULT_CLAIMS)
+    unsupported_fact = _introduces_unsupported_fact(source, value)
+    if upgraded or unsupported_result or unsupported_fact:
+        logger.info("Restored source wording for over-claimed bullet: %s", value[:80])
+        return source, "restored"
+    return value, "accepted"
 
 
 def _ground_bullets(resume: CanonicalResume, evidence_text: str) -> CanonicalResume:
@@ -182,19 +224,50 @@ def _ground_bullets(resume: CanonicalResume, evidence_text: str) -> CanonicalRes
                 value = str(bullet or "").strip()
                 if not value:
                     continue
-                source, similarity = _closest_source_sentence(value, sentences)
-                if not source or similarity < 0.22:
-                    logger.info("Dropped ungrounded bullet: %s", value[:80])
-                    continue
-                upgraded = _action_level(value) > _action_level(source)
-                unsupported_result = any(term in value and term not in source for term in _RESULT_CLAIMS)
-                unsupported_fact = _introduces_unsupported_fact(source, value)
-                if upgraded or unsupported_result or unsupported_fact:
-                    logger.info("Restored source wording for over-claimed bullet: %s", value[:80])
-                    value = source
-                if value not in safe_bullets:
-                    safe_bullets.append(value)
+                safe_value, _status = _ground_bullet_value(value, sentences)
+                if safe_value and safe_value not in safe_bullets:
+                    safe_bullets.append(safe_value)
             record.bullets = safe_bullets
+    return grounded
+
+
+def _ground_optimizer_output(
+    original: CanonicalResume,
+    optimized: CanonicalResume,
+    evidence_text: str,
+) -> CanonicalResume:
+    """Revert any optimizer patch that fails the final evidence grounder.
+
+    Optimizer patches are optional wording changes. Losing a factual bullet is
+    never an acceptable consequence of rejecting one, so the already-verified
+    original is retained at the same stable index.
+    """
+
+    grounded = optimized.model_copy(deep=True)
+    sentences = _source_sentences(evidence_text)
+    for section_name in ("experience", "research", "activities", "projects"):
+        before_records = getattr(original, section_name)
+        after_records = getattr(grounded, section_name)
+        for record_index, after_record in enumerate(after_records):
+            before_bullets = (
+                list(before_records[record_index].bullets)
+                if record_index < len(before_records) else []
+            )
+            safe_bullets: list[str] = []
+            for bullet_index, bullet in enumerate(after_record.bullets):
+                value = str(bullet or "").strip()
+                safe_value, status = _ground_bullet_value(value, sentences)
+                if status != "accepted" and bullet_index < len(before_bullets):
+                    safe_value = str(before_bullets[bullet_index] or "").strip()
+                    logger.info(
+                        "Reverted unsupported optimizer patch at %s[%d].bullets[%d]",
+                        section_name,
+                        record_index,
+                        bullet_index,
+                    )
+                if safe_value and safe_value not in safe_bullets:
+                    safe_bullets.append(safe_value)
+            after_record.bullets = safe_bullets
     return grounded
 
 
@@ -293,6 +366,160 @@ def _bullet_rewrite_changes(
     return changes
 
 
+_COVERAGE_LAYOUT_LABEL = re.compile(
+    r"^(?:个人信息|基本信息|联系方式|经历|工作经验|实习经验|项目经验|"
+    r"技能|核心技能|其他信息|补充信息)$"
+)
+_COVERAGE_BOILERPLATE = re.compile(
+    r"^(?:候选人)?具备清晰的问题拆解和执行闭环能力$|"
+    r"^过往经历以真实岗位职责和结果为准$"
+)
+_COVERAGE_QUERY_DIRECTION = re.compile(
+    r"^(?:请|帮我|麻烦)?(?:保留|突出|侧重|优化|润色|修改|调整|删除|去掉|"
+    r"不要|避免|针对|适配)"
+)
+_COVERAGE_QUERY_FACT_SIGNAL = re.compile(
+    r"(?:我(?:叫|是|会|有|曾|在|负责|参与|主导|获得|毕业|就读|熟悉|擅长)|"
+    r"本人|姓名是|曾任|任职于|就职于|毕业于|就读于|"
+    r"\d+(?:\.\d+)?\s*(?:年|个月)\s*(?:工作|从业|实习)?(?:经验|经历))"
+)
+_COVERAGE_ANCHOR = re.compile(
+    r"\d+(?:\.\d+)?%?|[A-Za-z][A-Za-z0-9+.#/_@-]*",
+    re.IGNORECASE,
+)
+
+
+def _coverage_normalize(value: str) -> str:
+    value = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    return re.sub(r"[^\w\u4e00-\u9fff]+", "", value)
+
+
+def _coverage_bigrams(value: str) -> set[str]:
+    normalized = _coverage_normalize(value)
+    return {
+        normalized[index:index + 2]
+        for index in range(max(0, len(normalized) - 1))
+    }
+
+
+def _coverage_unit_is_optional(unit: dict[str, str]) -> bool:
+    """Exclude extraction scaffolding, never candidate facts, from recall.
+
+    Source coverage is a completeness signal, not a second truth gate.  OCR and
+    DOCX extraction can emit layout labels that have no destination in the
+    canonical schema.  A small amount of stock summary copy is similarly not a
+    candidate fact and is replaced by the grounded summary builder later.
+    """
+
+    text = str(unit.get("match_text", "") or "").strip()
+    compact = re.sub(r"[\s:：|｜/\\【】\[\]()（）]+", "", text)
+    if not compact or _is_section_heading(compact) or _COVERAGE_LAYOUT_LABEL.fullmatch(compact):
+        return True
+    if _COVERAGE_BOILERPLATE.fullmatch(compact):
+        return True
+    if (
+        unit.get("source_type") == "query"
+        and _COVERAGE_QUERY_DIRECTION.search(text)
+        and not _COVERAGE_QUERY_FACT_SIGNAL.search(text)
+    ):
+        # SourceAdapter deliberately errs on the side of retaining ambiguous
+        # query clauses.  Editing directions such as “保留原学校” must not make
+        # a complete Composer draft look incomplete.
+        return True
+    return False
+
+
+def _coverage_unit_is_represented(
+    unit: dict[str, str],
+    claims_by_block: dict[str, list[str]],
+    all_claims: list[str],
+) -> bool:
+    """Recognize split structured fields without weakening factual gates.
+
+    A source line such as ``学校 + 学历 + 专业 + 日期`` becomes four canonical
+    fields.  The legacy reverse-coverage check compares each field separately
+    with the whole source line, so all four can be truth-bound while the line is
+    still reported missing.  Here exact cross-block duplicates and the union of
+    claims bound to the *same* source block are accepted.  Every numeric/Latin
+    anchor must survive, which keeps dates, metrics and named tools strict.
+    """
+
+    source_text = str(unit.get("match_text", "") or "").strip()
+    source_value = _coverage_normalize(source_text)
+    if not source_value:
+        return True
+
+    normalized_claims: list[str] = []
+    for claim in all_claims:
+        normalized_claim = _coverage_normalize(claim)
+        if normalized_claim:
+            normalized_claims.append(normalized_claim)
+    if any(source_value == claim_value for claim_value in normalized_claims):
+        # This also resolves duplicated name/contact lines whose binding points
+        # at the first identical occurrence in the extracted document.
+        return True
+
+    block_claims = [
+        str(claim).strip()
+        for claim in claims_by_block.get(str(unit.get("block_id", "")), [])
+        if str(claim).strip()
+    ]
+    if len(block_claims) < 2:
+        return False
+
+    source_anchors = {
+        anchor.casefold() for anchor in _COVERAGE_ANCHOR.findall(source_text)
+    }
+    claim_anchors = {
+        anchor.casefold()
+        for claim in block_claims
+        for anchor in _COVERAGE_ANCHOR.findall(claim)
+    }
+    if source_anchors and not source_anchors.issubset(claim_anchors):
+        return False
+
+    source_bigrams = _coverage_bigrams(source_text)
+    claim_bigrams = set().union(*(_coverage_bigrams(claim) for claim in block_claims))
+    recall = len(source_bigrams & claim_bigrams) / max(1, len(source_bigrams))
+    # Only field-boundary bigrams should be absent. A lower threshold can hide
+    # a genuinely omitted short field such as a degree or role.
+    return recall >= 0.82
+
+
+def _deterministic_source_coverage(
+    source,
+    bindings,
+) -> tuple[float, list[str]]:
+    """Measure representable source recall for the Verifier fast path."""
+
+    units = [unit for unit in source_fact_units(source) if not _coverage_unit_is_optional(unit)]
+    if not units:
+        return 1.0, []
+
+    _, legacy_missing_values = measure_source_coverage(source, bindings)
+    legacy_missing = set(legacy_missing_values)
+    claims_by_block: dict[str, list[str]] = {}
+    all_claims: list[str] = []
+    for binding in bindings:
+        claim = str(binding.claim or "").strip()
+        if claim:
+            claims_by_block.setdefault(binding.block_id, []).append(claim)
+            all_claims.append(claim)
+
+    missing: list[str] = []
+    for unit in units:
+        # ``measure_source_coverage`` remains the authority for ordinary
+        # one-claim fuzzy rewrites.  Only reconsider units it marked missing.
+        if (
+            unit["unit_id"] in legacy_missing
+            and not _coverage_unit_is_represented(unit, claims_by_block, all_claims)
+        ):
+            missing.append(unit["unit_id"])
+
+    ratio = (len(units) - len(missing)) / len(units)
+    return round(ratio, 4), missing
+
+
 def _deterministic_verify_draft(
     source,
     draft: DraftResume,
@@ -312,15 +539,24 @@ def _deterministic_verify_draft(
     resume = _compact_canonical(resume)
     if _is_empty_resume(resume) or len(bindings) < 3:
         return None
-    coverage, missing_blocks = measure_source_coverage(source, bindings)
-    content_block_count = len({binding.block_id for binding in bindings}) + len(missing_blocks)
-    if content_block_count >= 5 and coverage < 0.75:
+    raw_coverage, raw_missing = measure_source_coverage(source, bindings)
+    coverage, missing_blocks = _deterministic_source_coverage(source, bindings)
+    if missing_blocks and coverage < 0.80:
         logger.info(
-            "V2 | Deterministic verifier rejected draft: source coverage %.1f%%, missing=%s",
+            "V2 | Deterministic verifier rejected draft: representable coverage %.1f%% "
+            "(raw %.1f%%), missing=%s",
             coverage * 100,
+            raw_coverage * 100,
             missing_blocks[:8],
         )
         return None
+    if raw_missing and coverage > raw_coverage:
+        logger.info(
+            "V2 | Deterministic verifier resolved structural coverage artifacts: "
+            "%.1f%% -> %.1f%%",
+            raw_coverage * 100,
+            coverage * 100,
+        )
     if len(removed) > max(2, int(len(bindings) * 0.15)):
         logger.info("V2 | Deterministic verifier rejected draft: %d unbound claims", len(removed))
         return None
@@ -360,11 +596,14 @@ def _build_evidence_summary(resume: CanonicalResume) -> str:
     """
 
     if not any((
+        resume.summary,
+        resume.meta.work_experience,
         resume.education,
         resume.experience,
         resume.research,
         resume.activities,
         resume.projects,
+        resume.skills.items,
         resume.awards,
         resume.publications,
         resume.patents,
@@ -376,13 +615,25 @@ def _build_evidence_summary(resume: CanonicalResume) -> str:
         return ""
 
     candidates: list[str] = []
-    if resume.education:
-        edu = resume.education[0]
-        school = edu.school.strip()
-        qualification = "、".join(part.strip() for part in (edu.major, edu.degree) if part.strip())
-        education_text = "，".join(part for part in (school, qualification) if part)
-        if education_text:
-            candidates.append(education_text)
+
+    target_role = resume.meta.target_role.strip()
+    if re.fullmatch(r"[a-z0-9]+(?:[_-][a-z0-9]+)+", target_role, re.IGNORECASE):
+        target_role = " ".join(
+            token.upper() if len(token) <= 3 else token.title()
+            for token in re.split(r"[_-]+", target_role)
+            if token
+        )
+    if target_role:
+        candidates.append("求职方向为" + target_role)
+
+    # A source-grounded summary can carry valuable facts (for example eight
+    # years of clinical work) that are not duplicated in another field. Keep
+    # complete factual sentences, while filtering subjective filler.
+    for sentence in (
+        item.strip() for item in re.split(r"[。！？!?；;]+", resume.summary) if item.strip()
+    ):
+        if not _SUMMARY_SUBJECTIVE.search(sentence):
+            candidates.append(sentence)
 
     experience_bits: list[str] = []
     for item in resume.experience[:2]:
@@ -390,7 +641,11 @@ def _build_evidence_summary(resume: CanonicalResume) -> str:
         if identity and identity not in experience_bits:
             experience_bits.append(identity)
     if experience_bits:
-        candidates.append("曾任" + "、".join(experience_bits))
+        seniority = resume.meta.work_experience.strip()
+        if seniority and re.fullmatch(r"\d+(?:\.\d+)?\s*(?:年|个月|月)", seniority):
+            seniority += "经验"
+        prefix = f"有{seniority}，" if seniority else ""
+        candidates.append(prefix + "曾任" + "、".join(experience_bits))
 
     research_bits: list[str] = []
     for item in resume.research[:2]:
@@ -400,13 +655,24 @@ def _build_evidence_summary(resume: CanonicalResume) -> str:
     if research_bits:
         candidates.append("科研经历包括" + "、".join(research_bits))
 
-    project_names = list(dict.fromkeys(item.name.strip() for item in resume.projects if item.name.strip()))[:4]
-    if project_names:
-        candidates.append("项目经历包括" + "、".join(project_names))
-
     achievement = _best_achievement(resume)
     if achievement:
         candidates.append("代表成果：" + achievement)
+
+    skill_names = list(dict.fromkeys(item.name.strip() for item in resume.skills.items if item.name.strip()))[:4]
+    if skill_names:
+        candidates.append("技能包括" + "、".join(skill_names))
+
+    if resume.education:
+        edu = resume.education[0]
+        qualification = "、".join(part.strip() for part in (edu.major, edu.degree) if part.strip())
+        education_text = "，".join(part for part in (edu.school.strip(), qualification) if part)
+        if education_text:
+            candidates.append(education_text)
+
+    project_names = list(dict.fromkeys(item.name.strip() for item in resume.projects if item.name.strip()))[:2]
+    if project_names:
+        candidates.append("项目经历包括" + "、".join(project_names))
 
     if resume.publications:
         candidates.append(f"论文成果{len(resume.publications)}项")
@@ -424,27 +690,24 @@ def _build_evidence_summary(resume: CanonicalResume) -> str:
         if activity_bits:
             candidates.append("校园或社会活动包括" + "、".join(activity_bits))
 
-    skill_names = list(dict.fromkeys(item.name.strip() for item in resume.skills.items if item.name.strip()))[:8]
-    if skill_names:
-        candidates.append("技能包括" + "、".join(skill_names))
-
-    target_role = resume.meta.target_role.strip()
-    if target_role:
-        candidates.append("求职方向为" + target_role)
-
     compact: list[str] = []
     current_length = 0
+    seen: set[str] = set()
     for sentence in candidates:
         sentence = sentence.strip("。；; ")
         if not sentence:
             continue
+        normalized = re.sub(r"\W+", "", sentence).casefold()
+        if not normalized or normalized in seen:
+            continue
         added = len(sentence) + 1
         # Keep each selected sentence intact instead of slicing it mid-phrase.
-        if current_length + added > 180:
+        if current_length + added > 100:
             continue
         compact.append(sentence)
+        seen.add(normalized)
         current_length += added
-        if len(compact) >= 6:
+        if len(compact) >= 4:
             break
     return "。".join(compact) + ("。" if compact else "")
 
@@ -523,90 +786,497 @@ def _compact_canonical(resume: CanonicalResume) -> CanonicalResume:
     return compacted
 
 
-def _deterministic_fallback(cv_text: str, query_text: str, jd_text: str) -> CanonicalResume:
-    """Preserve source facts when the LLM pipeline is unavailable.
+_FALLBACK_PERIOD = re.compile(
+    r"(?:(?:19|20)\d{2}(?:(?:[./-]\d{1,2})|(?:年\d{1,2}月?))?|(?:0?[1-9]|1[0-2])[-/](?:19|20)\d{2})"
+    r"\s*(?:[-—~至到]\s*(?:(?:19|20)\d{2}(?:(?:[./-]\d{1,2})|(?:年\d{1,2}月?))?|"
+    r"(?:0?[1-9]|1[0-2])[-/](?:19|20)\d{2}|至今|现在))?"
+)
+_FALLBACK_ORGANIZATION = re.compile(
+    r"[\u4e00-\u9fffA-Za-z0-9·.&（）()_-]{0,40}(?:大学|学院|学校|医院|公司|集团|"
+    r"中学|小学|幼儿园|研究院|实验室|中心|部门|协会|学会|学生会|社团|委员会|事务所|银行|"
+    r"基金会|工作室|团队)"
+)
+_FALLBACK_ROLE = re.compile(
+    r"[\u4e00-\u9fffA-Za-z0-9/+.#_-]{0,24}(?:工程师|设计师|教师|老师|医生|医师|"
+    r"护士|经理|主管|总监|主任|顾问|研究员|专员|助理|负责人|组长|队长|主席|"
+    r"部长|实习生|实习|见习|分析师|架构师|运营|产品|开发|测试|销售|讲师)"
+)
+_FALLBACK_DEGREE = re.compile(r"(?:博士研究生|硕士研究生|本科|硕士|博士|大专|专科|高中)(?:在读|毕业)?")
 
-    This intentionally parses only CV text as candidate evidence. Query/JD are
-    used for classification and direction, never as employment/education facts.
-    """
-    industry = product_logic.infer_industry(query_text, cv_text, jd_text)
-    target_role = product_logic.extract_target_role(query_text, jd_text) if hasattr(product_logic, "extract_target_role") else ""
-    raw = product_logic.heuristic_resume_from_text(cv_text, industry, target_role)
-    raw = product_logic.normalize_resume_data_for_product(
-        raw,
-        raw_text=cv_text,
-        industry=industry,
-        target_role=target_role,
+
+def _first_match(pattern: re.Pattern[str], value: str) -> str:
+    match = pattern.search(value)
+    return match.group(0).strip() if match else ""
+
+
+def _labeled_value(value: str, labels: tuple[str, ...]) -> str:
+    joined = "|".join(re.escape(label) for label in labels)
+    match = re.search(rf"(?:{joined})\s*[:：]\s*([^|｜，,；;\n]+)", value)
+    return match.group(1).strip() if match else ""
+
+
+def _organization_from_text(value: str) -> str:
+    cleaned = re.sub(
+        r"^(?:负责|参与|协助|支持|组织|推动|运营|管理|加入|担任)\s*",
+        "",
+        value.strip(),
+    )
+    # OCR often joins a leading period directly to the organization.  Remove
+    # only the recognized date span before matching so the date cannot become
+    # part of the company/school name.
+    cleaned = _FALLBACK_PERIOD.sub(" ", cleaned)
+    cleaned = re.sub(r"^[\s\-—~至到]+", "", cleaned)
+    contextual = re.search(
+        r"(?:就职于|任职于|供职于|在)\s*"
+        r"([\u4e00-\u9fffA-Za-z0-9·.&（）()_-]{1,40}?(?:大学|学院|学校|医院|公司|集团|"
+        r"研究院|实验室|中心|部门|协会|学会|学生会|社团|委员会|事务所|银行|"
+        r"基金会|工作室|团队))(?=工作|任职|担任|就职|[，,。；;\s])",
+        cleaned,
+    )
+    if contextual:
+        return contextual.group(1).strip()
+    return _first_match(_FALLBACK_ORGANIZATION, cleaned)
+
+
+def _role_from_text(value: str, organization: str = "") -> str:
+    labeled = _labeled_value(value, ("岗位", "职位", "角色", "职务"))
+    if labeled:
+        return labeled
+    # Identity normally appears before the first duty clause. Strip the period
+    # and already-grounded organization so a greedy role regex cannot absorb
+    # them from OCR-compressed headers.
+    header = re.split(r"[，,。；;]", value, maxsplit=1)[0]
+    period = _first_match(_FALLBACK_PERIOD, header)
+    for identity in (period, organization):
+        if identity:
+            header = header.replace(identity, " ")
+    header = re.sub(r"^[\s|｜:：\-—~至到]+|[\s|｜:：\-—~至到]+$", "", header)
+    return _first_match(_FALLBACK_ROLE, header)
+
+
+def _fallback_target_role(query_text: str, jd_text: str) -> str:
+    extracted = (
+        product_logic.extract_target_role(query_text, jd_text)
+        if hasattr(product_logic, "extract_target_role") else ""
+    )
+    invalid = (
+        not extracted
+        or extracted.casefold() in {"jd", "的jd", "岗位", "目标岗位", "简历"}
+        or any(token in extracted.casefold() for token in ("简历", "修改", "优化"))
+    )
+    if not invalid:
+        return extracted
+    embedded = re.search(
+        r"(?:一个|目标(?:岗位)?\s*[:：]?)\s*"
+        r"([A-Za-z0-9+.#/_\-\u4e00-\u9fff]{2,32}?)(?:的)?岗位(?:JD|描述)?",
+        query_text,
+        re.IGNORECASE,
+    )
+    if embedded:
+        return embedded.group(1).strip()
+    rewrite = re.search(
+        r"(?:优化|调整|修改|改写|适配)(?:成|为)\s*"
+        r"([A-Za-z0-9+.#/_\-\u4e00-\u9fff]{2,32}?)(?=岗位|方向|[，,。；;\n]|$)",
+        query_text,
+        re.IGNORECASE,
+    )
+    if rewrite:
+        return rewrite.group(1).strip()
+    matches = re.finditer(
+        r"(?:投递|应聘|申请|求职|想投|继续投|目标岗位(?:是|为)?)\s*"
+        r"([A-Za-z0-9+.#/_\-\u4e00-\u9fff]{2,32}?)(?=岗位|[，,。；;\n]|帮我|$)",
+        query_text,
+        re.IGNORECASE,
+    )
+    for match in matches:
+        candidate = match.group(1).strip()
+        if candidate.casefold() not in {"jd", "的jd", "岗位", "目标岗位", "简历"}:
+            return candidate
+    return ""
+
+
+def _record_groups(source, section: str) -> list[list[str]]:
+    groups: list[list[str]] = []
+    group_ids: list[str] = []
+    for block in candidate_blocks(source):
+        if block.section_hint != section or _is_section_heading(block.text):
+            continue
+        group_id = block.record_id or f"{block.block_id}:single"
+        if not group_ids or group_ids[-1] != group_id:
+            group_ids.append(group_id)
+            groups.append([])
+        groups[-1].append(block.text.strip())
+    return groups
+
+
+def _fallback_record(section: str, lines: list[str]) -> tuple[dict, list[str]]:
+    """Parse identities conservatively and keep every unconsumed line."""
+
+    joined = " ｜ ".join(line for line in lines if line)
+    period = _labeled_value(joined, ("时间", "任职时间", "起止时间", "项目时间")) or _first_match(
+        _FALLBACK_PERIOD, joined,
+    )
+    organization = _labeled_value(joined, ("公司", "单位", "组织", "机构", "学校"))
+    if not organization:
+        organization = _organization_from_text(joined)
+    role = _labeled_value(joined, ("岗位", "职位", "角色", "职务"))
+    if not role:
+        for line in lines:
+            role = _role_from_text(line, organization)
+            if role:
+                break
+
+    consumed = {value for value in (period, organization, role) if value}
+    bullets: list[str] = []
+    for line in lines:
+        residual = line
+        for value in sorted(consumed, key=len, reverse=True):
+            residual = residual.replace(value, " ")
+        residual = re.sub(
+            r"(?:公司|单位|组织|机构|学校|岗位|职位|角色|职务|时间|任职时间|起止时间|项目时间)\s*[:：]",
+            " ",
+            residual,
+        )
+        residual = re.sub(r"^[\s|｜,，;；:：\-—~至到]+|[\s|｜,，;；:：\-—~至到]+$", "", residual)
+        if len(re.sub(r"\W+", "", residual)) >= 2:
+            bullets.append(residual)
+    bullets = list(dict.fromkeys(bullets))
+
+    if section == "experience":
+        return {
+            "organization": organization,
+            "role": role,
+            "period": period,
+            "bullets": bullets,
+        }, []
+    if section == "research":
+        topic = _labeled_value(joined, ("课题", "研究方向", "研究主题"))
+        if not topic:
+            topic = next((item for item in bullets if not _looks_like_record_body(item)), "")
+            if topic in bullets:
+                bullets.remove(topic)
+        return {
+            "institution": organization,
+            "topic": topic or role,
+            "period": period,
+            "bullets": bullets,
+        }, []
+    if section == "activities":
+        return {
+            "organization": organization,
+            "role": role,
+            "period": period,
+            "bullets": bullets,
+        }, []
+
+    name = _labeled_value(joined, ("项目名称", "项目"))
+    if not name:
+        header_candidates = [
+            line for line in lines
+            if not _looks_like_record_body(line) and line not in consumed
+        ]
+        if header_candidates:
+            candidate = header_candidates[0]
+            candidate = candidate.replace(period, " ") if period else candidate
+            candidate = candidate.replace(organization, " ") if organization else candidate
+            candidate = candidate.replace(role, " ") if role else candidate
+            name = re.sub(r"^[\s|｜,，;；:：\-]+|[\s|｜,，;；:：\-]+$", "", candidate)
+    if name in bullets:
+        bullets.remove(name)
+    return {
+        "name": name,
+        "organization": organization,
+        "role": role,
+        "period": period,
+        "bullets": bullets,
+    }, []
+
+
+def _fallback_education(lines: list[str]) -> tuple[dict, list[str]]:
+    joined = " ｜ ".join(lines)
+    school = _labeled_value(joined, ("学校", "院校")) or _first_match(_FALLBACK_ORGANIZATION, joined)
+    degree = _labeled_value(joined, ("学历", "学位")) or _first_match(_FALLBACK_DEGREE, joined)
+    major = _labeled_value(joined, ("专业",))
+    period = _labeled_value(joined, ("时间", "就读时间", "起止时间")) or _first_match(_FALLBACK_PERIOD, joined)
+    parts = [
+        part.strip()
+        for part in re.split(r"[|｜\t，,;；]+|\s{2,}", joined)
+        if part.strip()
+    ]
+    if len(parts) >= 2 and not _FALLBACK_PERIOD.fullmatch(parts[0]) and not _FALLBACK_DEGREE.fullmatch(parts[0]):
+        # Delimited education headers conventionally put the institution first;
+        # this also preserves anonymized names such as “学校0”.
+        school = parts[0]
+    if not school:
+        school = next((
+            value for value in parts
+            if not _FALLBACK_DEGREE.fullmatch(value)
+            and not _FALLBACK_PERIOD.fullmatch(value)
+        ), "")
+    if not major:
+        for value in parts:
+            if not value or any(item and item in value for item in (school, degree, period)):
+                continue
+            value = re.sub(r"(?:专业|学历|学位|时间|就读时间|起止时间)\s*[:：]", "", value).strip()
+            if value:
+                major = value
+                break
+    if not major:
+        residual = joined
+        for value in (school, degree, period):
+            if value:
+                residual = residual.replace(value, " ")
+        residual = re.sub(
+            r"(?:学校|院校|学历|学位|专业|时间|就读时间|起止时间)\s*[:：]",
+            " ",
+            residual,
+        )
+        residual = re.sub(r"[\s|｜,，;；:：\-—~至到]+", "", residual)
+        if 2 <= len(residual) <= 40:
+            major = residual
+    leftovers = []
+    for line in lines:
+        residual = line
+        for value in (school, degree, major, period):
+            if value:
+                residual = residual.replace(value, " ")
+        residual = re.sub(r"[\s|｜,，;；:：\-—~至到]+", "", residual)
+        if len(residual) >= 2:
+            leftovers.append(line)
+    return {"school": school, "degree": degree, "major": major, "period": period}, leftovers
+
+
+def _deterministic_fallback(cv_text: str, query_text: str, jd_text: str) -> CanonicalResume:
+    """Lossless, section-aware fallback for any profession and resume length."""
+
+    source = build_source_bundle(cv_text, query_text, jd_text)
+    factual_text = "\n".join(block.text for block in candidate_blocks(source))
+    industry = product_logic.infer_industry(query_text, factual_text, jd_text)
+    target_role = _fallback_target_role(query_text, jd_text)
+    raw = product_logic.heuristic_resume_from_text(factual_text, industry, target_role)
+    meta = dict(raw.get("meta") or {})
+
+    phone_match = re.search(r"1[3-9]\d(?:[\s-]?\d){8}", factual_text)
+    email_match = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", factual_text)
+    name_match = re.search(r"(?:姓名|name)\s*[:：]\s*([\u4e00-\u9fff·]{2,12})", factual_text, re.IGNORECASE)
+    if not name_match:
+        name_match = re.search(
+            r"(?m)^\s*([\u4e00-\u9fff·]{2,12})(?:个人)?简历\s*$",
+            factual_text,
+        )
+    seniority_match = re.search(
+        r"\d+(?:\.\d+)?\s*(?:年|个月|月)(?:工作|从业|实习)?(?:经验|经历)",
+        factual_text,
     )
 
-    meta = dict(raw.get("meta") or {})
-    experiences = []
-    for item in raw.get("experience", []) or []:
-        if not isinstance(item, dict):
-            continue
-        bullets = item.get("bullets") or item.get("responsibilities") or []
-        if isinstance(bullets, str):
-            bullets = [bullets]
-        experiences.append({
-            "organization": str(item.get("organization") or item.get("company") or ""),
-            "role": str(item.get("role") or ""),
-            "period": str(item.get("period") or ""),
-            "bullets": [str(value) for value in bullets if str(value).strip()],
-        })
+    additional: dict[str, list[str]] = {}
+    education: list[dict] = []
+    for lines in _record_groups(source, "education"):
+        record, leftovers = _fallback_education(lines)
+        if any(record.values()):
+            education.append(record)
+        if leftovers:
+            additional.setdefault("教育经历补充", []).extend(leftovers)
 
-    projects = []
-    for item in raw.get("projects", []) or []:
-        if not isinstance(item, dict):
-            continue
-        bullets = item.get("bullets") or item.get("description") or []
-        if isinstance(bullets, str):
-            bullets = [bullets]
-        projects.append({
-            "name": str(item.get("name") or ""),
-            "organization": str(item.get("organization") or item.get("company") or ""),
-            "role": str(item.get("role") or ""),
-            "period": str(item.get("period") or ""),
-            "bullets": [str(value) for value in bullets if str(value).strip()],
-        })
+    records: dict[str, list[dict]] = {name: [] for name in ("experience", "research", "activities", "projects")}
+    for section in records:
+        for lines in _record_groups(source, section):
+            record, leftovers = _fallback_record(section, lines)
+            if any(value for key, value in record.items() if key != "bullets") or record.get("bullets"):
+                records[section].append(record)
+            if leftovers:
+                additional.setdefault("待整理的原始经历", []).extend(leftovers)
 
-    skill_items = []
-    category_map = {
-        "languages": "language",
-        "frameworks": "framework",
-        "tools": "tool",
-        "domains": "domain",
-        "methodologies": "methodology",
-        "certifications": "certification",
-        "natural_languages": "natural_language",
-        "others": "other",
+    scalar_sections = {
+        "awards": "awards",
+        "publications": "publications",
+        "patents": "patents",
+        "certifications": "certifications",
+        "training": "training",
+        "teaching": "teaching",
     }
-    for category, values in (raw.get("skills") or {}).items():
-        if isinstance(values, list):
-            skill_items.extend(
-                {"name": str(value), "category": category_map.get(category, category)}
-                for value in values if str(value).strip()
+    scalars: dict[str, list[str]] = {target: [] for target in scalar_sections.values()}
+    summary_lines: list[str] = []
+    skill_items: list[dict[str, str]] = []
+    unclassified: list[str] = []
+    unstructured_current: tuple[str, int] | None = None
+    for block in candidate_blocks(source):
+        if _is_section_heading(block.text):
+            continue
+        section = block.section_hint or ""
+        value = block.text.strip()
+        if section == "summary":
+            summary_lines.append(value)
+        elif section == "skills":
+            value = re.sub(r"^(?:专业技能|技能清单|技术栈|工具|语言能力)\s*[:：]\s*", "", value)
+            for item in re.split(r"[、，,；;|｜/]+", value):
+                item = item.strip(" \t-•")
+                if len(item) >= 2:
+                    skill_items.append({"name": item, "category": "other"})
+        elif section in scalar_sections:
+            cleaned = re.sub(r"^[^:：]{1,12}[:：]\s*", "", value).strip()
+            if cleaned:
+                scalars[scalar_sections[section]].append(cleaned)
+        elif section not in {"education", "experience", "research", "activities", "projects"}:
+            skill_match = re.match(r"^(?:技能|专业技能|工具)\s*[:：]\s*(.+)$", value)
+            language_match = re.match(r"^(?:语言|语言能力)\s*[:：]\s*(.+)$", value)
+            if skill_match or language_match:
+                category = "natural_language" if language_match else "other"
+                raw_values = (skill_match or language_match).group(1)
+                for item in re.split(r"[、，,；;|｜/]+", raw_values):
+                    item = item.strip(" \t-•")
+                    if len(item) >= 2:
+                        skill_items.append({"name": item, "category": category})
+                unstructured_current = None
+                continue
+            if re.search(r"(?:奖学金|一等奖|二等奖|三等奖|优秀学生干部|荣誉称号|获奖)$", value):
+                scalars["awards"].append(value)
+                unstructured_current = None
+                continue
+            if re.search(r"(?:证书|资格证|执业证|职业资格|认证|执照)$", value):
+                scalars["certifications"].append(value)
+                unstructured_current = None
+                continue
+            profile_domain = re.search(
+                r"我(?:是)?(?:做|从事|负责)\s*([^，,。；;]{2,30}?)(?:的|方向|工作|$)",
+                value,
             )
+            if profile_domain:
+                domain = profile_domain.group(1).strip()
+                if domain:
+                    skill_items.append({"name": domain, "category": "domain"})
+                    summary_lines.append(value)
+                    continue
+
+            organization = _organization_from_text(value)
+            period = _first_match(_FALLBACK_PERIOD, value)
+            degree = _first_match(_FALLBACK_DEGREE, value)
+            compact_role = _role_from_text(value, organization)
+            activity_hint = bool(re.search(
+                r"(?:学生会|志愿者?(?:协会|团队)?|社团|校园组织|校团委|协会活动|社区义工)",
+                value,
+            ))
+            explicit_work = bool(
+                organization
+                and re.search(r"(?:就职于|任职于|供职于|在.+?(?:工作|担任|任职))", value)
+            )
+            project_match = re.search(
+                r"(?:参与|负责|主导|完成)\s*([^，。；;]{2,36}?(?:APP|系统|平台|项目|课题|产品))"
+                r"(?:的|设计|开发|建设|研究|$)",
+                value,
+                re.IGNORECASE,
+            )
+
+            if organization and degree:
+                record, leftovers = _fallback_education([value])
+                education.append(record)
+                if leftovers:
+                    additional.setdefault("教育经历补充", []).extend(leftovers)
+                unstructured_current = None
+                continue
+            if explicit_work or (organization and period and compact_role):
+                record, _leftovers = _fallback_record("experience", [value])
+                records["experience"].append(record)
+                unstructured_current = ("experience", len(records["experience"]) - 1)
+                continue
+            if activity_hint:
+                target_section = "activities"
+                if unstructured_current and unstructured_current[0] == target_section:
+                    current_record = records[target_section][unstructured_current[1]]
+                    current_org = str(current_record.get("organization", ""))
+                    same_activity = bool(
+                        current_org and (
+                            current_org in value
+                            or ("志愿" in current_org and "志愿" in value)
+                            or ("学生会" in current_org and "学生会" in value)
+                        )
+                    )
+                    if same_activity:
+                        current_record["bullets"].append(value)
+                        continue
+                if (
+                    unstructured_current
+                    and unstructured_current[0] == target_section
+                    and organization
+                    and records[target_section][unstructured_current[1]].get("organization") == organization
+                ):
+                    records[target_section][unstructured_current[1]]["bullets"].append(value)
+                else:
+                    records[target_section].append({
+                        "organization": organization,
+                        "role": _labeled_value(value, ("岗位", "职位", "角色", "职务")),
+                        "period": _first_match(_FALLBACK_PERIOD, value),
+                        "bullets": [value],
+                    })
+                    unstructured_current = (target_section, len(records[target_section]) - 1)
+                continue
+            if project_match:
+                name = project_match.group(1).strip()
+                if (
+                    unstructured_current
+                    and unstructured_current[0] == "projects"
+                    and re.search(r"^(?:撰写|完成|优化|设计|开发|建设|维护|测试)", name)
+                ):
+                    records["projects"][unstructured_current[1]]["bullets"].append(value)
+                    continue
+                records["projects"].append({
+                    "name": name,
+                    "organization": "",
+                    "role": "",
+                    "period": _first_match(_FALLBACK_PERIOD, value),
+                    "bullets": [value],
+                })
+                unstructured_current = ("projects", len(records["projects"]) - 1)
+                continue
+            if unstructured_current is not None and _looks_like_record_body(value):
+                current_section, current_index = unstructured_current
+                records[current_section][current_index]["bullets"].append(value)
+                continue
+            if unstructured_current is not None:
+                # Contact rows, summaries and a following record header must
+                # not leak into the preceding experience merely because OCR
+                # removed the section headings.
+                unstructured_current = None
+            if (
+                (phone_match and phone_match.group(0) in value)
+                or (email_match and email_match.group(0) in value)
+            ):
+                # The values have already been extracted into meta. Keeping a
+                # compact contact row as the personal summary duplicates PII
+                # and crowds out grounded professional content.
+                continue
+            if not summary_lines and len(value) >= 20:
+                summary_lines.append(value)
+                continue
+            if not any(token and token in value for token in (
+                name_match.group(1) if name_match else "",
+                phone_match.group(0) if phone_match else "",
+                email_match.group(0) if email_match else "",
+            )):
+                unclassified.append(value)
+    if unclassified:
+        additional["待整理的原始信息"] = list(dict.fromkeys(unclassified))
 
     return CanonicalResume.model_validate({
         "meta": {
-            "name": meta.get("name", ""),
-            "phone": meta.get("phone", ""),
-            "email": meta.get("email", ""),
-            "target_role": meta.get("target_role", target_role),
-            "work_experience": meta.get("work_experience", ""),
+            "name": (name_match.group(1) if name_match else meta.get("name", "")),
+            "phone": (phone_match.group(0) if phone_match else meta.get("phone", "")),
+            "email": (email_match.group(0) if email_match else meta.get("email", "")),
+            "target_role": target_role or meta.get("target_role", ""),
+            "work_experience": seniority_match.group(0) if seniority_match else "",
         },
-        "education": raw.get("education") or [],
-        "experience": experiences,
-        "projects": projects,
-        "skills": {"items": skill_items},
-        "summary": raw.get("summary", ""),
-        "awards": raw.get("awards") or raw.get("honors") or [],
-        "publications": raw.get("publications") or [],
-        "patents": raw.get("patents") or [],
-        "certifications": raw.get("certifications") or [],
-        "training": raw.get("training") or [],
-        "teaching": raw.get("teaching") or [],
-        "additional_sections": raw.get("additional_sections") or {},
+        "summary": "。".join(item.strip("。") for item in summary_lines if item.strip("。")),
+        "education": education,
+        "experience": records["experience"],
+        "research": records["research"],
+        "activities": records["activities"],
+        "projects": records["projects"],
+        "skills": {"items": list({item["name"]: item for item in skill_items}.values())},
+        **{key: list(dict.fromkeys(values)) for key, values in scalars.items()},
+        "additional_sections": {
+            title: list(dict.fromkeys(value for value in values if value.strip()))
+            for title, values in additional.items() if values
+        },
     })
 
 
@@ -688,6 +1358,52 @@ def _empty_profile_framework(target_role: str = "") -> dict:
     }
 
 
+_SOURCE_FALLBACK_FASTPATH_MIN_COVERAGE = 0.90
+
+
+def _has_structured_history(resume: CanonicalResume) -> bool:
+    """Require real canonical records, not merely raw text parked in extras."""
+
+    return any((
+        resume.education,
+        resume.experience,
+        resume.research,
+        resume.activities,
+        resume.projects,
+    ))
+
+
+def _grounded_source_fallback(
+    cv_text: str,
+    query_text: str,
+    jd_text: str,
+    source,
+    candidate_evidence: str,
+) -> tuple[VerifiedResult, float, list[str]]:
+    """Build the same evidence-gated fallback used by final coverage repair."""
+
+    fallback = _deterministic_fallback(cv_text, query_text, jd_text)
+    fallback = _ground_bullets(fallback, candidate_evidence)
+    fallback, fallback_bindings, fallback_removed = enforce_resume_evidence(
+        fallback,
+        source,
+    )
+    fallback = _compact_canonical(fallback)
+    fallback_bindings = bind_resume_evidence(fallback, source)
+    fallback_coverage, fallback_missing = _deterministic_source_coverage(
+        source,
+        fallback_bindings,
+    )
+    return VerifiedResult(
+        resume=fallback,
+        changes=[
+            Change(path=path, action="remove", reason="No candidate evidence binding")
+            for path in fallback_removed
+        ],
+        evidence_bindings=fallback_bindings,
+    ), fallback_coverage, fallback_missing
+
+
 def run_v2_pipeline(
     cv_text: str,
     query_text: str,
@@ -704,7 +1420,7 @@ def run_v2_pipeline(
         used_fallback = False
         if _is_empty_resume(resume) and query_text.strip():
             logger.warning("Generate composer produced an empty resume; using deterministic query fallback")
-            resume = _deterministic_fallback(query_text, query_text, jd_text)
+            resume = _deterministic_fallback("", query_text, jd_text)
             used_fallback = not _is_empty_resume(resume)
         n_exp = len(resume.experience)
         n_proj = len(resume.projects)
@@ -736,6 +1452,7 @@ def run_v2_pipeline(
         if _needs_optimizer(resume):
             before_optimizer = resume.model_copy(deep=True)
             resume = optimize_resume(resume, jd_text)
+            resume = _ground_optimizer_output(before_optimizer, resume, query_text)
             optimizer_changes = _bullet_rewrite_changes(before_optimizer, resume)
         else:
             logger.info("V2 | Optimizer skipped: no factual bullets")
@@ -783,13 +1500,40 @@ def run_v2_pipeline(
                 time.perf_counter() - t_composer)
 
     t_verifier = time.perf_counter()
+    candidate_evidence = "\n".join(block.text for block in candidate_blocks(source))
     result = _deterministic_verify_draft(source, draft)
     if result is None:
-        logger.info("V2 | Falling back to LLM Verifier")
-        result = verify_resume(source, draft)
+        fallback_candidate = None
+        try:
+            fallback_candidate = _grounded_source_fallback(
+                cv_text,
+                query_text,
+                jd_text,
+                source,
+                candidate_evidence,
+            )
+        except Exception as exc:
+            logger.warning("V2 | Pre-verifier source fallback failed: %s", exc)
+        if (
+            fallback_candidate is not None
+            and fallback_candidate[1] >= _SOURCE_FALLBACK_FASTPATH_MIN_COVERAGE
+            and _has_structured_history(fallback_candidate[0].resume)
+        ):
+            result, fallback_coverage, _fallback_missing = fallback_candidate
+            result.changes.insert(0, Change(
+                path="*",
+                action="replace",
+                reason="Used high-coverage deterministic parser before LLM verification",
+            ))
+            logger.info(
+                "V2 | LLM Verifier skipped: evidence-gated fallback coverage %.1f%%",
+                fallback_coverage * 100,
+            )
+        else:
+            logger.info("V2 | Falling back to LLM Verifier")
+            result = verify_resume(source, draft)
     else:
         logger.info("V2 | LLM Verifier skipped")
-    candidate_evidence = "\n".join(block.text for block in candidate_blocks(source))
     result.resume = _ground_bullets(result.resume, candidate_evidence)
     if _is_empty_resume(result.resume):
         logger.warning("V2 verifier produced an empty resume; using deterministic source fallback")
@@ -814,6 +1558,11 @@ def run_v2_pipeline(
     if _needs_optimizer(result.resume):
         before_optimizer = result.resume.model_copy(deep=True)
         result.resume = optimize_resume(result.resume, jd_text)
+        result.resume = _ground_optimizer_output(
+            before_optimizer,
+            result.resume,
+            candidate_evidence,
+        )
         result.changes.extend(_bullet_rewrite_changes(before_optimizer, result.resume))
     else:
         logger.info("V2 | Optimizer skipped: no factual bullets")
@@ -831,33 +1580,44 @@ def run_v2_pipeline(
     )
     result.resume = _compact_canonical(result.resume)
     result.evidence_bindings = bind_resume_evidence(result.resume, source)
-    coverage, missing_blocks = measure_source_coverage(source, result.evidence_bindings)
-    content_block_count = len({binding.block_id for binding in result.evidence_bindings}) + len(missing_blocks)
-    if content_block_count >= 5 and coverage < 0.62:
+    raw_coverage, raw_missing = measure_source_coverage(source, result.evidence_bindings)
+    coverage, missing_blocks = _deterministic_source_coverage(
+        source,
+        result.evidence_bindings,
+    )
+    if raw_missing and coverage > raw_coverage:
+        logger.info(
+            "V2 | Final coverage resolved structural artifacts: %.1f%% -> %.1f%%",
+            raw_coverage * 100,
+            coverage * 100,
+        )
+    if missing_blocks and coverage < 0.80:
         # Prefer a less polished deterministic parse only when it demonstrably
         # preserves substantially more of the source. This prevents a valid
         # long resume from collapsing to a few attractive bullets.
         try:
-            fallback = _deterministic_fallback(cv_text, query_text, jd_text)
-            fallback = _ground_bullets(fallback, candidate_evidence)
-            fallback, fallback_bindings, _ = enforce_resume_evidence(fallback, source)
-            fallback = _compact_canonical(fallback)
-            fallback_bindings = bind_resume_evidence(fallback, source)
-            fallback_coverage, _ = measure_source_coverage(source, fallback_bindings)
+            fallback_result, fallback_coverage, fallback_missing = _grounded_source_fallback(
+                cv_text,
+                query_text,
+                jd_text,
+                source,
+                candidate_evidence,
+            )
             if fallback_coverage >= coverage + 0.10:
                 logger.warning(
                     "V2 | Replaced low-coverage result with source-preserving fallback: %.1f%% -> %.1f%%",
                     coverage * 100,
                     fallback_coverage * 100,
                 )
-                result.resume = fallback
-                result.evidence_bindings = fallback_bindings
-                result.changes.append(Change(
+                result.resume = fallback_result.resume
+                result.evidence_bindings = fallback_result.evidence_bindings
+                result.changes = [Change(
                     path="*",
                     action="replace",
                     reason="Source coverage repair used the more complete deterministic parse",
-                ))
+                )] + fallback_result.changes
                 coverage = fallback_coverage
+                missing_blocks = fallback_missing
         except Exception as exc:
             logger.warning("V2 | Source coverage fallback failed: %s", exc)
     if missing_blocks:

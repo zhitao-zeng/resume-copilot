@@ -2,13 +2,17 @@ import json
 import logging
 import os
 import re
+import threading
+import time
+from contextlib import contextmanager
+from contextvars import ContextVar, Token
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
 from pydantic import BaseModel
 
-from llm_gateway import LLMGateway
+from llm_gateway import LLMDeadlineExceeded, LLMGateway
 
 try:
     from openai import OpenAI
@@ -69,7 +73,10 @@ if ENABLE_AVATAR_EXTRACTION:
 if ENABLE_LLM_FAILURE_DUMP:
     LLM_FAILURE_DUMP_DIR.mkdir(parents=True, exist_ok=True)
 
-ALLOWED_UPLOAD_EXTENSIONS = {".pdf", ".docx", ".png", ".jpg", ".jpeg", ".bmp", ".webp", ".txt", ".md"}
+ALLOWED_UPLOAD_EXTENSIONS = {
+    ".pdf", ".docx", ".png", ".jpg", ".jpeg", ".bmp", ".webp",
+    ".gif", ".tif", ".tiff", ".txt", ".md",
+}
 SUPPORTED_FILE_PATH_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif", ".tif", ".tiff"}
 MAX_FILE_SIZE = 20 * 1024 * 1024
 def _safe_env_int(name: str, default: int) -> int:
@@ -89,7 +96,91 @@ SHRINK_GUARD_MIN_SOURCE_CHARS = _safe_env_int("SHRINK_GUARD_MIN_SOURCE_CHARS", 5
 MAX_AUDIT_ISSUES = _safe_env_int("MAX_AUDIT_ISSUES", 12)
 LLM_TIMEOUT_SECONDS = _safe_env_int("LLM_TIMEOUT_SECONDS", 180)
 REQUEST_TIMEOUT_SECONDS = _safe_env_int("REQUEST_TIMEOUT_SECONDS", 480)
+LLM_DEADLINE_RESERVE_SECONDS = _safe_env_int("LLM_DEADLINE_RESERVE_SECONDS", 2)
+LLM_RETRY_MIN_REMAINING_SECONDS = _safe_env_int("LLM_RETRY_MIN_REMAINING_SECONDS", 10)
+LLM_INFLIGHT_LIMIT = _safe_env_int("LLM_INFLIGHT_LIMIT", 2)
 DATA_RETENTION_SECONDS = _safe_env_int("DATA_RETENTION_SECONDS", 7 * 24 * 60 * 60)
+
+# Bound all application-side LLM calls, including calls from different resume
+# requests and the Composer's internal workers. vLLM owns one shared model and
+# KV-cache pool, so this limit must match the production ``max-num-seqs`` value.
+_LLM_INFLIGHT_SLOTS = threading.BoundedSemaphore(LLM_INFLIGHT_LIMIT)
+
+_REQUEST_DEADLINE_AT: ContextVar[Optional[float]] = ContextVar(
+    "resume_copilot_request_deadline_at",
+    default=None,
+)
+
+
+def get_request_deadline() -> Optional[float]:
+    """Return the inherited absolute monotonic request deadline, if any."""
+
+    return _REQUEST_DEADLINE_AT.get()
+
+
+def set_request_deadline(
+    *,
+    deadline_at: Optional[float] = None,
+    timeout_seconds: Optional[float] = None,
+) -> Token:
+    """Set a request deadline without extending an inherited outer deadline.
+
+    ``asyncio.to_thread`` copies context variables, so synchronous Composer and
+    OpenAI calls made in worker threads continue to see this deadline.
+    """
+
+    candidates: list[float] = []
+    inherited = get_request_deadline()
+    if inherited is not None:
+        candidates.append(inherited)
+    if deadline_at is not None:
+        candidates.append(float(deadline_at))
+    if timeout_seconds is not None:
+        candidates.append(time.monotonic() + max(0.0, float(timeout_seconds)))
+    if not candidates:
+        raise ValueError("deadline_at or timeout_seconds is required")
+    return _REQUEST_DEADLINE_AT.set(min(candidates))
+
+
+def reset_request_deadline(token: Token) -> None:
+    """Restore the deadline context that existed before ``set``."""
+
+    _REQUEST_DEADLINE_AT.reset(token)
+
+
+def remaining_request_seconds() -> Optional[float]:
+    """Return non-negative request time remaining, or ``None`` outside a request."""
+
+    deadline_at = get_request_deadline()
+    if deadline_at is None:
+        return None
+    return max(0.0, deadline_at - time.monotonic())
+
+
+@contextmanager
+def _llm_inflight_slot():
+    """Acquire one global backend slot without waiting past the request budget."""
+
+    started = time.perf_counter()
+    remaining = remaining_request_seconds()
+    if remaining is None:
+        acquired = _LLM_INFLIGHT_SLOTS.acquire()
+    else:
+        usable = max(0.0, remaining - LLM_DEADLINE_RESERVE_SECONDS)
+        acquired = _LLM_INFLIGHT_SLOTS.acquire(timeout=usable)
+    if not acquired:
+        raise LLMDeadlineExceeded("request deadline reached while waiting for an LLM slot")
+    waited = time.perf_counter() - started
+    if waited >= 0.05:
+        logger.info(
+            "LLM inflight slot acquired | waited_s=%.3f limit=%d",
+            waited,
+            LLM_INFLIGHT_LIMIT,
+        )
+    try:
+        yield
+    finally:
+        _LLM_INFLIGHT_SLOTS.release()
 
 SECTION_HEADING_KEYWORDS = (
     "个人简历",
@@ -357,7 +448,15 @@ def get_client() -> OpenAI:
     if not llm_enabled():
         raise RuntimeError("OpenAI SDK, MODELHUB_API_KEY or MODELHUB_BASE_URL is not configured")
     if _client is None:
-        _client = OpenAI(api_key=API_KEY, base_url=API_BASE_URL, timeout=LLM_TIMEOUT_SECONDS)
+        # SDK retries happen below the application deadline and cannot be
+        # cancelled by ``asyncio.to_thread``. Keep retry policy in our gateway,
+        # where every additional call is checked against the request budget.
+        _client = OpenAI(
+            api_key=API_KEY,
+            base_url=API_BASE_URL,
+            timeout=LLM_TIMEOUT_SECONDS,
+            max_retries=0,
+        )
     return _client
 
 
@@ -369,6 +468,10 @@ def get_llm_gateway() -> LLMGateway:
             model_name=MODEL_NAME,
             logger=logger,
             enable_json_repair=ENABLE_LLM_JSON_REPAIR,
+            call_timeout_seconds=LLM_TIMEOUT_SECONDS,
+            request_time_remaining=remaining_request_seconds,
+            deadline_reserve_seconds=LLM_DEADLINE_RESERVE_SECONDS,
+            retry_min_remaining_seconds=LLM_RETRY_MIN_REMAINING_SECONDS,
             dump_failure_payload=lambda tag, raw_content, error: _dump_llm_failure_payload(
                 tag=tag,
                 raw_content=raw_content,
@@ -418,14 +521,15 @@ def call_llm_typed(
     max_tokens: int = 4096,
     prefill: str = "{",
 ) -> dict[str, Any]:
-    return get_llm_gateway().call_typed(
-        output_model=output_model,
-        system_prompt=system_prompt,
-        user_prompt=user_prompt,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        prefill=prefill,
-    )
+    with _llm_inflight_slot():
+        return get_llm_gateway().call_typed(
+            output_model=output_model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            prefill=prefill,
+        )
 
 
 def call_llm_text(
@@ -435,9 +539,10 @@ def call_llm_text(
     max_tokens: int = 4096,
 ) -> str:
     """Call LLM and return raw text. No JSON parsing or schema injection."""
-    return get_llm_gateway().call_text(
-        system_prompt=system_prompt,
-        user_prompt=user_prompt,
-        temperature=temperature,
-        max_tokens=max_tokens,
-    )
+    with _llm_inflight_slot():
+        return get_llm_gateway().call_text(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )

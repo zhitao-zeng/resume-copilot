@@ -9,15 +9,20 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from typing import Any
 
-from llm_gateway import parse_json_content
+from llm_gateway import LLMDeadlineExceeded, parse_json_content
 from server_runtime import call_llm_text, llm_enabled
 from v2_schemas import CanonicalResume
 
 logger = logging.getLogger(__name__)
+
+_MAX_OPTIMIZER_CONCURRENCY = 2
 
 
 _STRONG_ACTIONS = ("主导", "统筹", "牵头", "独立负责", "全权负责", "从0到1", "从零到一")
@@ -174,7 +179,7 @@ def _build_optimizer_batches(resume: CanonicalResume) -> list[dict[str, list[dic
             bullet_count = len(record.bullets)
             char_count = sum(len(str(value)) for value in record.bullets)
             if current_bullets and (
-                current_bullets + bullet_count > 16 or current_chars + char_count > 6000
+                current_bullets + bullet_count > 8 or current_chars + char_count > 2500
             ):
                 batches.append(current)
                 current = {name: [] for name in current}
@@ -186,6 +191,88 @@ def _build_optimizer_batches(resume: CanonicalResume) -> list[dict[str, list[dic
     if current_bullets:
         batches.append(current)
     return batches
+
+
+def _split_optimizer_batch(
+    payload: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, list[dict[str, Any]]]]:
+    records = [
+        (section, record)
+        for section in ("experience", "research", "activities", "projects")
+        for record in payload.get(section, [])
+    ]
+    if len(records) < 2:
+        return []
+    middle = len(records) // 2
+    result: list[dict[str, list[dict[str, Any]]]] = []
+    for subset in (records[:middle], records[middle:]):
+        child = {section: [] for section in payload}
+        for section, record in subset:
+            child[section].append(record)
+        result.append(child)
+    return result
+
+
+def _optimizer_concurrency() -> int:
+    """Return the bounded fan-out supported by the 40 GiB runtime profile."""
+
+    try:
+        configured = int(os.getenv("LLM_OPTIMIZER_CONCURRENCY", "2"))
+    except (TypeError, ValueError):
+        configured = 2
+    return max(1, min(_MAX_OPTIMIZER_CONCURRENCY, configured))
+
+
+def _build_optimizer_prompt(
+    payload: dict[str, list[dict[str, Any]]],
+    jd_text: str,
+) -> str:
+    prompt = "请优化以下已校验简历的文字。每条记录中的 index 是整份简历的稳定索引，输出时必须原样使用。\n\n"
+    if jd_text.strip():
+        prompt += f"【目标岗位，仅用于排序和措辞】\n{jd_text.strip()[:1600]}\n\n"
+    return prompt + "【只读事实与原始 bullets】\n" + json.dumps(
+        payload,
+        ensure_ascii=False,
+    )
+
+
+def _optimize_batch(
+    payload: dict[str, list[dict[str, Any]]],
+    jd_text: str,
+) -> dict[str, Any]:
+    """Call and parse one independent optimizer batch in a worker thread."""
+
+    content = call_llm_text(
+        OPTIMIZER_SYSTEM_PROMPT,
+        _build_optimizer_prompt(payload, jd_text),
+        temperature=0.0,
+        max_tokens=4096,
+    )
+    parsed = parse_json_content(content)
+    if not isinstance(parsed, dict) or not parsed:
+        raise ValueError(f"Optimizer batch JSON parse failed, len={len(content)}")
+    return parsed
+
+
+def _patches_for_payload(
+    payload: dict[str, list[dict[str, Any]]],
+    section: str,
+    patches: Any,
+) -> list[dict[str, Any]]:
+    """Reject patches that target records outside their isolated batch."""
+
+    if not isinstance(patches, list):
+        return []
+    allowed_indices = {
+        record.get("index")
+        for record in payload.get(section, [])
+        if isinstance(record, dict) and isinstance(record.get("index"), int)
+    }
+    return [
+        patch
+        for patch in patches
+        if isinstance(patch, dict) and patch.get("index") in allowed_indices
+    ]
 
 
 def optimize_resume(resume: CanonicalResume, jd_text: str = "") -> CanonicalResume:
@@ -204,37 +291,87 @@ def optimize_resume(resume: CanonicalResume, jd_text: str = "") -> CanonicalResu
     optimized = resume.model_copy(deep=True)
     accepted = 0
     batches = _build_optimizer_batches(resume)
-    for batch_index, payload in enumerate(batches):
-        prompt = "请优化以下已校验简历的文字。每条记录中的 index 是整份简历的稳定索引，输出时必须原样使用。\n\n"
-        if jd_text.strip():
-            prompt += f"【目标岗位，仅用于排序和措辞】\n{jd_text.strip()[:1600]}\n\n"
-        prompt += "【只读事实与原始 bullets】\n" + json.dumps(payload, ensure_ascii=False)
-        try:
-            content = call_llm_text(
-                OPTIMIZER_SYSTEM_PROMPT,
-                prompt,
-                temperature=0.0,
-                max_tokens=4096,
-            )
-        except Exception as exc:
-            logger.warning("Optimizer batch %d/%d failed: %s", batch_index + 1, len(batches), exc)
-            continue
-        parsed = parse_json_content(content)
-        if not isinstance(parsed, dict) or not parsed:
-            logger.warning(
-                "Optimizer batch %d/%d JSON parse failed, len=%d",
-                batch_index + 1,
-                len(batches),
-                len(content),
-            )
-            continue
+    initial_batch_count = len(batches)
+    pending: list[tuple[tuple[int, ...], dict[str, list[dict[str, Any]]]]] = [
+        ((index,), payload) for index, payload in enumerate(batches)
+    ]
+    completed: dict[
+        tuple[int, ...],
+        tuple[dict[str, list[dict[str, Any]]], dict[str, Any]],
+    ] = {}
+    attempted = 0
+    worker_count = _optimizer_concurrency()
+    deadline_reached = False
+    with ThreadPoolExecutor(
+        max_workers=worker_count,
+        thread_name_prefix="resume-optimizer",
+    ) as executor:
+        while pending and not deadline_reached:
+            wave = pending[:worker_count]
+            del pending[:len(wave)]
+            attempted += len(wave)
+            futures = [
+                (
+                    key,
+                    payload,
+                    executor.submit(
+                        copy_context().run,
+                        _optimize_batch,
+                        payload,
+                        jd_text,
+                    ),
+                )
+                for key, payload in wave
+            ]
+            retries: list[
+                tuple[tuple[int, ...], dict[str, list[dict[str, Any]]]]
+            ] = []
+            for key, payload, future in futures:
+                try:
+                    completed[key] = (payload, future.result())
+                except LLMDeadlineExceeded as exc:
+                    deadline_reached = True
+                    logger.warning(
+                        "Optimizer stopped at request deadline; kept remaining original wording: %s",
+                        exc,
+                    )
+                except Exception as exc:
+                    children = _split_optimizer_batch(payload)
+                    if children:
+                        retries.extend(
+                            (key + (child_index,), child)
+                            for child_index, child in enumerate(children)
+                        )
+                        logger.warning(
+                            "Optimizer batch failed and was split into %d smaller batches: %s",
+                            len(children),
+                            exc,
+                        )
+                    else:
+                        logger.warning(
+                            "Optimizer single-record batch failed; kept original wording: %s",
+                            exc,
+                        )
+            if not deadline_reached:
+                # Retry failed child batches before later records. Successful
+                # results are applied only after all workers finish, on the
+                # caller thread and in stable source order.
+                pending[0:0] = retries
+
+    for key in sorted(completed):
+        payload, parsed = completed[key]
         for section in ("experience", "research", "activities", "projects"):
-            accepted += _apply_section_patches(optimized, section, parsed.get(section))
+            accepted += _apply_section_patches(
+                optimized,
+                section,
+                _patches_for_payload(payload, section, parsed.get(section)),
+            )
 
     logger.info(
-        "Optimizer patches applied: %d/%d bullets across %d batch(es)",
+        "Optimizer patches applied: %d/%d bullets across %d initial/%d attempted batch(es)",
         accepted,
         total_bullets,
-        len(batches),
+        initial_batch_count,
+        attempted,
     )
     return optimized

@@ -1408,6 +1408,46 @@ def _render_docx_minimal(doc: DocxDocument, resume_data: dict[str, Any]) -> None
             if isinstance(tech, list) and tech:
                 doc.add_paragraph("Tech: " + " · ".join(str(x) for x in tech))
 
+    education = resume_data.get("education", []) if isinstance(resume_data, dict) else []
+    if isinstance(education, list) and education:
+        _add_section_heading(doc, "教育经历", "minimal")
+        for edu in education:
+            if not isinstance(edu, dict):
+                continue
+            line = " | ".join(
+                str(value).strip()
+                for value in (
+                    edu.get("school", ""),
+                    " ".join(str(value).strip() for value in (edu.get("degree", ""), edu.get("major", "")) if str(value).strip()),
+                    edu.get("period", ""),
+                )
+                if str(value).strip()
+            )
+            if line:
+                doc.add_paragraph(line)
+
+    skills = resume_data.get("skills", {}) if isinstance(resume_data, dict) else {}
+    if isinstance(skills, dict) and any(skills.values()):
+        _add_section_heading(doc, "专业技能", "minimal")
+        for key, label in {
+            "languages": "编程语言", "frameworks": "框架工具", "tools": "工具",
+            "domains": "专业领域", "methodologies": "方法与流程",
+            "certifications": "证书与资质", "natural_languages": "语言能力",
+            "others": "其他专业技能",
+        }.items():
+            values = skills.get(key, [])
+            if isinstance(values, list) and values:
+                doc.add_paragraph(f"{label}：" + " · ".join(str(value) for value in values))
+
+    publications = resume_data.get("publications", []) if isinstance(resume_data, dict) else []
+    if isinstance(publications, list):
+        _append_docx_text_section(
+            doc,
+            "论文与专利成果",
+            [_publication_line(item) for item in publications if _has_publication_content(item)],
+            "minimal",
+        )
+
     _append_docx_text_section(
         doc,
         "荣誉与奖项",
@@ -1903,6 +1943,7 @@ def _apply_resume_data_to_template(doc: "DocxDocument", resume_data: dict[str, A
     sections = _build_renderable_sections(resume_data)
 
     for section_heading, items in sections:
+        matched = False
         for para in doc.paragraphs:
             full_text = para.text.strip()
             if _template_section_matches(full_text, section_heading):
@@ -1936,7 +1977,30 @@ def _apply_resume_data_to_template(doc: "DocxDocument", resume_data: dict[str, A
                             run.font.size = Pt(10)
 
                 # Remove any paragraphs after this section (could be stale content)
+                matched = True
                 break
+        if matched:
+            continue
+        # A user template rarely contains every profession-specific heading.
+        # Append every non-empty unmatched section so custom styling cannot
+        # silently discard research, campus, education, skills or publications.
+        section_para = doc.add_paragraph()
+        run = section_para.add_run(section_heading)
+        run.bold = True
+        run.font.size = Pt(12)
+        section_para.paragraph_format.space_before = Pt(8)
+        section_para.paragraph_format.space_after = Pt(4)
+        for item in items:
+            if isinstance(item, tuple) and len(item) == 2:
+                sub_heading, sub_items = item
+                sub_para = doc.add_paragraph()
+                sub_run = sub_para.add_run(str(sub_heading))
+                sub_run.bold = True
+                for sub_item in sub_items:
+                    bullet = doc.add_paragraph(style="List Bullet")
+                    bullet.add_run(str(sub_item))
+            else:
+                doc.add_paragraph(str(item))
 
 
 def _template_section_matches(text: str, section_heading: str) -> bool:
@@ -1947,6 +2011,11 @@ def _template_section_matches(text: str, section_heading: str) -> bool:
         "个人总结": {"个人简介", "自我评价", "职业总结"},
         "教育背景": {"教育经历", "学历背景"},
         "专业技能": {"技能", "技能清单", "个人技能"},
+        "工作/实习经历": {"工作经历", "实习经历", "职业经历", "任职经历"},
+        "项目经历": {"项目经验", "个人项目", "课程项目"},
+        "科研经历": {"研究经历", "实验室经历"},
+        "校园与志愿经历": {"校园经历", "社团经历", "志愿经历", "社会实践"},
+        "论文与专利成果": {"论文成果", "论文", "专利成果", "学术成果"},
     }
     candidates = {target, *aliases.get(target, set())}
     return any(candidate and (normalized == candidate or candidate in normalized) for candidate in candidates)
@@ -2055,6 +2124,7 @@ def _build_renderable_sections(resume_data: dict[str, Any]) -> list[tuple[str, l
     # Experience
     experience = resume_data.get("experience", [])
     if isinstance(experience, list) and experience:
+        experience_items = []
         for exp in experience:
             if not isinstance(exp, dict):
                 continue
@@ -2076,11 +2146,35 @@ def _build_renderable_sections(resume_data: dict[str, Any]) -> list[tuple[str, l
             ach = exp.get("achievements", [])
             if isinstance(ach, list):
                 items.extend([a for a in ach if a])
-            sections.append((exp_heading, items))
+            experience_items.append((exp_heading, items))
+        if experience_items:
+            sections.append(("工作/实习经历", experience_items))
+
+    for key, title in (("research", "科研经历"), ("campus_experience", "校园与志愿经历")):
+        records = resume_data.get(key, [])
+        if not isinstance(records, list) or not records:
+            continue
+        record_items = []
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            heading = " | ".join(
+                str(value).strip()
+                for value in (
+                    record.get("company") or record.get("organization"),
+                    record.get("role") or record.get("topic"),
+                    record.get("period"),
+                )
+                if str(value or "").strip()
+            ) or title
+            record_items.append((heading, _collect_experience_bullets(record)))
+        if record_items:
+            sections.append((title, record_items))
 
     # Projects
     projects = resume_data.get("projects", [])
     if isinstance(projects, list) and projects:
+        project_items = []
         for proj in projects:
             if not isinstance(proj, dict):
                 continue
@@ -2101,7 +2195,9 @@ def _build_renderable_sections(resume_data: dict[str, Any]) -> list[tuple[str, l
             tech = proj.get("tech_stack", [])
             if isinstance(tech, list) and tech:
                 items.append("技术栈: " + " · ".join(str(t) for t in tech))
-            sections.append((heading, items))
+            project_items.append((heading, items))
+        if project_items:
+            sections.append(("项目经历", project_items))
 
     # Skills
     skills = resume_data.get("skills", {})

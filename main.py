@@ -44,13 +44,19 @@ from server_runtime import (
     REQUEST_TIMEOUT_SECONDS,
     llm_enabled,
     logger,
+    remaining_request_seconds,
+    reset_request_deadline,
+    set_request_deadline,
 )
 
 app = FastAPI(title="Resume Audit & Optimize API", version="3.1.0")
 cors_origins = [item.strip() for item in os.getenv("CORS_ORIGINS", "*").split(",") if item.strip()]
 MAX_REQUEST_SIZE_BYTES = int(os.getenv("MAX_REQUEST_SIZE_BYTES", str(64 * 1024 * 1024)))
 REQUEST_CONCURRENCY = max(1, int(os.getenv("REQUEST_CONCURRENCY", "2")))
+REQUEST_QUEUE_LIMIT = max(1, int(os.getenv("REQUEST_QUEUE_LIMIT", "8")))
 _request_slots = asyncio.Semaphore(REQUEST_CONCURRENCY)
+_request_waiters = 0
+_request_waiters_lock = asyncio.Lock()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_origins,
@@ -62,15 +68,29 @@ app.add_middleware(
 
 @app.middleware("http")
 async def authenticate_requests(request: Request, call_next):
-    content_length = request.headers.get("Content-Length", "")
-    if content_length.isdigit() and int(content_length) > MAX_REQUEST_SIZE_BYTES:
-        return JSONResponse(status_code=413, content={"detail": "request body is too large"})
-    expected = os.getenv("API_AUTH_TOKEN", "").strip()
-    if expected and request.url.path not in {"/ready", "/health"}:
-        supplied = request.headers.get("Authorization", "")
-        if not hmac.compare_digest(supplied, f"Bearer {expected}"):
-            return JSONResponse(status_code=401, content={"detail": "unauthorized"})
-    return await call_next(request)
+    deadline_token = set_request_deadline(timeout_seconds=REQUEST_TIMEOUT_SECONDS)
+    try:
+        content_length = request.headers.get("Content-Length", "")
+        if content_length.isdigit() and int(content_length) > MAX_REQUEST_SIZE_BYTES:
+            return JSONResponse(status_code=413, content={"detail": "request body is too large"})
+        expected = os.getenv("API_AUTH_TOKEN", "").strip()
+        if expected and request.url.path not in {"/ready", "/health"}:
+            supplied = request.headers.get("Authorization", "")
+            if not hmac.compare_digest(supplied, f"Bearer {expected}"):
+                return JSONResponse(status_code=401, content={"detail": "unauthorized"})
+        remaining = remaining_request_seconds()
+        if remaining is None or remaining <= 0:
+            return JSONResponse(status_code=504, content={"detail": "request deadline exceeded"})
+        try:
+            async with asyncio.timeout(remaining):
+                return await call_next(request)
+        except TimeoutError:
+            return JSONResponse(
+                status_code=504,
+                content={"detail": f"request exceeded the {REQUEST_TIMEOUT_SECONDS}s budget"},
+            )
+    finally:
+        reset_request_deadline(deadline_token)
 
 
 async def _backend_ready() -> bool:
@@ -86,12 +106,31 @@ async def _backend_ready() -> bool:
 
 
 async def _run_copilot_with_timeout(**kwargs):
+    global _request_waiters
+    deadline_token = set_request_deadline(timeout_seconds=REQUEST_TIMEOUT_SECONDS)
+    acquired = False
+    waiting_registered = False
     try:
-        await asyncio.wait_for(_request_slots.acquire(), timeout=0.1)
-    except TimeoutError as exc:
-        raise HTTPException(status_code=429, detail="server is at generation capacity; retry later") from exc
-    try:
-        async with asyncio.timeout(REQUEST_TIMEOUT_SECONDS):
+        async with _request_waiters_lock:
+            if _request_waiters >= REQUEST_QUEUE_LIMIT:
+                raise HTTPException(
+                    status_code=429,
+                    detail="server request queue is full; retry later",
+                )
+            _request_waiters += 1
+            waiting_registered = True
+        remaining = remaining_request_seconds()
+        if remaining is None or remaining <= 0:
+            raise TimeoutError
+        await asyncio.wait_for(_request_slots.acquire(), timeout=remaining)
+        acquired = True
+        async with _request_waiters_lock:
+            _request_waiters -= 1
+            waiting_registered = False
+        remaining = remaining_request_seconds()
+        if remaining is None or remaining <= 0:
+            raise TimeoutError
+        async with asyncio.timeout(remaining):
             return await resume_copilot_service(**kwargs)
     except TimeoutError as exc:
         raise HTTPException(
@@ -99,7 +138,12 @@ async def _run_copilot_with_timeout(**kwargs):
             detail=f"resume-copilot exceeded the {REQUEST_TIMEOUT_SECONDS}s request budget",
         ) from exc
     finally:
-        _request_slots.release()
+        if waiting_registered:
+            async with _request_waiters_lock:
+                _request_waiters = max(0, _request_waiters - 1)
+        if acquired:
+            _request_slots.release()
+        reset_request_deadline(deadline_token)
 
 
 @app.exception_handler(HTTPException)

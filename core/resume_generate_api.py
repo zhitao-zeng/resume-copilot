@@ -14,8 +14,12 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import logging
+import multiprocessing as mp
 import os
+import re
 import shutil
+import signal
+import secrets
 import time
 import threading
 from pathlib import Path
@@ -23,9 +27,19 @@ from typing import Any
 
 from flask import Flask, request, Response, send_file
 
+from http_compat import HTTPException
 from resume_copilot_service import resume_copilot_service
 from resume_io import extract_text_from_bytes, IMAGE_EXTENSIONS
-from server_runtime import OUTPUT_DIR, DEFAULT_TEMPLATE, MAX_FILE_SIZE, logger
+from server_runtime import (
+    API_BASE_URL,
+    OUTPUT_DIR,
+    DEFAULT_TEMPLATE,
+    MAX_FILE_SIZE,
+    REQUEST_TIMEOUT_SECONDS,
+    logger,
+    reset_request_deadline,
+    set_request_deadline,
+)
 from security_utils import safe_child_path, safe_filename, safe_task_id
 
 app = Flask(__name__)
@@ -82,14 +96,35 @@ _werkzeug_log.info = _quiet_werkzeug
 async_tasks: dict[str, dict] = {}
 task_lock = threading.Lock()
 
+
+def _positive_float_env(name: str, default: float) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
 # ── Task queue (single worker to avoid thread/event-loop accumulation) ──
 _task_executor = concurrent.futures.ThreadPoolExecutor(
     max_workers=int(os.getenv("TASK_MAX_WORKERS", "1")),
 )
-_task_futures: dict[str, concurrent.futures.Future] = {}
+_task_futures: dict[str, tuple[str, concurrent.futures.Future]] = {}
 _task_futures_lock = threading.Lock()
+_task_timers: dict[str, tuple[str, threading.Timer]] = {}
+_task_timers_lock = threading.Lock()
 _TASK_QUEUE_LIMIT = max(1, int(os.getenv("TASK_QUEUE_LIMIT", "8")))
 _TASK_STATE_TTL = max(60, int(os.getenv("TASK_STATE_TTL_SECONDS", "86400")))
+_TASK_DEADLINE_SECONDS = max(
+    1.0,
+    min(
+        _positive_float_env("TASK_DEADLINE_SECONDS", 450.0),
+        max(1.0, float(REQUEST_TIMEOUT_SECONDS) - 5.0),
+    ),
+)
+_TASK_PROCESS_KILL_GRACE_SECONDS = max(
+    0.2, _positive_float_env("TASK_PROCESS_KILL_GRACE_SECONDS", 1.5)
+)
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 UPLOADS_DIR = OUTPUT_DIR / "uploads"
@@ -98,9 +133,105 @@ UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 _json_logger = logging.getLogger("resume_api")
 
 
-def _discard_future(task_id: str) -> None:
+def _discard_future(task_id: str, run_id: str) -> None:
     with _task_futures_lock:
-        _task_futures.pop(task_id, None)
+        current = _task_futures.get(task_id)
+        if current and current[0] == run_id:
+            _task_futures.pop(task_id, None)
+    with _task_timers_lock:
+        current_timer = _task_timers.get(task_id)
+        if current_timer and current_timer[0] == run_id:
+            _task_timers.pop(task_id, None)
+            current_timer[1].cancel()
+
+
+def _task_is_active(task_id: str, run_id: str) -> bool:
+    with task_lock:
+        state = async_tasks.get(task_id)
+        return bool(
+            state
+            and state.get("run_id") == run_id
+            and not state.get("finished", False)
+        )
+
+
+def _publish_terminal_state(task_id: str, run_id: str, **updates: Any) -> bool:
+    """Publish exactly one terminal result for the current incarnation."""
+
+    with task_lock:
+        state = async_tasks.get(task_id)
+        if (
+            not state
+            or state.get("run_id") != run_id
+            or state.get("finished", False)
+        ):
+            return False
+        state.update(updates)
+        state["finished"] = True
+        state["end_time"] = time.time()
+        return True
+
+
+def _remove_task_state(task_id: str, run_id: str) -> None:
+    """Remove only the exact task incarnation owned by the caller."""
+
+    with task_lock:
+        state = async_tasks.get(task_id)
+        if state and state.get("run_id") == run_id:
+            async_tasks.pop(task_id, None)
+
+
+def _publish_success_file(
+    task_id: str,
+    run_id: str,
+    *,
+    temp_path: Path,
+    final_path: Path,
+    summary: str,
+) -> bool:
+    """Atomically publish both the DOCX and its successful task state."""
+
+    with task_lock:
+        state = async_tasks.get(task_id)
+        if (
+            not state
+            or state.get("run_id") != run_id
+            or state.get("finished", False)
+        ):
+            return False
+        os.replace(temp_path, final_path)
+        state.update(
+            status="done",
+            summary=summary,
+            file_path=str(final_path),
+            error=None,
+            finished=True,
+            end_time=time.time(),
+        )
+        return True
+
+
+def _expire_task(task_id: str, run_id: str, form_data: Any) -> None:
+    """Deadline callback for both queued and supervised running jobs."""
+
+    published = _publish_terminal_state(
+        task_id,
+        run_id,
+        status="error",
+        summary=f"生成失败: 端到端处理超过 {_TASK_DEADLINE_SECONDS:.0f} 秒，任务已终止",
+        file_path="",
+        error="end-to-end task deadline exceeded",
+    )
+    if not published:
+        return
+    # Do not hold the mapping lock while cancelling: Future callbacks may
+    # immediately re-enter _discard_future.
+    with _task_futures_lock:
+        current = _task_futures.get(task_id)
+        future = current[1] if current and current[0] == run_id else None
+    cancelled_before_start = bool(future and future.cancel())
+    if cancelled_before_start:
+        _cleanup_saved_inputs(form_data)
 
 
 def _cleanup_task_state() -> None:
@@ -222,6 +353,8 @@ def _extract_file_field(form_data: dict, field_name: str, id_str: str) -> tuple[
                 content = f.read()
             text = extract_text_from_bytes(content, save_path.name)
             return str(save_path), text
+        except HTTPException:
+            raise
         except Exception as exc:
             logger.warning("Failed to extract text from pre-saved %s: %s", field_name, exc)
             return str(save_path), None
@@ -249,6 +382,8 @@ def _extract_file_field(form_data: dict, field_name: str, id_str: str) -> tuple[
                 content = f.read()
             text = extract_text_from_bytes(content, save_path.name)
             return str(save_path), text
+        except HTTPException:
+            raise
         except Exception as exc:
             logger.warning("Failed to extract text from %s: %s", field_name, exc)
             return str(save_path), None
@@ -261,182 +396,356 @@ def _extract_file_field(form_data: dict, field_name: str, id_str: str) -> tuple[
     return None, None
 
 
-def _wait_vllm_ready(max_wait: int = 900) -> float:
-    """Block until vLLM /health returns 200, or timeout. Returns elapsed seconds."""
+def _wait_vllm_ready(max_wait: float = 15.0, *, deadline_at: float | None = None) -> float:
+    """Wait briefly for vLLM, bounded by the end-to-end task deadline."""
     import urllib.request
-    import urllib.error
-    started = time.time()
-    for i in range(max_wait):
+    from urllib.parse import urlsplit, urlunsplit
+
+    configured_health_url = os.getenv("MODELHUB_HEALTH_URL", "").strip()
+    if configured_health_url:
+        health_url = configured_health_url
+    else:
+        api_url = urlsplit(API_BASE_URL)
+        if not api_url.scheme or not api_url.netloc:
+            raise RuntimeError(f"Invalid MODELHUB_BASE_URL: {API_BASE_URL!r}")
+        # vLLM exposes /health outside the OpenAI-compatible /v1 namespace.
+        # Reverse proxies with a path prefix can provide MODELHUB_HEALTH_URL.
+        health_url = urlunsplit((api_url.scheme, api_url.netloc, "/health", "", ""))
+
+    started = time.monotonic()
+    wait_deadline = started + max(0.1, float(max_wait))
+    if deadline_at is not None:
+        wait_deadline = min(wait_deadline, float(deadline_at))
+    first_attempt = True
+    while time.monotonic() < wait_deadline:
         try:
-            urllib.request.urlopen("http://localhost:8000/health", timeout=2)
-            elapsed = time.time() - started
+            with urllib.request.urlopen(health_url, timeout=2):
+                pass
+            elapsed = time.monotonic() - started
             _json_logger.info("vLLM ready after %.0fs", elapsed)
             return elapsed
         except Exception:
-            if i == 0:
+            if first_attempt:
                 _json_logger.info("Waiting for vLLM to be ready...")
-            time.sleep(1)
-    _json_logger.warning("vLLM not ready after %ds, proceeding anyway", max_wait)
-    return time.time() - started
+                first_attempt = False
+            time.sleep(min(0.5, max(0.0, wait_deadline - time.monotonic())))
+    elapsed = time.monotonic() - started
+    raise RuntimeError(f"vLLM not ready within {elapsed:.1f}s")
 
 
-def _process_resume(task_id: str, form_data: Any) -> None:
-    """Background task: call resume_copilot_service and store results."""
-    start_time = time.time()
+def _execute_resume_job(task_id: str, form_data: Any, deadline_at: float) -> dict[str, Any]:
+    """Execute one resume job inside an isolated child process."""
 
-    with task_lock:
-        async_tasks[task_id] = {
-            "status": "processing",
-            "finished": False,
-            "summary": "",
-            "file_path": "",
-            "error": None,
-            "start_time": start_time,
-        }
+    _wait_vllm_ready(deadline_at=deadline_at)
+    query = str(form_data.get("Query") or form_data.get("query") or "")
+    target_jd_text = str(form_data.get("target_jd") or "")
+    keys_summary = [f"{key}=<str:{len(str(form_data[key]))}c>" for key in form_data]
+    _json_logger.info(
+        "[%s] form keys: %d fields, %s",
+        task_id,
+        len(form_data),
+        ", ".join(keys_summary) if keys_summary else "(none)",
+    )
+
+    cv_path, cv_text = _extract_file_field(form_data, "cv", task_id)
+    cv_template_path = _save_upload_file(form_data.get("cv_template"), task_id, "cv_template")
+    jd_path, jd_text = _extract_file_field(form_data, "target_jd", task_id)
+    final_jd = jd_text or target_jd_text or ""
+
+    cv_upload = None
+    if cv_text and len(cv_text.strip()) > 5:
+        _json_logger.info("[%s] cv uses pre-extracted text (%d chars)", task_id, len(cv_text))
+        cv_upload = _MockUpload(None, "cv.txt", content=cv_text)
+    elif cv_path:
+        # Text extraction may legitimately be empty for an unsupported/blank
+        # document. The hard OCR error is propagated instead of retrying here.
+        cv_upload = _MockUpload(cv_path, Path(cv_path).name)
+
+    cv_template_upload = _MockUpload(cv_template_path, "template") if cv_template_path else None
+    jd_upload = _MockUpload(jd_path, Path(jd_path).name) if jd_path else None
+    is_url = bool(re.match(r"^https?://", final_jd.strip(), re.IGNORECASE)) if final_jd else False
+    target_jd_url = final_jd if is_url else None
+    jd_text_value = final_jd if final_jd and not is_url else None
+
+    _json_logger.info(
+        "[%s] calling resume_copilot_service | cv_upload=%s | has_jd=%s | query_chars=%d",
+        task_id,
+        "present" if cv_upload is not None else "NONE",
+        bool(jd_upload is not None or jd_text_value or target_jd_url),
+        len(query),
+    )
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        response = loop.run_until_complete(
+            resume_copilot_service(
+                query=query,
+                cv=cv_upload,
+                cv_template=cv_template_upload,
+                target_jd=None,
+                target_jd_file=jd_upload,
+                target_jd_url=target_jd_url,
+                jd_text=jd_text_value,
+                jd_url=None,
+                template=DEFAULT_TEMPLATE,
+            )
+        )
+    finally:
+        loop.close()
+
+    files = getattr(response, "files", {}) or {}
+    return {
+        "status": "done",
+        "summary": getattr(response, "reply_text", "") or "简历生成完成",
+        "generated_docx_path": str(files.get("docx", "") or ""),
+        "score": getattr(response, "score", "?"),
+    }
+
+
+def _resume_job_child(connection, task_id: str, run_id: str, form_data: Any, deadline_at: float) -> None:
+    """Spawn child entry. The ready handshake makes later killpg safe."""
+
+    group_ready = False
+    deadline_token = None
+    try:
+        if os.name == "posix":
+            os.setsid()
+            group_ready = True
+            os.environ["RESUME_TASK_PROCESS_GROUP"] = "1"
+        connection.send(("ready", {"process_group": group_ready, "run_id": run_id}))
+        deadline_token = set_request_deadline(deadline_at=deadline_at)
+        result = _execute_resume_job(task_id, form_data, deadline_at)
+        connection.send(("result", result))
+    except BaseException as exc:
+        error_msg = str(getattr(exc, "detail", exc) or type(exc).__name__)
+        connection.send(("error", {"message": error_msg[:500]}))
+    finally:
+        if deadline_token is not None:
+            reset_request_deadline(deadline_token)
+        connection.close()
+
+
+def _linux_descendant_pids(root_pid: int) -> set[int]:
+    """Return a best-effort recursive process tree snapshot from procfs."""
+
+    if os.name != "posix" or not Path("/proc").is_dir():
+        return set()
+    descendants: set[int] = set()
+    pending = [int(root_pid)]
+    while pending:
+        parent_pid = pending.pop()
+        task_dir = Path(f"/proc/{parent_pid}/task")
+        try:
+            child_files = list(task_dir.glob("*/children"))
+        except OSError:
+            continue
+        for child_file in child_files:
+            try:
+                child_ids = [int(value) for value in child_file.read_text().split()]
+            except (OSError, ValueError):
+                continue
+            for child_pid in child_ids:
+                if child_pid in descendants or child_pid == root_pid:
+                    continue
+                descendants.add(child_pid)
+                pending.append(child_pid)
+    return descendants
+
+
+def _signal_descendant_tree(root_pid: int, descendants: set[int], sig: int) -> None:
+    """Signal detached descendant groups plus individual descendants safely."""
 
     try:
-        # Wait for vLLM if not ready yet (before extracting fields to avoid wasted work)
-        _wait_vllm_ready()
+        supervisor_group = os.getpgrp()
+    except OSError:
+        supervisor_group = -1
+    try:
+        root_group = os.getpgid(root_pid)
+    except OSError:
+        root_group = -1
 
-        # Extract text fields
-        query = str(form_data.get("Query") or form_data.get("query") or "")
-        target_jd_text = str(form_data.get("target_jd") or "")
-
-        # 诊断：列出 form_data 中所有 key 及是否文件
-        _keys_summary = []
-        for k in form_data:
-            v = form_data[k]
-            is_file = hasattr(v, "filename")
-            _keys_summary.append(f"{k}=<file>" if is_file else f"{k}=<str:{len(str(v))}c>")
-        _json_logger.info("[%s] form keys: %d fields, %s", task_id, len(form_data), ", ".join(_keys_summary) if _keys_summary else "(none)")
-
-        # Extract files
-        cv_path, cv_text = _extract_file_field(form_data, "cv", task_id)
-        cv_template_path = _save_upload_file(form_data.get("cv_template"), task_id, "cv_template")
-        jd_path, jd_text = _extract_file_field(form_data, "target_jd", task_id)
-
-        # Use extracted text from file first (jd_text), fall back to raw form field
-        # (target_jd_text may be a file path after pre-save, not actual JD content)
-        final_jd = jd_text or target_jd_text or ""
-        final_cv = cv_text
-
-        # Build mock UploadFile-like objects for resume_copilot_service
-        from http_compat import HTTPException
-        from resume_copilot_service import _ensure_time_budget
-
-        # cv: prefer already-extracted text so images are OCR'd once (here),
-        # not a second time by the main pipeline. Path mode is a fallback for
-        # extractions that returned no text.
-        cv_upload = None
-        if cv_text and len(cv_text.strip()) > 5:
-            _json_logger.info("[%s] cv uses pre-extracted text (%d chars)", task_id, len(cv_text))
-            cv_upload = _MockUpload(None, "cv.txt", content=cv_text)
-        elif cv_path:
-            cv_upload = _MockUpload(cv_path, "cv")
-        elif cv_text and len(cv_text) > 5:
-            # Fallback: cv field may be a persisted file path string (JSON mode).
-            # Guard: CV text can be long; calling .exists() on it raises
-            # FileNameTooLong (OSError 36), so only stat short path-like strings.
-            _cv_candidate = cv_text.strip()
-            _looks_like_path = (
-                len(_cv_candidate) < 500
-                and "\n" not in _cv_candidate
-                and Path(_cv_candidate).suffix.lower() in {".pdf", ".docx", ".png", ".jpg", ".jpeg", ".bmp", ".webp", ".txt", ".md"}
-            )
-            if _looks_like_path:
-                _cv_text_path = Path(_cv_candidate)
-                try:
-                    _is_cv_file = _cv_text_path.exists() and _cv_text_path.is_file()
-                except OSError:
-                    _is_cv_file = False
-                if _is_cv_file:
-                    _json_logger.info("[%s] cv received as persisted upload", task_id)
-                    cv_upload = _MockUpload(str(_cv_text_path), _cv_text_path.name)
-                    cv_path = str(_cv_text_path)  # for logging
-                else:
-                    _json_logger.warning("[%s] cv_text=%s does not exist as file, cv_upload=None", task_id, cv_text[:100])
-
-        cv_template_upload = _MockUpload(cv_template_path, "template") if cv_template_path else None
-        jd_upload = _MockUpload(jd_path, "target_jd") if jd_path else None
-
-        # JD as URL or text or file
-        import re as _re
-        _is_url = _re.match(r"^https?://", final_jd.strip(), _re.IGNORECASE) if final_jd else False
-        target_jd_url = final_jd if _is_url else None
-        jd_text_value = final_jd if final_jd and not _is_url else None
-
-        # Run async service in event loop
-        _json_logger.info(
-            "[%s] calling resume_copilot_service | cv_upload=%s | cv_path=%s | has_jd=%s | query_chars=%d",
-            task_id,
-            "present" if cv_upload is not None else "NONE",
-            "present" if cv_path else "N/A",
-            bool(jd_upload is not None or jd_text_value or target_jd_url),
-            len(query or ""),
-        )
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+    detached_groups: set[int] = set()
+    for child_pid in descendants:
         try:
-            response = loop.run_until_complete(
-                resume_copilot_service(
-                    query=query,
-                    cv=cv_upload,
-                    cv_template=cv_template_upload,
-                    target_jd=None,
-                    target_jd_file=jd_upload,
-                    target_jd_url=target_jd_url,
-                    jd_text=jd_text_value,
-                    jd_url=None,
-                    template=DEFAULT_TEMPLATE,
-                )
-            )
-        finally:
-            loop.close()
+            child_group = os.getpgid(child_pid)
+        except OSError:
+            continue
+        if child_group > 1 and child_group not in {supervisor_group, root_group}:
+            detached_groups.add(child_group)
 
-        elapsed = round(time.time() - start_time, 3)
-        score_val = getattr(response, "score", "?")
-        _json_logger.info("Task %s completed in %.1fs (score=%s)", task_id, elapsed, score_val)
+    for process_group in detached_groups:
+        try:
+            os.killpg(process_group, sig)
+        except (OSError, ProcessLookupError):
+            pass
+    # Also address descendants which did not establish a separate process group.
+    # Individual signalling cannot accidentally terminate the API's own group.
+    for child_pid in descendants:
+        try:
+            os.kill(child_pid, sig)
+        except (OSError, ProcessLookupError):
+            pass
 
-        # Save generated docx
-        files = getattr(response, "files", {}) or {}
-        docx_path = files.get("docx", "")
-        if docx_path and Path(docx_path).exists():
-            dest = OUTPUT_DIR / f"{task_id}.docx"
-            shutil.copy2(docx_path, dest)
-            file_path = str(dest)
+
+def _terminate_task_process(process: mp.Process, *, process_group_ready: bool) -> None:
+    if process.pid is None:
+        return
+    if not process.is_alive():
+        process.join(timeout=0.2)
+        if os.name == "posix" and process_group_ready:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except (OSError, ProcessLookupError):
+                pass
+            time.sleep(0.05)
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
+        return
+    descendants = _linux_descendant_pids(process.pid)
+    _signal_descendant_tree(process.pid, descendants, signal.SIGTERM)
+    try:
+        if os.name == "posix" and process_group_ready:
+            os.killpg(process.pid, signal.SIGTERM)
         else:
-            file_path = ""
+            process.terminate()
+    except (OSError, ProcessLookupError):
+        pass
+    process.join(timeout=_TASK_PROCESS_KILL_GRACE_SECONDS)
+    if not process.is_alive():
+        _signal_descendant_tree(process.pid, descendants, signal.SIGKILL)
+        return
+    descendants.update(_linux_descendant_pids(process.pid))
+    _signal_descendant_tree(process.pid, descendants, signal.SIGKILL)
+    try:
+        if os.name == "posix" and process_group_ready:
+            os.killpg(process.pid, signal.SIGKILL)
+        elif hasattr(process, "kill"):
+            process.kill()
+        else:
+            process.terminate()
+    except (OSError, ProcessLookupError):
+        pass
+    process.join(timeout=1.0)
 
-        summary = getattr(response, "reply_text", "") or "简历生成完成"
 
+def _process_resume(
+    task_id: str,
+    run_id: str,
+    form_data: Any,
+    deadline_at: float,
+) -> None:
+    """Supervise a killable child so timed-out native work cannot survive."""
+
+    if not _task_is_active(task_id, run_id) or time.monotonic() >= deadline_at:
+        _expire_task(task_id, run_id, form_data)
+        _cleanup_saved_inputs(form_data)
+        return
+
+    context = mp.get_context(os.getenv("TASK_PROCESS_START_METHOD", "spawn"))
+    parent_connection, child_connection = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_resume_job_child,
+        args=(child_connection, task_id, run_id, form_data, deadline_at),
+        name=f"resume-job-{task_id}",
+    )
+    process_group_ready = False
+    terminal_message: tuple[str, Any] | None = None
+    started = time.monotonic()
+    try:
         with task_lock:
-            async_tasks[task_id] = {
-                "status": "done",
-                "finished": True,
-                "summary": summary,
-                "file_path": file_path,
-                "error": None,
-                "start_time": start_time,
-                "end_time": time.time(),
-            }
+            state = async_tasks.get(task_id)
+            if state and state.get("run_id") == run_id and not state.get("finished"):
+                state["status"] = "processing"
+        process.start()
+        child_connection.close()
+        while time.monotonic() < deadline_at and _task_is_active(task_id, run_id):
+            wait_seconds = min(0.1, max(0.0, deadline_at - time.monotonic()))
+            if parent_connection.poll(wait_seconds):
+                message = parent_connection.recv()
+                if not isinstance(message, tuple) or len(message) != 2:
+                    continue
+                status, payload = message
+                if status == "ready":
+                    process_group_ready = bool(
+                        isinstance(payload, dict) and payload.get("process_group")
+                    )
+                    continue
+                terminal_message = (str(status), payload)
+                break
+            if not process.is_alive():
+                break
+
+        if terminal_message is None:
+            _terminate_task_process(process, process_group_ready=process_group_ready)
+            if _task_is_active(task_id, run_id):
+                _publish_terminal_state(
+                    task_id,
+                    run_id,
+                    status="error",
+                    summary=f"生成失败: 端到端处理超过 {_TASK_DEADLINE_SECONDS:.0f} 秒，任务已终止",
+                    file_path="",
+                    error="end-to-end task deadline exceeded",
+                )
+            return
+
+        status, payload = terminal_message
+        process.join(timeout=1.0)
+        if process.is_alive():
+            _terminate_task_process(process, process_group_ready=process_group_ready)
+        if status == "result" and isinstance(payload, dict):
+            generated_path = Path(str(payload.get("generated_docx_path", "") or ""))
+            if not generated_path.is_file():
+                raise RuntimeError("resume generation completed without a DOCX output")
+            if not _task_is_active(task_id, run_id):
+                return
+            temp_dest = OUTPUT_DIR / f".{task_id}.{run_id}.docx.tmp"
+            final_dest = OUTPUT_DIR / f"{task_id}.{run_id}.docx"
+            shutil.copy2(generated_path, temp_dest)
+            published = _publish_success_file(
+                task_id,
+                run_id,
+                temp_path=temp_dest,
+                final_path=final_dest,
+                summary=str(payload.get("summary", "") or "简历生成完成"),
+            )
+            if not published:
+                temp_dest.unlink(missing_ok=True)
+                return
+            _json_logger.info(
+                "Task %s completed in %.1fs (score=%s)",
+                task_id,
+                time.monotonic() - started,
+                payload.get("score", "?"),
+            )
+        else:
+            error_msg = str(payload.get("message", "child process failed")) if isinstance(payload, dict) else str(payload)
+            _publish_terminal_state(
+                task_id,
+                run_id,
+                status="error",
+                summary=f"生成失败: {error_msg[:500]}",
+                file_path="",
+                error=error_msg[:500],
+            )
     except Exception as exc:
-        elapsed = round(time.time() - start_time, 3)
-        _json_logger.error("Task %s failed after %.1fs: %s", task_id, elapsed, exc, exc_info=True)
-        error_msg = str(exc)
-        if len(error_msg) > 500:
-            error_msg = error_msg[:500] + "..."
-
-        with task_lock:
-            async_tasks[task_id] = {
-                "status": "error",
-                "finished": True,
-                "summary": f"生成失败: {error_msg}",
-                "file_path": "",
-                "error": error_msg,
-                "start_time": start_time,
-                "end_time": time.time(),
-            }
+        _terminate_task_process(process, process_group_ready=process_group_ready)
+        _json_logger.error("Task %s supervisor failed: %s", task_id, exc, exc_info=True)
+        _publish_terminal_state(
+            task_id,
+            run_id,
+            status="error",
+            summary=f"生成失败: {str(exc)[:500]}",
+            file_path="",
+            error=str(exc)[:500],
+        )
     finally:
+        try:
+            child_connection.close()
+        except OSError:
+            pass
+        parent_connection.close()
         _cleanup_saved_inputs(form_data)
 
 
@@ -452,10 +761,14 @@ def ready():
 @app.route("/resume_optimize", methods=["POST"])   # 兼容旧版评测端
 def resume_generate():
     """Receive resume generation request, start background processing."""
+    received_wall = time.time()
+    received_mono = time.monotonic()
+    task_id = "unknown"
+    run_id = ""
+    data: Any = {}
+    submitted = False
     try:
         _cleanup_task_state()
-        task_id = "unknown"
-        data: Any = {}
 
         if request.content_type and "multipart/form-data" in request.content_type:
             task_id = safe_task_id(request.form.get("id"))
@@ -472,11 +785,30 @@ def resume_generate():
 
         # Normalize task_id
         task_id = safe_task_id(task_id)
+        run_id = secrets.token_hex(8)
+        deadline_at = received_mono + _TASK_DEADLINE_SECONDS
+
+        with _task_futures_lock:
+            prior_future = _task_futures.get(task_id)
+            prior_run_active = bool(prior_future and not prior_future[1].done())
 
         with task_lock:
             existing = async_tasks.get(task_id)
-            if existing and not existing.get("finished", False):
+            if prior_run_active or (existing and not existing.get("finished", False)):
                 return _json_response({"success": False, "message": "task id is already active"}, 409)
+            # Reserve the ID before persisting uploads. This closes the race in
+            # which two concurrent requests with the same evaluator ID both
+            # passed the duplicate check and overwrote one another.
+            async_tasks[task_id] = {
+                "status": "receiving",
+                "finished": False,
+                "summary": "",
+                "file_path": "",
+                "error": None,
+                "start_time": received_wall,
+                "deadline_at": deadline_at,
+                "run_id": run_id,
+            }
 
         # ── Save files to disk BEFORE spawning background thread ──
         # Flask/Werkzeug stores uploaded files as temp files; those are cleaned up
@@ -486,26 +818,23 @@ def resume_generate():
             if hasattr(val, "filename") and getattr(val, "filename", None):
                 save_path = safe_child_path(
                     UPLOADS_DIR,
-                    f"{task_id}_{safe_filename(key, 'file')}_{safe_filename(val.filename)}",
+                    f"{task_id}_{run_id}_{safe_filename(key, 'file')}_{safe_filename(val.filename)}",
                 )
                 val.save(str(save_path))
                 if save_path.stat().st_size > MAX_FILE_SIZE:
                     save_path.unlink(missing_ok=True)
                     _cleanup_saved_inputs(data)
+                    _remove_task_state(task_id, run_id)
                     return _json_response({"success": False, "message": "uploaded file is too large"}, 413)
                 data[key] = str(save_path)  # Replace FileStorage with persisted path
                 _json_logger.info("[%s] saved upload field=%s bytes=%d", task_id, key, save_path.stat().st_size)
 
-        # Register task
+        # Uploads are durable; expose the task as queued.
         with task_lock:
-            async_tasks[task_id] = {
-                "status": "processing",
-                "finished": False,
-                "summary": "",
-                "file_path": "",
-                "error": None,
-                "start_time": time.time(),
-            }
+            state = async_tasks.get(task_id)
+            if not state or state.get("run_id") != run_id:
+                raise RuntimeError("task reservation was lost")
+            state["status"] = "queued"
 
         # Log received fields
         query = data.get("Query", data.get("query", ""))
@@ -514,25 +843,67 @@ def resume_generate():
         # Submit to thread pool (max_workers=1 prevents thread accumulation)
         _task_id = task_id
         with _task_futures_lock:
-            active = sum(1 for item in _task_futures.values() if not item.done())
+            active = sum(1 for _, item in _task_futures.values() if not item.done())
             if active >= _TASK_QUEUE_LIMIT:
-                with task_lock:
-                    async_tasks.pop(_task_id, None)
+                _remove_task_state(_task_id, run_id)
                 _cleanup_saved_inputs(data)
                 return _json_response({"success": False, "message": "任务队列已满，请稍后重试"}, 429)
-            future = _task_executor.submit(_process_resume, _task_id, data)
-            _task_futures[_task_id] = future
-        future.add_done_callback(lambda _f, tid=_task_id: _discard_future(tid))
+            future = _task_executor.submit(
+                _process_resume,
+                _task_id,
+                run_id,
+                data,
+                deadline_at,
+            )
+            _task_futures[_task_id] = (run_id, future)
+            submitted = True
+
+        timer = threading.Timer(
+            max(0.01, deadline_at - time.monotonic()),
+            _expire_task,
+            args=(_task_id, run_id, data),
+        )
+        timer.daemon = True
+        with _task_timers_lock:
+            _task_timers[_task_id] = (run_id, timer)
+        timer.start()
+        future.add_done_callback(
+            lambda _f, tid=_task_id, rid=run_id: _discard_future(tid, rid)
+        )
 
         return _json_response({
             "success": True,
             "message": "简历生成请求已接收，正在异步处理中",
             "task_id": task_id,
+            "deadline_seconds": int(_TASK_DEADLINE_SECONDS),
         })
 
     except ValueError as exc:
+        if run_id and not submitted:
+            _remove_task_state(task_id, run_id)
+            _cleanup_saved_inputs(data)
         return _json_response({"success": False, "message": str(exc)}, 400)
     except Exception as exc:
+        if run_id:
+            if submitted:
+                _publish_terminal_state(
+                    task_id,
+                    run_id,
+                    status="error",
+                    summary="生成失败: 请求入队时发生内部错误",
+                    file_path="",
+                    error=str(exc)[:500],
+                )
+                with _task_futures_lock:
+                    current = _task_futures.get(task_id)
+                    future_to_cancel = (
+                        current[1] if current and current[0] == run_id else None
+                    )
+                if future_to_cancel is not None:
+                    future_to_cancel.cancel()
+            else:
+                _remove_task_state(task_id, run_id)
+            _cleanup_saved_inputs(data)
         _json_logger.error("resume_generate error: %s", exc, exc_info=True)
         return _json_response({"success": False, "message": "internal server error"}, 500)
 
@@ -566,14 +937,24 @@ def download_resume(task_id: str):
     except ValueError:
         return _json_response({"success": False, "message": "invalid task id"}, 400)
     with task_lock:
-        status = async_tasks.get(task_id, {})
-        file_path = status.get("file_path", "")
+        status = async_tasks.get(task_id)
+        file_path = status.get("file_path", "") if status else ""
 
-    # Fallback: check OUTPUT_DIR directly
-    if not file_path:
+    # Historical fallback is allowed only when no live task state exists. A new
+    # run with the same ID must never expose the previous run's DOCX while it is
+    # processing or after it failed.
+    if status is None and not file_path:
         fallback = safe_child_path(OUTPUT_DIR, f"{task_id}.docx")
         if fallback.exists():
             file_path = str(fallback)
+
+    if status is not None and (
+        not status.get("finished", False) or status.get("status") != "done"
+    ):
+        return _json_response(
+            {"success": False, "message": f"简历尚未成功生成: {task_id}"},
+            404,
+        )
 
     if not file_path or not Path(file_path).exists():
         return _json_response(

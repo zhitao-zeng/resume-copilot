@@ -9,14 +9,73 @@ Only Candidate Evidence (resume + query) can produce experience/education/projec
 from __future__ import annotations
 
 import logging
+import os
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from typing import Any
 
+from llm_gateway import (
+    ContextBudgetError,
+    LLMDeadlineExceeded,
+    LLMGateway,
+    estimate_chat_tokens,
+)
 from prompts import RESUME_COMPOSER_SYSTEM_PROMPT, GEN_COMPOSER_SYSTEM_PROMPT
-from server_runtime import call_llm_typed, llm_enabled
-from source_adapter import candidate_blocks
-from v2_schemas import SourceBundle, DraftResume, CanonicalResume
+from server_runtime import call_llm_typed, llm_enabled, remaining_request_seconds
+from source_adapter import build_source_bundle, candidate_blocks
+from v2_schemas import SourceBlock, SourceBundle, DraftResume, CanonicalResume
 
 logger = logging.getLogger(__name__)
+
+_COMPOSER_MAX_TOKENS = 4096
+_COMPOSER_SAFETY_TOKENS = 256
+_MIN_TYPED_OUTPUT_TOKENS = 2048
+_COMPOSER_MIN_FACT_TOKENS = 1024
+_COMPOSER_CONTEXT_CHARS = 1800
+_MAX_COMPOSER_FACT_CHARS = 60_000
+_MAX_COMPOSER_CHUNKS = 16
+_DEFAULT_COMPOSER_MIN_REMAINING_SECONDS = 10
+_MAX_COMPOSER_CONCURRENCY = 2
+
+
+def _safe_positive_env_int(name: str) -> int | None:
+    value = os.getenv(name)
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _llm_context_window() -> int:
+    """Return the application-side budget for the configured LLM backend."""
+
+    return (
+        _safe_positive_env_int("LLM_CONTEXT_WINDOW")
+        or _safe_positive_env_int("MAX_MODEL_LEN")
+        or 8192
+    )
+
+
+def _composer_min_remaining_seconds() -> int:
+    return (
+        _safe_positive_env_int("LLM_COMPOSER_MIN_REMAINING_SECONDS")
+        or _DEFAULT_COMPOSER_MIN_REMAINING_SECONDS
+    )
+
+
+def _composer_has_time_budget() -> bool:
+    remaining = remaining_request_seconds()
+    return remaining is None or remaining >= _composer_min_remaining_seconds()
+
+
+def _composer_concurrency() -> int:
+    """Return the bounded fan-out supported by the 40 GiB production profile."""
+
+    configured = _safe_positive_env_int("LLM_COMPOSER_CONCURRENCY") or 2
+    return max(1, min(_MAX_COMPOSER_CONCURRENCY, configured))
 
 
 def _build_source_text(source: SourceBundle) -> str:
@@ -69,36 +128,316 @@ def _build_source_text(source: SourceBundle) -> str:
     return "\n\n".join(parts)
 
 
-def _split_source_bundle(source: SourceBundle, max_fact_chars: int = 6000) -> list[SourceBundle]:
-    """Chunk long candidate evidence without splitting individual source lines."""
+def _build_resume_prompt(source: SourceBundle) -> str:
+    source_text = _build_source_text(source)
+    return (
+        "请从以下材料中完整提取简历信息。注意材料分为两部分：\n"
+        "1) CANDIDATE EVIDENCE：候选人的简历原文和用户明确补充，这是事实来源。\n"
+        "2) USER DIRECTIONS/TARGET CONTEXT：只做编辑和目标参考，不是候选人事实。\n\n"
+        "【材料】\n"
+        f"{source_text}"
+    )
 
-    factual = [block for block in source.blocks if block in candidate_blocks(source)]
-    context = [block for block in source.blocks if block not in factual]
-    if sum(len(block.text) for block in factual) <= max_fact_chars:
-        return [source]
-    chunks: list[list] = []
-    current: list = []
-    current_chars = 0
+
+def _typed_prompt_token_estimate(
+    output_model: type,
+    system_prompt: str,
+    user_prompt: str,
+) -> int:
+    messages = LLMGateway._build_messages(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        output_schema=output_model.model_json_schema(),
+        prefill="{",
+    )
+    return estimate_chat_tokens(messages)
+
+
+def _composer_prompt_token_estimate(source: SourceBundle) -> int:
+    return _typed_prompt_token_estimate(
+        DraftResume,
+        RESUME_COMPOSER_SYSTEM_PROMPT,
+        _build_resume_prompt(source),
+    )
+
+
+def _build_generate_prompt(query_text: str, jd_text: str) -> str:
+    prompt = ""
+    if query_text:
+        prompt += f"【用户描述】\n{query_text}\n\n"
+    if jd_text:
+        prompt += f"【目标岗位 JD】\n{jd_text}\n\n"
+    return prompt + "请根据以上信息生成简历结构化框架。"
+
+
+def _prepare_generate_request(query_text: str, jd_text: str) -> tuple[str, int]:
+    """Fit a no-CV request while retaining a useful structured output budget."""
+
+    # Never discard candidate text at a fixed character boundary.  Candidate
+    # facts use the chunked extraction path in ``compose_from_query``; this
+    # helper is primarily for instruction/JD-only framework generation.
+    query = query_text.strip()
+    jd = jd_text.strip()
+    context_window = _llm_context_window()
+    while True:
+        prompt = _build_generate_prompt(query, jd)
+        prompt_tokens = _typed_prompt_token_estimate(
+            CanonicalResume,
+            GEN_COMPOSER_SYSTEM_PROMPT,
+            prompt,
+        )
+        available = context_window - prompt_tokens - _COMPOSER_SAFETY_TOKENS
+        if available >= _COMPOSER_MAX_TOKENS:
+            return prompt, _COMPOSER_MAX_TOKENS
+
+        # Candidate facts are more important than target context. Shorten JD
+        # first to recover the full output budget. Only lower the completion
+        # budget when the candidate query alone still cannot fit 4096 tokens.
+        if jd:
+            new_length = max(0, int(len(jd) * 0.75) - 1)
+            jd = jd[:new_length]
+            continue
+        if available >= _MIN_TYPED_OUTPUT_TOKENS:
+            return prompt, available
+        raise ContextBudgetError(
+            f"LLM context window {context_window} is too small for no-CV generation without truncating the user input"
+        )
+
+
+def _copy_block_with_text(block: SourceBlock, text: str, suffix: str) -> SourceBlock:
+    return block.model_copy(update={
+        "block_id": f"{block.block_id}#{suffix}",
+        "text": text,
+    })
+
+
+def _natural_prefix_length(text: str, maximum: int) -> int:
+    """Prefer a nearby sentence/phrase boundary without dropping characters."""
+
+    if maximum >= len(text):
+        return len(text)
+    lower_bound = max(1, int(maximum * 0.6))
+    best = -1
+    for marker in ("。", "！", "？", "；", ";", "，", ",", " "):
+        index = text.rfind(marker, lower_bound, maximum)
+        if index >= lower_bound:
+            best = max(best, index + 1)
+    return best if best > 0 else maximum
+
+
+def _largest_fitting_prefix(
+    block: SourceBlock,
+    text: str,
+    shared_context: list[SourceBlock],
+    *,
+    prompt_limit: int,
+    max_chars: int,
+) -> int:
+    """Find the largest text prefix that fits a complete typed request."""
+
+    low = 1
+    high = min(len(text), max_chars)
+    best = 0
+    while low <= high:
+        middle = (low + high) // 2
+        candidate = _copy_block_with_text(block, text[:middle], "probe")
+        estimate = _composer_prompt_token_estimate(
+            SourceBundle(blocks=[candidate, *shared_context])
+        )
+        if estimate <= prompt_limit:
+            best = middle
+            low = middle + 1
+        else:
+            high = middle - 1
+    return _natural_prefix_length(text, best) if best else 0
+
+
+def _select_shared_context(
+    context: list[SourceBlock],
+    *,
+    prompt_limit: int,
+) -> list[SourceBlock]:
+    """Keep ordered target context while reserving room for candidate facts."""
+
+    if not context:
+        return []
+    empty_prompt_tokens = _composer_prompt_token_estimate(SourceBundle(blocks=[]))
+    remaining_prompt_tokens = max(0, prompt_limit - empty_prompt_tokens)
+    # On a small backend the fixed typed-schema overhead can already consume
+    # most of the prompt budget. Split the remainder between target context and
+    # facts instead of dropping the JD entirely. Larger contexts retain the
+    # full one-thousand-token factual reserve.
+    factual_reserve = min(
+        _COMPOSER_MIN_FACT_TOKENS,
+        max(128, remaining_prompt_tokens // 2),
+    )
+    context_prompt_limit = max(empty_prompt_tokens, prompt_limit - factual_reserve)
+    selected: list[SourceBlock] = []
+    used_chars = 0
+    for index, block in enumerate(context):
+        remaining_chars = _COMPOSER_CONTEXT_CHARS - used_chars
+        if remaining_chars <= 0:
+            break
+        candidate_text = block.text[:remaining_chars]
+        candidate = _copy_block_with_text(block, candidate_text, f"context{index}")
+        estimate = _composer_prompt_token_estimate(
+            SourceBundle(blocks=[*selected, candidate])
+        )
+        if estimate <= context_prompt_limit:
+            selected.append(candidate)
+            used_chars += len(candidate_text)
+            if len(candidate_text) < len(block.text):
+                break
+            continue
+
+        low = 1
+        high = len(candidate_text)
+        best = 0
+        while low <= high:
+            middle = (low + high) // 2
+            prefix = _copy_block_with_text(block, candidate_text[:middle], f"context{index}")
+            estimate = _composer_prompt_token_estimate(
+                SourceBundle(blocks=[*selected, prefix])
+            )
+            if estimate <= context_prompt_limit:
+                best = middle
+                low = middle + 1
+            else:
+                high = middle - 1
+        if best:
+            cutoff = _natural_prefix_length(candidate_text, best)
+            selected.append(_copy_block_with_text(
+                block,
+                candidate_text[:cutoff],
+                f"context{index}",
+            ))
+        break
+    return selected
+
+
+def _split_source_bundle(source: SourceBundle, max_fact_chars: int = 6000) -> list[SourceBundle]:
+    """Chunk evidence so each complete typed request fits the LLM context.
+
+    The budget includes the system prompt, JSON schema, output rules, chat
+    framing, candidate facts and repeated target context.  Oversized individual
+    source lines are split at a nearby phrase boundary, then hard-split only
+    when no natural boundary is available.
+    """
+
+    context_window = _llm_context_window()
+    prompt_limit = context_window - _COMPOSER_MAX_TOKENS - _COMPOSER_SAFETY_TOKENS
+    if prompt_limit <= 0:
+        raise ValueError(
+            f"LLM context window {context_window} is too small for Composer output budget"
+        )
+
+    factual = candidate_blocks(source)
+    factual_ids = {block.block_id for block in factual}
+    context = [block for block in source.blocks if block.block_id not in factual_ids]
+    shared_context = _select_shared_context(context, prompt_limit=prompt_limit)
+
+    fragments: list[SourceBlock] = []
     for block in factual:
-        size = len(block.text) + 1
-        if current and current_chars + size > max_fact_chars:
+        remaining = block.text
+        part_index = 0
+        while remaining:
+            prefix_length = _largest_fitting_prefix(
+                block,
+                remaining,
+                shared_context,
+                prompt_limit=prompt_limit,
+                max_chars=max_fact_chars,
+            )
+            if prefix_length <= 0:
+                raise ValueError(
+                    "Composer fixed prompt/context leaves no room for candidate evidence"
+                )
+            piece = remaining[:prefix_length]
+            remaining = remaining[prefix_length:]
+            fragments.append(_copy_block_with_text(block, piece, f"part{part_index}"))
+            part_index += 1
+
+    if not fragments:
+        empty_bundle = SourceBundle(blocks=shared_context)
+        if _composer_prompt_token_estimate(empty_bundle) > prompt_limit:
+            raise ValueError("Composer prompt exceeds configured context window")
+        return [empty_bundle]
+
+    chunks: list[list[SourceBlock]] = []
+    current: list[SourceBlock] = []
+    current_chars = 0
+    for fragment in fragments:
+        fragment_size = len(fragment.text)
+        candidate_facts = [*current, fragment]
+        candidate_bundle = SourceBundle(blocks=[*candidate_facts, *shared_context])
+        candidate_fits = (
+            current_chars + fragment_size <= max_fact_chars
+            and _composer_prompt_token_estimate(candidate_bundle) <= prompt_limit
+        )
+        if current and not candidate_fits:
             chunks.append(current)
             current = []
             current_chars = 0
-        current.append(block)
-        current_chars += size
+        current.append(fragment)
+        current_chars += fragment_size
     if current:
         chunks.append(current)
-    # Target/instruction context is capped and repeated so every extraction
-    # chunk applies the same source-isolation rules and target direction.
-    shared_context = []
-    context_chars = 0
-    for block in context:
-        if context_chars + len(block.text) > 1800:
-            break
-        shared_context.append(block)
-        context_chars += len(block.text) + 1
-    return [SourceBundle(blocks=list(chunk) + shared_context) for chunk in chunks]
+
+    result = [
+        SourceBundle(blocks=[*chunk, *shared_context])
+        for chunk in chunks
+    ]
+    logger.info(
+        "ResumeComposer budgeted %d factual block(s) into %d chunk(s) | context_window=%d | prompt_limit=%d",
+        len(factual),
+        len(result),
+        context_window,
+        prompt_limit,
+    )
+    return result
+
+
+def _bisect_source_bundle(source: SourceBundle) -> list[SourceBundle]:
+    """Split a backend-rejected chunk without dropping candidate evidence."""
+
+    factual = candidate_blocks(source)
+    factual_ids = {block.block_id for block in factual}
+    context = [block for block in source.blocks if block.block_id not in factual_ids]
+    if len(factual) >= 2:
+        total_chars = sum(len(block.text) for block in factual)
+        target = total_chars / 2
+        running = 0
+        split_at = 1
+        for index, block in enumerate(factual[:-1], start=1):
+            running += len(block.text)
+            split_at = index
+            if running >= target:
+                break
+        return [
+            SourceBundle(blocks=[*factual[:split_at], *context]),
+            SourceBundle(blocks=[*factual[split_at:], *context]),
+        ]
+
+    if len(factual) == 1 and len(factual[0].text) > 1:
+        block = factual[0]
+        cutoff = _natural_prefix_length(block.text, max(1, len(block.text) // 2))
+        return [
+            SourceBundle(blocks=[
+                _copy_block_with_text(block, block.text[:cutoff], "retry0"),
+                *context,
+            ]),
+            SourceBundle(blocks=[
+                _copy_block_with_text(block, block.text[cutoff:], "retry1"),
+                *context,
+            ]),
+        ]
+
+    # Candidate facts always take precedence over target context. If even a
+    # one-character fact cannot fit, remove the repeated context for this last
+    # fragment instead of silently discarding the fact itself.
+    if factual and context:
+        return [SourceBundle(blocks=factual)]
+    return []
 
 
 def _merge_drafts(drafts: list[DraftResume]) -> DraftResume:
@@ -123,48 +462,162 @@ def _merge_drafts(drafts: list[DraftResume]) -> DraftResume:
     return merged
 
 
+def _draft_has_candidate_content(draft: DraftResume) -> bool:
+    """Exclude schema-valid but semantically empty Composer responses."""
+
+    return any((
+        draft.meta.name,
+        draft.meta.phone,
+        draft.meta.email,
+        draft.meta.work_experience,
+        draft.education,
+        draft.experience,
+        draft.research,
+        draft.activities,
+        draft.projects,
+        draft.skills.items,
+        draft.summary,
+        draft.awards,
+        draft.publications,
+        draft.patents,
+        draft.certifications,
+        draft.training,
+        draft.teaching,
+        draft.additional_sections,
+    ))
+
+
+def _compose_chunk(chunk: SourceBundle) -> DraftResume:
+    """Run and validate one independent Composer request."""
+
+    parsed = call_llm_typed(
+        DraftResume,
+        RESUME_COMPOSER_SYSTEM_PROMPT,
+        _build_resume_prompt(chunk),
+        temperature=0.0,
+        max_tokens=_COMPOSER_MAX_TOKENS,
+    )
+    if not isinstance(parsed, dict) or not parsed:
+        raise ValueError("Composer returned an empty or invalid chunk")
+    parsed_draft = DraftResume(**parsed)
+    if candidate_blocks(chunk) and not _draft_has_candidate_content(parsed_draft):
+        raise ValueError("Composer returned no candidate content for a factual chunk")
+    return parsed_draft
+
+
 def compose_resume(source: SourceBundle) -> DraftResume:
     """Call LLM to extract structured resume from source material."""
     if not llm_enabled():
         return DraftResume()
 
-    drafts: list[DraftResume] = []
-    chunks = _split_source_bundle(source)
-    for chunk_index, chunk in enumerate(chunks):
-        source_text = _build_source_text(chunk)
-        prompt = (
-            "请从以下材料中完整提取简历信息。注意材料分为两部分：\n"
-            "1) CANDIDATE EVIDENCE：候选人的简历原文和用户明确补充，这是事实来源。\n"
-            "2) USER DIRECTIONS/TARGET CONTEXT：只做编辑和目标参考，不是候选人事实。\n\n"
-            "【材料】\n"
-            f"{source_text}"
+    factual_chars = sum(len(block.text) for block in candidate_blocks(source))
+    if factual_chars > _MAX_COMPOSER_FACT_CHARS:
+        logger.warning(
+            "ResumeComposer skipped oversized candidate evidence (%d chars > %d); deterministic fallback will preserve source facts",
+            factual_chars,
+            _MAX_COMPOSER_FACT_CHARS,
         )
-        try:
-            parsed = call_llm_typed(
-                DraftResume,
-                RESUME_COMPOSER_SYSTEM_PROMPT,
-                prompt,
-                temperature=0.0,
-                max_tokens=4096,
-            )
-        except Exception as exc:
-            logger.warning("ResumeComposer chunk %d/%d failed: %s", chunk_index + 1, len(chunks), exc)
-            continue
-        if not isinstance(parsed, dict):
-            continue
-        try:
-            drafts.append(DraftResume(**parsed))
-        except Exception as exc:
-            logger.warning(
-                "ResumeComposer chunk %d/%d validation failed: %s",
-                chunk_index + 1,
-                len(chunks),
-                exc,
-            )
+        return DraftResume()
+
+    chunks = _split_source_bundle(source)
+    pending: list[tuple[tuple[int, ...], SourceBundle]] = [
+        ((index,), chunk) for index, chunk in enumerate(chunks)
+    ]
+    if len(pending) > _MAX_COMPOSER_CHUNKS:
+        logger.warning(
+            "ResumeComposer skipped %d chunks (limit=%d); deterministic fallback will preserve source facts",
+            len(pending),
+            _MAX_COMPOSER_CHUNKS,
+        )
+        return DraftResume()
+    drafts: dict[tuple[int, ...], DraftResume] = {}
+    worker_count = _composer_concurrency()
+    with ThreadPoolExecutor(
+        max_workers=worker_count,
+        thread_name_prefix="resume-composer",
+    ) as executor:
+        while pending:
+            if len(drafts) + len(pending) > _MAX_COMPOSER_CHUNKS:
+                logger.warning(
+                    "ResumeComposer backend required more than %d chunks; discarding partial extraction for deterministic fallback",
+                    _MAX_COMPOSER_CHUNKS,
+                )
+                return DraftResume()
+
+            wave = pending[:worker_count]
+            del pending[:len(wave)]
+            futures = []
+            budget_exhausted = False
+            for key, chunk in wave:
+                if not _composer_has_time_budget():
+                    budget_exhausted = True
+                    break
+                futures.append((
+                    key,
+                    chunk,
+                    executor.submit(copy_context().run, _compose_chunk, chunk),
+                ))
+            if budget_exhausted:
+                logger.warning(
+                    "ResumeComposer stopped with source chunks remaining: request deadline budget is too low; using deterministic fallback",
+                )
+                # A partial structured extraction can silently omit the remaining
+                # source records. Empty output deliberately selects the complete,
+                # evidence-preserving deterministic fallback in V2.
+                return DraftResume()
+            retries: list[tuple[tuple[int, ...], SourceBundle]] = []
+            fatal_error: Exception | None = None
+            for key, chunk, future in futures:
+                try:
+                    drafts[key] = future.result()
+                except ContextBudgetError as exc:
+                    smaller_chunks = _bisect_source_bundle(chunk)
+                    if not smaller_chunks:
+                        logger.warning("ResumeComposer irreducible chunk failed: %s", exc)
+                        fatal_error = exc
+                        continue
+                    retries.extend(
+                        (key + (child_index,), child)
+                        for child_index, child in enumerate(smaller_chunks)
+                    )
+                    logger.warning(
+                        "ResumeComposer backend context rejection; split chunk into %d smaller request(s): %s",
+                        len(smaller_chunks),
+                        exc,
+                    )
+                except LLMDeadlineExceeded as exc:
+                    logger.warning(
+                        "ResumeComposer stopped at request deadline: %s; using deterministic fallback",
+                        exc,
+                    )
+                    fatal_error = exc
+                except Exception as exc:
+                    logger.warning(
+                        "ResumeComposer chunk failed: %s; discarding partial extraction for deterministic fallback",
+                        exc,
+                    )
+                    fatal_error = exc
+            if fatal_error is not None:
+                return DraftResume()
+            if len(drafts) + len(retries) + len(pending) > _MAX_COMPOSER_CHUNKS:
+                logger.warning(
+                    "ResumeComposer backend required more than %d chunks; discarding partial extraction for deterministic fallback",
+                    _MAX_COMPOSER_CHUNKS,
+                )
+                return DraftResume()
+            # Retry split children before later source chunks, matching the old
+            # lossless queue behavior. Final merge still uses the logical key.
+            pending[0:0] = retries
+
     if not drafts:
         return DraftResume()
-    logger.info("ResumeComposer extracted %d chunk(s)", len(drafts))
-    return _merge_drafts(drafts)
+    ordered_drafts = [drafts[key] for key in sorted(drafts)]
+    logger.info(
+        "ResumeComposer extracted %d/%d completed chunk(s)",
+        len(ordered_drafts),
+        len(ordered_drafts),
+    )
+    return _merge_drafts(ordered_drafts)
 
 
 def compose_from_query(query_text: str, jd_text: str) -> CanonicalResume:
@@ -175,21 +628,32 @@ def compose_from_query(query_text: str, jd_text: str) -> CanonicalResume:
     """
     if not llm_enabled():
         return CanonicalResume()
+    if not _composer_has_time_budget():
+        logger.warning(
+            "GenerateComposer skipped: request deadline budget is too low"
+        )
+        return CanonicalResume()
 
-    prompt = ""
-    if query_text.strip():
-        prompt += f"【用户描述】\n{query_text.strip()[:2000]}\n\n"
-    if jd_text.strip():
-        prompt += f"【目标岗位 JD】\n{jd_text.strip()[:1500]}\n\n"
-    prompt += "请根据以上信息生成简历结构化框架。"
+    # When the query contains candidate facts, use the same lossless chunking
+    # and all-or-nothing extraction path as an uploaded CV.  A single generate
+    # request used to hard-cut everything after 2,000 characters.
+    source = build_source_bundle("", query_text, jd_text)
+    if candidate_blocks(source):
+        draft = compose_resume(source)
+        try:
+            return CanonicalResume.model_validate(draft.model_dump())
+        except Exception as exc:
+            logger.warning("GenerateComposer chunked output validation failed: %s", exc)
+            return CanonicalResume()
 
     try:
+        prompt, max_tokens = _prepare_generate_request(query_text, jd_text)
         parsed = call_llm_typed(
             CanonicalResume,
             GEN_COMPOSER_SYSTEM_PROMPT,
             prompt,
             temperature=0.2,
-            max_tokens=4096,
+            max_tokens=max_tokens,
         )
     except Exception as exc:
         logger.warning("GenerateComposer LLM call failed: %s", exc)

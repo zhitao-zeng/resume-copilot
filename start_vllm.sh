@@ -31,11 +31,19 @@ fi
 # ═══ vLLM 启动并等待模型加载完成 ═══
 # Qwen3-14B-GPTQ-Int4: 纯文本 GPTQ, 9.4GB
 # gpumem 30GB: 80×0.95=76GB但HAMI限制30GB, 模型9+KV≈12+开销=25GB<30GB ✓
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-16384}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-2}"
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
+export MAX_MODEL_LEN
+export LLM_CONTEXT_WINDOW="$MAX_MODEL_LEN"
+export LLM_TOKENIZER_PATH="${LLM_TOKENIZER_PATH:-$MODEL_FOUND}"
+export LLM_INFLIGHT_LIMIT="${LLM_INFLIGHT_LIMIT:-$MAX_NUM_SEQS}"
 vllm serve "$MODEL_FOUND" \
     --host 0.0.0.0 --port 8000 \
     --gpu-memory-utilization "${GPU_MEM_UTIL:-0.95}" \
-    --max-model-len "${MAX_MODEL_LEN:-16384}" \
-    --max-num-seqs "${MAX_NUM_SEQS:-2}" \
+    --max-model-len "$MAX_MODEL_LEN" \
+    --max-num-seqs "$MAX_NUM_SEQS" \
+    --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS" \
     --trust-remote-code --dtype auto \
     --enforce-eager > /tmp/vllm_stdout.log 2>&1 &
 VLLM_LOG="/tmp/vllm_stdout.log"

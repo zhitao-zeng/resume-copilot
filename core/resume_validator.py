@@ -267,11 +267,20 @@ def _has_function_description(payload: dict[str, Any]) -> bool:
 
 
 def _has_result_description(payload: dict[str, Any]) -> bool:
-    return (
-        _has_any_text(payload.get("result_description"))
-        or _has_any_text(payload.get("achievements"))
-        or _has_any_text(payload.get("bullets"))
+    if _has_any_text(payload.get("result_description")) or _has_any_text(payload.get("achievements")):
+        return True
+    bullets = payload.get("bullets", [])
+    if isinstance(bullets, str):
+        bullets = [bullets]
+    if not isinstance(bullets, list):
+        return False
+    result_signal = re.compile(
+        r"(?:结果|成果|交付|产出|完成|上线|发布|发表|获奖|录用|通过|解决|达成|达到|"
+        r"提升|提高|降低|增长|减少|缩短|节省|覆盖|复核|验证|入选|落地|闭环|"
+        r"delivered|launched|published|achieved|improved|reduced|increased|resolved)",
+        re.IGNORECASE,
     )
+    return any(result_signal.search(str(item)) for item in bullets if str(item).strip())
 
 
 def _field_exists_in_source(key: str, source_text: str) -> bool:
@@ -330,14 +339,6 @@ def check_required_fields(
                 source=field_source,
             ))
 
-    if not str(meta.get("work_experience", "")).strip():
-        if stage_value != "student" and not resume_data.get("experience_years"):
-            missing.append(MissingField(
-                field="meta.work_experience",
-                label="工作经验",
-                reason="工作经验为必填项，请补充工作年限或完整经历时间",
-            ))
-
     # Education is required
     education = resume_data.get("education", [])
     if not isinstance(education, list) or len(education) == 0:
@@ -382,23 +383,33 @@ def check_required_fields(
             label="个人总结",
             reason="个人总结为必填项，请补充真实职业背景、核心优势和求职方向",
         ))
-    elif len(summary) > 180:
+    elif len(summary) > 100:
         missing.append(MissingField(
             field="summary",
             label="个人总结",
-            reason=f"个人总结过长（{len(summary)}字），建议控制在180字以内",
+            reason=f"个人总结过长（{len(summary)}字），建议控制在100字以内",
         ))
 
-    # At least one of experience/internship/project is required
+    # At least one substantive experience type is required. Work seniority is
+    # optional, and campus/research records are valid for students and other
+    # profiles without conventional employment.
     experience = resume_data.get("experience", [])
     projects = resume_data.get("projects", [])
+    campus = resume_data.get("campus_experience", resume_data.get("activities", []))
+    research = resume_data.get("research", [])
     if not isinstance(experience, list):
         experience = []
     if not isinstance(projects, list):
         projects = []
+    if not isinstance(campus, list):
+        campus = []
+    if not isinstance(research, list):
+        research = []
 
     has_exp = len(experience) > 0
     has_proj = len(projects) > 0
+    has_campus = len(campus) > 0
+    has_research = len(research) > 0
 
     # Check nested projects in experience
     nested_proj_count = 0
@@ -409,25 +420,14 @@ def check_required_fields(
                 if isinstance(exp_projects, list):
                     nested_proj_count += len(exp_projects)
 
-    # User-stage aware validation
-    is_student = stage_value == "student"
-    is_experienced = stage_value == "experienced"
-
-    if is_student:
-        # Students: internship/education required, work experience optional
-        has_any_work = has_exp
-    elif is_experienced:
-        # Experienced: work experience required, internship optional
-        has_any_work = has_exp
-    else:
-        # Default: at least one of experience/project is required
-        has_any_work = has_exp or has_proj or nested_proj_count > 0
-
-    if not has_any_work and not has_proj and nested_proj_count == 0:
+    has_any_experience = any((
+        has_exp, has_proj, has_campus, has_research, nested_proj_count > 0,
+    ))
+    if not has_any_experience:
         missing.append(MissingField(
-            field="experience/projects",
+            field="experience/projects/campus",
             label="经历",
-            reason="工作经历/实习经历/项目经历不可全部为空，请至少补充一项经历",
+            reason="工作经历/实习经历/项目经历/校园经历不可全部为空，请至少补充一项经历",
         ))
 
     # Check each experience has all required fields (period, company, role, bullets)
@@ -483,6 +483,39 @@ def check_required_fields(
                     field=f"projects[{idx}].result_description",
                     label="项目工作成果",
                     reason=f"项目经历第{idx+1}段缺少项目成果，请补充结果、影响或验证口径",
+                ))
+
+    for section_name, records, label, identity_fields in (
+        ("campus_experience", campus, "校园经历", ("company", "role", "period")),
+        ("research", research, "科研经历", ("company", "role", "period")),
+    ):
+        for idx, record in enumerate(records):
+            if not isinstance(record, dict):
+                continue
+            # V2 canonical names are accepted as well as renderer/V1 names.
+            identity_values = {
+                "company": record.get("company") or record.get("organization") or record.get("institution"),
+                "role": record.get("role") or record.get("topic"),
+                "period": record.get("period"),
+            }
+            missing_identity = [key for key in identity_fields if not str(identity_values.get(key) or "").strip()]
+            if missing_identity:
+                missing.append(MissingField(
+                    field=f"{section_name}[{idx}]",
+                    label=label,
+                    reason=f"{label}第{idx+1}段缺少组织/角色或主题/时间，请按原始事实补充",
+                ))
+            if not _has_function_description(record):
+                missing.append(MissingField(
+                    field=f"{section_name}[{idx}].function_description",
+                    label=f"{label}工作内容",
+                    reason=f"{label}第{idx+1}段缺少个人职责或具体行动，请补充",
+                ))
+            if not _has_result_description(record):
+                missing.append(MissingField(
+                    field=f"{section_name}[{idx}].result_description",
+                    label=f"{label}成果",
+                    reason=f"{label}第{idx+1}段缺少交付结果、影响或验证口径，请补充真实信息",
                 ))
 
     # Skills are optional but we suggest
@@ -938,36 +971,26 @@ def check_summary_jd_alignment(
     if not jd_text or not jd_text.strip():
         return conflicts
 
-    jd_lower = jd_text.lower()
-    summary_lower = summary.lower()
+    # Dynamic character/token overlap works for doctors, teachers, operations,
+    # R&D and long-tail professions without maintaining an industry dictionary.
+    def signals(value: str) -> set[str]:
+        normalized = re.sub(r"[^A-Za-z0-9\u4e00-\u9fff]+", "", value).casefold()
+        chinese_bigrams = {
+            normalized[index:index + 2]
+            for index in range(max(0, len(normalized) - 1))
+        }
+        latin = {
+            token.casefold()
+            for token in re.findall(r"[A-Za-z][A-Za-z0-9+.#/_-]+", value)
+        }
+        return chinese_bigrams | latin
 
-    # Check for common capability keywords in JD
-    jd_cap_keywords = {
-        "产品", "运营", "设计", "开发", "算法", "数据", "分析",
-        "工程", "管理", "市场", "销售", "教育", "医疗", "金融",
-        "测试", "运维", "前端", "后端", "全栈", "算法", "NLP",
-        "CV", "图像", "语音", "推荐", "搜索", "风控",
-        "研发", "技术", "架构", "系统", "软件", "硬件",
-        "communication", "leadership", "management", "design",
-        "engineering", "development", "analysis", "research",
-        "marketing", "sales", "education", "teaching", "doctor",
-    }
-
-    found_keywords = sum(1 for kw in jd_cap_keywords if kw in summary_lower or kw in summary)
-
-    # If JD has very specific domain focus and summary has none of it
-    jd_domain_words = re.findall(r"[A-Za-z\u4e00-\u9fff]{2,20}", jd_text)
-    jd_domain_keywords = set()
-    for w in jd_domain_words:
-        if len(w) >= 2 and w not in {"岗位", "要求", "负责", "经验", "能力", "优先", "以及"}:
-            jd_domain_keywords.add(w.lower())
-
-    if jd_domain_keywords:
-        overlap = sum(1 for w in jd_domain_keywords if w in summary_lower or w in summary)
-        if overlap == 0 and found_keywords == 0:
-            conflicts.append(FieldConflict(
-                field="summary",
-                description="个人总结与目标岗位JD缺乏匹配，建议在总结中体现目标岗位所需的核心能力",
-            ))
+    jd_signals = signals(jd_text)
+    summary_signals = signals(summary)
+    if jd_signals and summary_signals and not (jd_signals & summary_signals):
+        conflicts.append(FieldConflict(
+            field="summary",
+            description="个人总结与目标岗位JD缺乏明确的内容交集，建议核对求职方向并补充有事实依据的相关能力",
+        ))
 
     return conflicts

@@ -1,11 +1,26 @@
 import io
+import math
+import multiprocessing as mp
 import os
 import re
+import signal
+import threading
+import time
 import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 from xml.etree import ElementTree as ET
+
+# Native math libraries otherwise see the host's CPU count rather than the 2C
+# cgroup quota and may try to create hundreds of threads during a spawn import.
+for _native_thread_env in (
+    "OPENBLAS_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+):
+    os.environ.setdefault(_native_thread_env, "1")
 
 from docx import Document as DocxDocument
 from docx.oxml.ns import qn
@@ -21,105 +36,425 @@ try:
 except ImportError:
     pytesseract = None
 
-# RapidOCR (GPU-accelerated, multi-language fallback)
+# RapidOCR. PP-OCRv6 small is the preferred document model on both CPU and
+# CUDA. The legacy v5 mobile/server bundles remain bounded fallbacks for images
+# built before the v6 model artifact was added.
 _RAPID_OCR = None
 _RAPID_OCR_PATH = None
 _RAPID_OCR_INITED = False
 _RAPID_OCR_VERSION = "v4"
+_RAPID_OCR_MODEL_TYPE = "unknown"
+_RAPID_OCR_PROVIDER = "unavailable"
+_RAPID_OCR_INIT_LOCK = threading.Lock()
+_RAPID_OCR_RUN_LOCK = threading.Lock()
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+def _positive_float_env(name: str, default: float) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+def _cgroup_cpu_limit() -> Optional[int]:
+    """Read cgroup v2/v1 CPU quota as a conservative whole-core count."""
+    try:
+        quota_text = Path("/sys/fs/cgroup/cpu.max").read_text().strip().split()
+        if len(quota_text) == 2 and quota_text[0] != "max":
+            quota, period = int(quota_text[0]), int(quota_text[1])
+            if quota > 0 and period > 0:
+                return max(1, quota // period)
+    except (OSError, ValueError):
+        pass
+
+    for root in (Path("/sys/fs/cgroup/cpu"), Path("/sys/fs/cgroup")):
+        try:
+            quota = int((root / "cpu.cfs_quota_us").read_text().strip())
+            period = int((root / "cpu.cfs_period_us").read_text().strip())
+            if quota > 0 and period > 0:
+                return max(1, quota // period)
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def _available_cpu_count() -> int:
+    """Return the lower of CPU affinity and the container's CPU quota."""
+    try:
+        affinity_count = max(1, len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):
+        affinity_count = max(1, os.cpu_count() or 1)
+    quota_count = _cgroup_cpu_limit()
+    return min(affinity_count, quota_count) if quota_count else affinity_count
+
+
+def _rapid_ocr_cuda_available() -> bool:
+    # CPU/mobile is the safe default because this service normally shares its
+    # GPU with vLLM.  Set RAPID_OCR_DEVICE=cuda (or auto) for a deployment with
+    # enough dedicated GPU headroom.
+    device = os.getenv("RAPID_OCR_DEVICE", "cpu").strip().lower()
+    if device in {"cpu", "off", "0", "false"}:
+        return False
+    try:
+        import onnxruntime as ort
+
+        # ONNX Runtime installed next to PyTorch may need its CUDA/cuDNN wheels
+        # preloaded from site-packages before a CUDA session can be created.
+        preload_dlls = getattr(ort, "preload_dlls", None)
+        if callable(preload_dlls):
+            try:
+                preload_dlls()
+            except Exception as exc:
+                logger.warning("RapidOCR could not preload CUDA libraries: %s", exc)
+        return (
+            ort.get_device() == "GPU"
+            and "CUDAExecutionProvider" in ort.get_available_providers()
+        )
+    except Exception:
+        return False
+
+
+def _rapid_ocr_model_bundles(model_dir: Path) -> dict[tuple[str, str], dict[str, Any]]:
+    return {
+        ("v6", "small"): {
+            "det": model_dir / "det.onnx",
+            "cls": model_dir / "cls.onnx",
+            "rec": model_dir / "rec.onnx",
+            "keys": model_dir / "keys.txt",
+            "cls_version": "v4",
+            "cls_model_type": "mobile",
+        },
+        ("v5", "server"): {
+            "det": model_dir / "ch_PP-OCRv5_det_server.onnx",
+            "cls": model_dir / "ch_PP-LCNet_x1_0_textline_ori_cls_server.onnx",
+            "rec": model_dir / "ch_PP-OCRv5_rec_server.onnx",
+            "cls_image_shape": [3, 80, 160],
+        },
+        ("v5", "mobile"): {
+            "det": model_dir / "ch_PP-OCRv5_det_mobile.onnx",
+            "cls": model_dir / "ch_PP-LCNet_x0_25_textline_ori_cls_mobile.onnx",
+            "rec": model_dir / "ch_PP-OCRv5_rec_mobile.onnx",
+            "cls_image_shape": [3, 80, 160],
+        },
+        ("v4", "server"): {
+            "det": model_dir / "ch_PP-OCRv4_det_server.onnx",
+            "cls": model_dir / "ch_ppocr_mobile_v2.0_cls_mobile.onnx",
+            "rec": model_dir / "ch_PP-OCRv4_rec_server.onnx",
+        },
+        ("v4", "mobile"): {
+            "det": model_dir / "ch_PP-OCRv4_det_mobile.onnx",
+            "cls": model_dir / "ch_ppocr_mobile_v2.0_cls_mobile.onnx",
+            "rec": model_dir / "ch_PP-OCRv4_rec_mobile.onnx",
+        },
+    }
+
+
+def _rapid_ocr_candidate_dirs() -> list[Path]:
+    configured_v6 = os.getenv("PPOCRV6_MODEL_DIR", "").strip()
+    candidates = [
+        Path(__file__).parent / "models" / "ppocrv6-small-ort",
+        Path(__file__).parent.parent / "models" / "ppocrv6-small-ort",
+        Path("/mounted_model/ppocrv6-small-ort"),
+        Path("/root/app/models/ppocrv6-small-ort"),
+        Path(__file__).parent / "models" / "rapidocr_multilang",
+        Path(__file__).parent.parent / "models" / "rapidocr_multilang",
+        Path("/mounted_model/rapidocr_multilang"),
+        Path("/root/app/models/rapidocr_multilang"),
+    ]
+    if configured_v6:
+        candidates.insert(0, Path(configured_v6))
+    return list(dict.fromkeys(candidates))
+
+
+def _select_rapid_ocr_bundle(
+    candidates: list[Path],
+    *,
+    prefer_server: bool,
+    forced_model_type: str = "auto",
+) -> Optional[dict[str, Any]]:
+    """Select an explicit model bundle without reconstructing filenames later."""
+    if forced_model_type not in {"auto", "small", "server", "mobile"}:
+        forced_model_type = "auto"
+    if forced_model_type == "auto":
+        type_order = ["small", "server", "mobile"] if prefer_server else ["small", "mobile", "server"]
+    else:
+        type_order = [forced_model_type]
+
+    for model_type in type_order:
+        for version in ("v6", "v5", "v4"):
+            for model_dir in candidates:
+                files = _rapid_ocr_model_bundles(model_dir).get((version, model_type))
+                if files is None:
+                    continue
+                model_paths = [value for value in files.values() if isinstance(value, Path)]
+                try:
+                    bundle_exists = bool(model_paths) and all(
+                        path.is_file() for path in model_paths
+                    )
+                except OSError:
+                    # A protected system path is just a non-candidate. Continue
+                    # probing later configured/local bundles instead of aborting
+                    # OCR initialization with PermissionError.
+                    bundle_exists = False
+                if bundle_exists:
+                    return {
+                        "model_dir": model_dir,
+                        "version": version,
+                        "model_type": model_type,
+                        **files,
+                    }
+    return None
+
+
+def _rapid_ocr_session_providers(ocr_instance: Any) -> list[str]:
+    providers: list[str] = []
+    for component_name in ("text_det", "text_cls", "text_rec"):
+        component = getattr(ocr_instance, component_name, None)
+        wrapper = getattr(component, "session", None)
+        session = getattr(wrapper, "session", wrapper)
+        get_providers = getattr(session, "get_providers", None)
+        if callable(get_providers):
+            try:
+                for provider in get_providers() or []:
+                    if provider not in providers:
+                        providers.append(str(provider))
+            except Exception:
+                continue
+    return providers
+
+
+def _build_rapid_ocr(bundle: dict[str, Any], *, use_cuda: bool, cpu_threads: int):
+    from rapidocr import RapidOCR
+    from rapidocr.utils.typings import ModelType as _ModelType
+    from rapidocr.utils.typings import OCRVersion as _OCRVersion
+
+    version_map = {
+        "v4": _OCRVersion.PPOCRV4,
+        "v5": _OCRVersion.PPOCRV5,
+        "v6": getattr(_OCRVersion, "PPOCRV6", None),
+    }
+    ocr_version = version_map.get(str(bundle["version"]))
+    if ocr_version is None:
+        raise RuntimeError(
+            "PP-OCRv6 requires rapidocr>=3.9.1; installed RapidOCR has no PPOCRV6 support"
+        )
+    cls_version = version_map.get(str(bundle.get("cls_version", bundle["version"])))
+    if cls_version is None:
+        cls_version = _OCRVersion.PPOCRV4
+    model_type_map = {
+        "small": _ModelType.SMALL,
+        "server": _ModelType.SERVER,
+        "mobile": _ModelType.MOBILE,
+    }
+    model_type = model_type_map[str(bundle["model_type"])]
+    cls_model_type = model_type_map[str(bundle.get("cls_model_type", bundle["model_type"]))]
+    gpu_mem_limit = _positive_int_env("RAPID_OCR_GPU_MEM_LIMIT_MB", 4096) * 1024 * 1024
+    params = {
+        "Det.model_path": str(bundle["det"]),
+        "Cls.model_path": str(bundle["cls"]),
+        "Rec.model_path": str(bundle["rec"]),
+        "Det.ocr_version": ocr_version,
+        "Det.model_type": model_type,
+        "Cls.ocr_version": cls_version,
+        "Cls.model_type": cls_model_type,
+        "Rec.ocr_version": ocr_version,
+        "Rec.model_type": model_type,
+        "Global.max_side_len": _positive_int_env("RAPID_OCR_ENGINE_MAX_SIDE", 1600),
+        "EngineConfig.onnxruntime.intra_op_num_threads": cpu_threads,
+        "EngineConfig.onnxruntime.inter_op_num_threads": 1,
+        "EngineConfig.onnxruntime.use_cuda": use_cuda,
+        "EngineConfig.onnxruntime.cuda_ep_cfg.gpu_mem_limit": gpu_mem_limit,
+    }
+    if bundle.get("keys"):
+        params["Rec.rec_keys_path"] = str(bundle["keys"])
+    if bundle.get("cls_image_shape"):
+        params["Cls.cls_image_shape"] = list(bundle["cls_image_shape"])
+    return RapidOCR(params=params)
+
+
+def _switch_rapid_ocr_to_cpu_mobile(reason: str) -> bool:
+    """Replace a failed CUDA engine with the bounded CPU v6-small path."""
+    global _RAPID_OCR, _RAPID_OCR_PATH, _RAPID_OCR_VERSION
+    global _RAPID_OCR_MODEL_TYPE, _RAPID_OCR_PROVIDER
+    with _RAPID_OCR_INIT_LOCK:
+        try:
+            bundle = _select_rapid_ocr_bundle(
+                _rapid_ocr_candidate_dirs(),
+                prefer_server=False,
+                forced_model_type="auto",
+            )
+            if bundle is None:
+                return False
+            cpu_threads = min(
+                _positive_int_env("RAPID_OCR_CPU_THREADS", 4),
+                _available_cpu_count(),
+            )
+            replacement = _build_rapid_ocr(
+                bundle,
+                use_cuda=False,
+                cpu_threads=cpu_threads,
+            )
+            providers = _rapid_ocr_session_providers(replacement)
+            with _RAPID_OCR_RUN_LOCK:
+                _RAPID_OCR = replacement
+                _RAPID_OCR_PATH = str(bundle["model_dir"])
+                _RAPID_OCR_VERSION = str(bundle["version"])
+                _RAPID_OCR_MODEL_TYPE = str(bundle["model_type"])
+                _RAPID_OCR_PROVIDER = providers[0] if providers else "unknown"
+            logger.warning(
+                "RapidOCR switched to CPU %s after CUDA failure | reason=%s provider=%s",
+                bundle["model_type"],
+                reason,
+                _RAPID_OCR_PROVIDER,
+            )
+            return True
+        except Exception as exc:
+            logger.warning("RapidOCR CPU failover could not initialize: %s", exc)
+            return False
 
 def _init_rapid_ocr():
     global _RAPID_OCR, _RAPID_OCR_PATH, _RAPID_OCR_INITED, _RAPID_OCR_VERSION
+    global _RAPID_OCR_MODEL_TYPE, _RAPID_OCR_PROVIDER
     if _RAPID_OCR_INITED:
         return
-    try:
-        import numpy as np  # noqa: F811
-        candidates = [
-            Path(__file__).parent / "models" / "rapidocr_multilang",
-            Path("/mounted_model/rapidocr_multilang"),
-            Path("/mnt/disk1/zengzhitao/menu-translate/models/rapidocr_multilang"),
-            Path("/root/app/models/rapidocr_multilang"),  # Docker container path
-        ]
-        candidates = [c for c in candidates if c is not None]
-        model_dir = None
-        for c in candidates:
-            # Prefer PP-OCRv5 Chinese server models
-            det = c / "ch_PP-OCRv5_det_server.onnx"
-            rec = c / "ch_PP-OCRv5_rec_server.onnx"
-            cls = c / "ch_PP-LCNet_x1_0_textline_ori_cls_server.onnx"
-            if det.exists() and rec.exists() and cls.exists():
-                model_dir = str(c)
-                version = "v5"
-                break
-
-        if model_dir is None:
-            for c in candidates:
-                # Fallback to PP-OCRv4 Chinese server models
-                det = c / "ch_PP-OCRv4_det_server.onnx"
-                rec = c / "ch_PP-OCRv4_rec_server.onnx"
-                cls = c / "ch_ppocr_mobile_v2.0_cls_mobile.onnx"
-                if det.exists() and rec.exists() and cls.exists():
-                    model_dir = str(c)
-                    version = "v4"
-                    break
-
-        if model_dir is None:
-            for c in candidates:
-                # Fallback to PP-OCRv5 Chinese mobile models
-                det = c / "ch_PP-OCRv5_det_mobile.onnx"
-                rec = c / "ch_PP-OCRv5_rec_mobile.onnx"
-                cls = c / "ch_PP-LCNet_x0_25_textline_ori_cls_mobile.onnx"
-                if det.exists() and rec.exists() and cls.exists():
-                    model_dir = str(c)
-                    version = "v5"
-                    break
-
-        if model_dir is None:
-            for c in candidates:
-                # Final fallback: PP-OCRv4 Chinese mobile models
-                det = c / "ch_PP-OCRv4_det_mobile.onnx"
-                rec = c / "ch_PP-OCRv4_rec_mobile.onnx"
-                cls = c / "ch_ppocr_mobile_v2.0_cls_mobile.onnx"
-                if det.exists() and rec.exists() and cls.exists():
-                    model_dir = str(c)
-                    version = "v4"
-                    break
-
-        if model_dir is None:
-            logger.warning("RapidOCR model files not found, falling back to pytesseract")
-            _RAPID_OCR_INITED = True
+    with _RAPID_OCR_INIT_LOCK:
+        if _RAPID_OCR_INITED:
             return
+        started = time.perf_counter()
+        try:
+            candidates = _rapid_ocr_candidate_dirs()
+            use_cuda = _rapid_ocr_cuda_available()
+            requested_device = os.getenv("RAPID_OCR_DEVICE", "cpu").strip().lower()
+            if requested_device in {"cuda", "gpu"} and not use_cuda:
+                logger.warning("RapidOCR CUDA requested but CUDAExecutionProvider is unavailable; using CPU")
 
-        det_path = os.path.join(model_dir, f"ch_PP-OCR{version}_det_server.onnx") if version == "v5" else os.path.join(model_dir, f"ch_PP-OCR{version}_det_server.onnx")
-        rec_path = os.path.join(model_dir, f"ch_PP-OCR{version}_rec_server.onnx") if version == "v5" else os.path.join(model_dir, f"ch_PP-OCR{version}_rec_server.onnx")
-        # RapidOCR 默认 Cls.ocr_version=PP-OCRv4 => cls_image_shape=[3,48,192]，
-        # 但 v5 CLS server 模型实际需要 [3,80,160]。通过显式传入 Cls.ocr_version
-        # 让 TextClassifier 使用正确的输入形状，避免 dimension mismatch。
-        if version == "v5":
-            cls_path = os.path.join(model_dir, "ch_PP-LCNet_x1_0_textline_ori_cls_server.onnx")
+            forced_model = os.getenv("RAPID_OCR_MODEL", "auto").strip().lower()
+            bundle = _select_rapid_ocr_bundle(
+                candidates,
+                prefer_server=use_cuda,
+                forced_model_type=forced_model,
+            )
+            if bundle is None:
+                logger.warning("RapidOCR model files not found, falling back to pytesseract")
+                return
+
+            cpu_threads = min(
+                _positive_int_env("RAPID_OCR_CPU_THREADS", 4),
+                _available_cpu_count(),
+            )
+            ocr_instance = _build_rapid_ocr(bundle, use_cuda=use_cuda, cpu_threads=cpu_threads)
+            providers = _rapid_ocr_session_providers(ocr_instance)
+
+            # A registered CUDA provider can still fail to create a CUDA session
+            # (for example due to a CUDA/cuDNN mismatch).  In auto mode, fall back
+            # to the bounded CPU path instead of silently running a CUDA-selected
+            # model through the CPU provider.
+            if (
+                use_cuda
+                and "CUDAExecutionProvider" not in providers
+                and forced_model == "auto"
+            ):
+                fallback_bundle = _select_rapid_ocr_bundle(
+                    candidates,
+                    prefer_server=False,
+                    forced_model_type="auto",
+                )
+                if fallback_bundle is not None:
+                    logger.warning(
+                        "RapidOCR CUDA session unavailable; switching to CPU %s model",
+                        fallback_bundle["model_type"],
+                    )
+                    bundle = fallback_bundle
+                    use_cuda = False
+                    ocr_instance = _build_rapid_ocr(
+                        bundle,
+                        use_cuda=False,
+                        cpu_threads=cpu_threads,
+                    )
+                    providers = _rapid_ocr_session_providers(ocr_instance)
+
+            _RAPID_OCR = ocr_instance
+            _RAPID_OCR_PATH = str(bundle["model_dir"])
+            _RAPID_OCR_VERSION = str(bundle["version"])
+            _RAPID_OCR_MODEL_TYPE = str(bundle["model_type"])
+            _RAPID_OCR_PROVIDER = providers[0] if providers else "unknown"
+            logger.info(
+                "RapidOCR initialized | version=%s model=%s provider=%s cpu_threads=%s init_s=%.3f path=%s",
+                _RAPID_OCR_VERSION,
+                _RAPID_OCR_MODEL_TYPE,
+                _RAPID_OCR_PROVIDER,
+                cpu_threads,
+                time.perf_counter() - started,
+                _RAPID_OCR_PATH,
+            )
+        except Exception as exc:
+            logger.warning("RapidOCR init failed: %s, falling back to pytesseract", exc)
+        finally:
+            _RAPID_OCR_INITED = True
+
+
+def _prepare_ocr_image(content: bytes):
+    """Decode, orient, normalize and bound an image before any OCR engine sees it."""
+    from PIL import ImageOps
+
+    with Image.open(io.BytesIO(content)) as source:
+        pil_img = ImageOps.exif_transpose(source)
+        if pil_img.mode != "RGB":
+            pil_img = pil_img.convert("RGB")
         else:
-            cls_path = os.path.join(model_dir, "ch_ppocr_mobile_v2.0_cls_mobile.onnx")
+            pil_img = pil_img.copy()
 
-        from rapidocr import RapidOCR
-        from rapidocr.utils.typings import OCRVersion as _OCRVersion
+    original_size = pil_img.size
+    width, height = original_size
+    max_pixels = _positive_int_env("RAPID_OCR_MAX_PIXELS", 6_000_000)
+    max_long_edge = _positive_int_env("RAPID_OCR_MAX_LONG_EDGE", 3000)
+    scale = min(
+        1.0,
+        max_long_edge / max(width, height),
+        math.sqrt(max_pixels / max(1, width * height)),
+    )
+    if scale < 1.0:
+        new_size = (
+            max(1, int(round(width * scale))),
+            max(1, int(round(height * scale))),
+        )
+        resampling = getattr(Image, "Resampling", Image).LANCZOS
+        pil_img = pil_img.resize(new_size, resampling)
+    return pil_img, original_size
 
-        cls_params = {"Cls.ocr_version": _OCRVersion.PPOCRV5} if version == "v5" else {}
-        ocr_instance = RapidOCR(params={
-            "Det.model_path": det_path,
-            "Cls.model_path": cls_path,
-            "Rec.model_path": rec_path,
-            **cls_params,
-        })
-        _RAPID_OCR = ocr_instance
-        _RAPID_OCR_PATH = model_dir
-        _RAPID_OCR_INITED = True
-        _RAPID_OCR_VERSION = version
-        logger.info(f"RapidOCR {version} initialized from {model_dir}")
-    except Exception as exc:
-        logger.warning(f"RapidOCR init failed: {exc}, falling back to pytesseract")
-        _RAPID_OCR_INITED = True  # prevent repeated attempts
+
+def _rapid_result_to_text(result: Any, *, img_width: int, img_height: int) -> str:
+    boxes = result.boxes if hasattr(result, "boxes") else (result[0] if isinstance(result, (tuple, list)) else None)
+    txts = result.txts if hasattr(result, "txts") else (result[1] if isinstance(result, (tuple, list)) and len(result) > 1 else None)
+    if boxes is None or len(boxes) == 0:
+        return ""
+    ordered_texts = _reconstruct_ocr_reading_order(
+        boxes,
+        txts,
+        img_width=img_width,
+        img_height=img_height,
+    )
+    return "\n".join(ordered_texts) if ordered_texts else ""
 
 
-def _ocr_image_with_rapid(content: bytes) -> str:
+def _run_rapid_ocr(np_img):
+    # RapidOCR/ONNX sessions are shared globally.  Serialize calls because the
+    # service may later raise its task-worker count and not every backend is
+    # guaranteed to be re-entrant.
+    with _RAPID_OCR_RUN_LOCK:
+        return _RAPID_OCR(np_img)
+
+
+def _ocr_image_with_rapid(content: bytes, *, prepared_image=None) -> str:
     """Extract text from image using global RapidOCR (single engine call).
 
     For two-column resume templates with a colored left banner (red/blue)
@@ -130,9 +465,7 @@ def _ocr_image_with_rapid(content: bytes) -> str:
     import numpy as np  # noqa: F811
     from PIL import ImageOps
 
-    pil_img = Image.open(io.BytesIO(content))
-    if pil_img.mode not in {"RGB", "L"}:
-        pil_img = pil_img.convert("RGB")
+    pil_img = prepared_image if prepared_image is not None else _prepare_ocr_image(content)[0]
 
     arr = np.array(pil_img)
     # Extract green channel — ideal for white-on-red (red bg is dark in G,
@@ -144,21 +477,24 @@ def _ocr_image_with_rapid(content: bytes) -> str:
     np_img = np.array(enhanced.convert("RGB"))
 
     try:
-        result = _RAPID_OCR(np_img)
+        result = _run_rapid_ocr(np_img)
     except Exception as exc:
         logger.warning("RapidOCR inference failed, falling back: %s", exc)
-        return ""
-    boxes = result.boxes if hasattr(result, "boxes") else (result[0] if isinstance(result, (tuple, list)) else None)
-    txts = result.txts if hasattr(result, "txts") else (result[1] if isinstance(result, (tuple, list)) else None)
-    if boxes is None or len(boxes) == 0:
-        return ""
-
-    texts = []
-    # Reconstruct reading order using layout information
-    ordered_texts = _reconstruct_ocr_reading_order(
-        boxes, txts, img_width=np_img.shape[1], img_height=np_img.shape[0],
+        if _RAPID_OCR_PROVIDER == "CUDAExecutionProvider" and _switch_rapid_ocr_to_cpu_mobile(
+            type(exc).__name__
+        ):
+            try:
+                result = _run_rapid_ocr(np_img)
+            except Exception as retry_exc:
+                logger.warning("RapidOCR CPU mobile retry failed: %s", retry_exc)
+                return ""
+        else:
+            return ""
+    return _rapid_result_to_text(
+        result,
+        img_width=np_img.shape[1],
+        img_height=np_img.shape[0],
     )
-    return "\n".join(ordered_texts) if ordered_texts else ""
 
 
 
@@ -348,88 +684,49 @@ def _reconstruct_ocr_reading_order(
     return result
 
 
-def _ocr_image_multicandidate(content: bytes) -> str:
-    """Try multiple preprocessing strategies with fresh OCR engines.
-
-    Each call creates a new engine, so this is safe even when the
-    global engine state is corrupted.
-    """
+def _ocr_image_multicandidate(content: bytes, *, prepared_image=None) -> str:
+    """Try a bounded number of alternate image transforms on the shared engine."""
     import numpy as np  # noqa: F811
-    from PIL import ImageOps, ImageEnhance
+    from PIL import ImageOps
 
-    pil_img = Image.open(io.BytesIO(content))
-    if pil_img.mode not in {"RGB", "L"}:
-        pil_img = pil_img.convert("RGB")
+    pil_img = prepared_image if prepared_image is not None else _prepare_ocr_image(content)[0]
 
-    if not _RAPID_OCR_PATH:
-        logger.warning("_RAPID_OCR_PATH is None, skipping multicandidate OCR fallback")
+    if _RAPID_OCR is None:
         return ""
-
-    def _eng():
-        from rapidocr import RapidOCR
-        from rapidocr.utils.typings import OCRVersion as _OCRVersion
-        det_model = f"ch_PP-OCR{_RAPID_OCR_VERSION}_det_server.onnx"
-        rec_model = f"ch_PP-OCR{_RAPID_OCR_VERSION}_rec_server.onnx"
-        if _RAPID_OCR_VERSION == "v5":
-            cls_model = "ch_PP-LCNet_x1_0_textline_ori_cls_server.onnx"
-            cp = {"Cls.ocr_version": _OCRVersion.PPOCRV5}
-        else:
-            cls_model = "ch_ppocr_mobile_v2.0_cls_mobile.onnx"
-            cp = {}
-        return RapidOCR(params={
-            "Det.model_path": _RAPID_OCR_PATH + "/" + det_model,
-            "Cls.model_path": _RAPID_OCR_PATH + "/" + cls_model,
-            "Rec.model_path": _RAPID_OCR_PATH + "/" + rec_model,
-            **cp,
-        })
 
     def _run(pil: Image.Image) -> str:
         try:
-            engine = _eng()
-            result = engine(np.array(pil))
-            boxes = result.boxes if hasattr(result, "boxes") else (result[0] if isinstance(result, (tuple, list)) else None)
-            txts = result.txts if hasattr(result, "txts") else (result[1] if isinstance(result, (tuple, list)) else None)
-            if boxes is None or len(boxes) == 0:
-                return ""
-            texts = []
-            for i in range(len(boxes)):
-                if texts and i < len(texts) and texts[i]:
-                    txt = str(txts[i][0]) if isinstance(txts[i], (tuple, list)) else str(txts[i])
-                else:
-                    txt = ""
-                if txt.strip():
-                    texts.append(txt.strip())
-            return "\n".join(texts)
-        except Exception:
+            np_img = np.array(pil.convert("RGB"))
+            result = _run_rapid_ocr(np_img)
+            return _rapid_result_to_text(
+                result,
+                img_width=np_img.shape[1],
+                img_height=np_img.shape[0],
+            )
+        except Exception as exc:
+            logger.warning("RapidOCR alternate preprocessing failed: %s", exc)
             return ""
 
-    best_text = ""
-    best_len = 0
-
-    # Strategy 1: grayscale 2x scale (original multicandidate)
-    gray_2x = pil_img.convert("L").resize((pil_img.width * 2, pil_img.height * 2), Image.BICUBIC)
-    t = _run(gray_2x.convert("RGB"))
-    if len(t.splitlines()) > best_len:
-        best_text, best_len = t, len(t.splitlines())
-
-    # Strategy 2: autocontrast (handles both light and dark areas)
+    # The primary path uses the green channel for colored resume sidebars.
+    # First retry a conventional grayscale image; this is the only retry by
+    # default, keeping an empty/unsupported image from multiplying OCR cost.
     auto = ImageOps.autocontrast(pil_img.convert("L"), cutoff=3)
-    t = _run(auto.convert("RGB"))
-    if len(t.splitlines()) > best_len:
-        best_text, best_len = t, len(t.splitlines())
+    text = _run(auto.convert("RGB"))
+    if text.strip():
+        return text
 
-    # Strategy 3: invert left column + keep right original (for two-column templates)
+    if _positive_int_env("RAPID_OCR_FALLBACK_ATTEMPTS", 1) < 2:
+        return ""
+
+    # Optional second retry for white text on a dark left column.
     w, h = pil_img.size
     if w > 200:
         arr = np.array(pil_img)
         left_inv = 255 - arr[:, :int(w * 0.35), :]
         right_orig = arr[:, int(w * 0.35):, :]
         merged = np.concatenate([left_inv, right_orig], axis=1)
-        t = _run(Image.fromarray(merged).convert("RGB"))
-        if len(t.splitlines()) > best_len:
-            best_text, best_len = t, len(t.splitlines())
-
-    return best_text
+        return _run(Image.fromarray(merged).convert("RGB"))
+    return ""
 
 from server_runtime import (
     ALLOWED_UPLOAD_EXTENSIONS,
@@ -446,6 +743,7 @@ from server_runtime import (
     logger,
     np,
     pikepdf,
+    remaining_request_seconds,
 )
 def _normalize_heading_line(line: str) -> str:
     text = str(line or "").strip()
@@ -963,7 +1261,39 @@ def _extract_text_from_pdf_bytes(content: bytes) -> str:
         doc = None
         try:
             doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-            return "\n".join(page.get_text() for page in doc).strip()
+            page_texts: list[str] = []
+            max_ocr_pages = _positive_int_env("OCR_PDF_MAX_PAGES", 12)
+            sparse_threshold = _positive_int_env("OCR_PDF_NATIVE_MIN_CHARS", 40)
+            render_scale = max(1.0, min(3.0, _positive_float_env("OCR_PDF_RENDER_SCALE", 1.7)))
+            ocr_pages = 0
+            for page_index, page in enumerate(doc):
+                native_text = (page.get_text() or "").strip()
+                native_chars = len(re.sub(r"\s+", "", native_text))
+                if native_chars >= sparse_threshold or ocr_pages >= max_ocr_pages:
+                    page_texts.append(native_text)
+                    continue
+
+                # Scanned and hybrid PDFs commonly contain an empty text layer.
+                # Render only sparse pages; native pages remain cheap and exact.
+                pixmap = page.get_pixmap(
+                    matrix=fitz.Matrix(render_scale, render_scale),
+                    alpha=False,
+                )
+                image_bytes = pixmap.tobytes("png")
+                ocr_text = extract_text_from_image_bytes(
+                    image_bytes,
+                    f"page-{page_index + 1}.png",
+                ).strip()
+                ocr_pages += 1
+                page_texts.append(ocr_text if len(ocr_text) > len(native_text) else native_text)
+            if ocr_pages:
+                logger.info(
+                    "PDF sparse-page OCR finished | pages=%s ocr_pages=%s source=%s",
+                    len(page_texts),
+                    ocr_pages,
+                    source,
+                )
+            return "\n".join(text for text in page_texts if text).strip()
         except Exception as exc:
             last_exc = exc
             logger.warning("PDF parse failed via %s bytes | error=%s", source, exc)
@@ -1010,39 +1340,79 @@ def _validate_upload_signature(content: bytes, filename: str) -> None:
 
 
 def extract_text_from_image_bytes(content: bytes, filename: str) -> str:
-    # Prefer RapidOCR (GPU, accurate), fall back to pytesseract (CPU)
+    total_started = time.perf_counter()
+    prepared_image, original_size = _prepare_ocr_image(content)
+    logger.info(
+        "OCR image prepared | extension=%s original=%sx%s input=%sx%s resized=%s",
+        Path(filename).suffix.lower(),
+        original_size[0],
+        original_size[1],
+        prepared_image.width,
+        prepared_image.height,
+        prepared_image.size != original_size,
+    )
+
+    # Prefer RapidOCR (CUDA server or CPU mobile), then bounded fallbacks.
     if not _RAPID_OCR_INITED:
         _init_rapid_ocr()
 
     text = ""
     if _RAPID_OCR is not None:
-        text = _ocr_image_with_rapid(content)
+        stage_started = time.perf_counter()
+        text = _ocr_image_with_rapid(content, prepared_image=prepared_image)
+        logger.info(
+            "OCR primary finished | provider=%s model=%s elapsed_s=%.3f chars=%s",
+            _RAPID_OCR_PROVIDER,
+            _RAPID_OCR_MODEL_TYPE,
+            time.perf_counter() - stage_started,
+            len(text),
+        )
 
     if not text.strip():
-        # Try grayscale/scaled preprocessing as fallback
+        stage_started = time.perf_counter()
         try:
-            text = _ocr_image_multicandidate(content)
+            text = _ocr_image_multicandidate(content, prepared_image=prepared_image)
         except Exception as exc:
             logger.warning("RapidOCR preprocessing fallback failed: %s", exc)
+        logger.info(
+            "OCR alternate preprocessing finished | elapsed_s=%.3f chars=%s",
+            time.perf_counter() - stage_started,
+            len(text),
+        )
 
     if not text.strip() and pytesseract is not None:
-        # Last resort: pytesseract (CPU, lower quality)
+        stage_started = time.perf_counter()
         try:
-            image = Image.open(io.BytesIO(content))
-            if image.mode not in {"RGB", "L"}:
-                image = image.convert("RGB")
-            text = pytesseract.image_to_string(image, lang="chi_sim+eng")
+            text = pytesseract.image_to_string(
+                prepared_image,
+                lang="chi_sim+eng",
+                timeout=_positive_float_env("TESSERACT_TIMEOUT_SECONDS", 15.0),
+            )
         except Exception as exc:
             logger.warning("pytesseract OCR also failed: %s", exc)
+        logger.info(
+            "OCR tesseract fallback finished | elapsed_s=%.3f chars=%s",
+            time.perf_counter() - stage_started,
+            len(text),
+        )
 
     if not text.strip():
-        logger.warning("All OCR engines failed for %s", filename)
+        logger.warning(
+            "All OCR engines failed | extension=%s total_s=%.3f",
+            Path(filename).suffix.lower(),
+            time.perf_counter() - total_started,
+        )
         return ""
 
     normalized = _normalize_extracted_resume_text(text)
+    logger.info(
+        "OCR extraction finished | total_s=%.3f normalized_chars=%s",
+        time.perf_counter() - total_started,
+        len(normalized),
+    )
     return normalized if normalized else ""
 
-def extract_text_from_bytes(content: bytes, filename: str) -> str:
+def _extract_text_from_bytes_impl(content: bytes, filename: str) -> str:
     ext = _detect_extension(filename)
     if ext not in ALLOWED_UPLOAD_EXTENSIONS:
         raise HTTPException(status_code=400, detail=f"Unsupported file extension: {ext}")
@@ -1078,6 +1448,204 @@ def extract_text_from_bytes(content: bytes, filename: str) -> str:
     return text
 
 
+def _isolated_descendant_pids(root_pid: int) -> set[int]:
+    if os.name != "posix" or not Path("/proc").is_dir():
+        return set()
+    descendants: set[int] = set()
+    pending = [int(root_pid)]
+    while pending:
+        parent_pid = pending.pop()
+        try:
+            child_files = list(Path(f"/proc/{parent_pid}/task").glob("*/children"))
+        except OSError:
+            continue
+        for child_file in child_files:
+            try:
+                child_ids = [int(value) for value in child_file.read_text().split()]
+            except (OSError, ValueError):
+                continue
+            for child_pid in child_ids:
+                if child_pid in descendants or child_pid == root_pid:
+                    continue
+                descendants.add(child_pid)
+                pending.append(child_pid)
+    return descendants
+
+
+def _signal_isolated_descendants(descendants: set[int], sig: int) -> None:
+    for child_pid in descendants:
+        try:
+            os.kill(child_pid, sig)
+        except (OSError, ProcessLookupError):
+            pass
+
+
+def _isolated_extract_entry(connection, content: bytes, filename: str) -> None:
+    """Child entry for native OCR libraries that cannot be cancelled safely."""
+
+    process_group_ready = False
+    try:
+        nested_in_task_group = os.getenv("RESUME_TASK_PROCESS_GROUP", "").strip() == "1"
+        if os.name == "posix" and not nested_in_task_group:
+            os.setsid()
+            process_group_ready = True
+        connection.send(("ready", {"process_group": process_group_ready}))
+        text = _extract_text_from_bytes_impl(content, filename)
+        connection.send(("ok", text))
+    except BaseException as exc:  # child must serialize failures, not traceback objects
+        connection.send((
+            "error",
+            {
+                "status_code": int(getattr(exc, "status_code", 400) or 400),
+                "detail": str(getattr(exc, "detail", exc) or type(exc).__name__),
+                "exception_type": type(exc).__name__,
+            },
+        ))
+    finally:
+        connection.close()
+
+
+def _terminate_isolated_process(process: mp.Process, *, process_group_ready: bool) -> None:
+    """Terminate an OCR child and any native subprocesses it spawned."""
+
+    if process.pid is None:
+        return
+    if not process.is_alive():
+        process.join(timeout=0.2)
+        if os.name == "posix" and process_group_ready:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except (OSError, ProcessLookupError):
+                pass
+            time.sleep(0.05)
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
+        return
+    descendants = _isolated_descendant_pids(process.pid)
+    _signal_isolated_descendants(descendants, signal.SIGTERM)
+    try:
+        if os.name == "posix" and process_group_ready:
+            os.killpg(process.pid, signal.SIGTERM)
+        else:
+            process.terminate()
+    except (OSError, ProcessLookupError):
+        pass
+    process.join(timeout=1.0)
+    if not process.is_alive():
+        _signal_isolated_descendants(descendants, signal.SIGKILL)
+        return
+    descendants.update(_isolated_descendant_pids(process.pid))
+    _signal_isolated_descendants(descendants, signal.SIGKILL)
+    try:
+        if os.name == "posix" and process_group_ready:
+            os.killpg(process.pid, signal.SIGKILL)
+        elif hasattr(process, "kill"):
+            process.kill()
+        else:
+            process.terminate()
+    except (OSError, ProcessLookupError):
+        pass
+    process.join(timeout=1.0)
+
+
+def _ocr_hard_timeout_seconds() -> float:
+    configured = _positive_float_env("OCR_HARD_TIMEOUT_SECONDS", 60.0)
+    remaining = remaining_request_seconds()
+    if remaining is None:
+        return configured
+    # Leave a small budget for deterministic fallback/reporting after OCR.
+    return max(0.1, min(configured, remaining - 2.0))
+
+
+def _extract_text_isolated(content: bytes, filename: str, timeout_seconds: float) -> str:
+    """Run OCR/PDF extraction in a spawn child with a real kill boundary."""
+
+    context = mp.get_context(os.getenv("OCR_PROCESS_START_METHOD", "spawn"))
+    parent_connection, child_connection = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_isolated_extract_entry,
+        args=(child_connection, content, filename),
+        name="resume-ocr",
+    )
+    process.start()
+    child_connection.close()
+    deadline = time.monotonic() + max(0.1, float(timeout_seconds))
+    process_group_ready = False
+    result: Optional[tuple[str, Any]] = None
+    try:
+        while time.monotonic() < deadline:
+            wait_seconds = min(0.1, max(0.0, deadline - time.monotonic()))
+            if parent_connection.poll(wait_seconds):
+                message = parent_connection.recv()
+                if not isinstance(message, tuple) or len(message) != 2:
+                    continue
+                status, payload = message
+                if status == "ready":
+                    process_group_ready = bool(
+                        isinstance(payload, dict) and payload.get("process_group")
+                    )
+                    continue
+                result = (str(status), payload)
+                break
+            if not process.is_alive():
+                break
+    finally:
+        if result is None and process.is_alive():
+            _terminate_isolated_process(
+                process,
+                process_group_ready=process_group_ready,
+            )
+        else:
+            process.join(timeout=1.0)
+            if process.is_alive():
+                _terminate_isolated_process(
+                    process,
+                    process_group_ready=process_group_ready,
+                )
+        parent_connection.close()
+
+    if result is None:
+        if time.monotonic() >= deadline:
+            raise HTTPException(
+                status_code=408,
+                detail=f"OCR exceeded the {timeout_seconds:.1f}s hard timeout",
+            )
+        raise HTTPException(
+            status_code=500,
+            detail=f"OCR worker exited without a result (exit={process.exitcode})",
+        )
+    status, payload = result
+    if status == "ok":
+        return str(payload or "")
+    if isinstance(payload, dict):
+        raise HTTPException(
+            status_code=int(payload.get("status_code", 400) or 400),
+            detail=str(payload.get("detail", "OCR worker failed")),
+        )
+    raise HTTPException(status_code=400, detail=str(payload or "OCR worker failed"))
+
+
+def extract_text_from_bytes(content: bytes, filename: str) -> str:
+    """Extract text, isolating OCR-capable formats behind a hard timeout."""
+
+    ext = _detect_extension(filename)
+    needs_native_ocr = ext in IMAGE_EXTENSIONS or ext == ".pdf"
+    isolation_enabled = os.getenv("OCR_PROCESS_ISOLATION", "1").strip().lower() not in {
+        "0", "false", "no", "off",
+    }
+    # Daemonic workers cannot create children. The whole-task supervisor still
+    # provides an outer kill boundary in that uncommon deployment mode.
+    if needs_native_ocr and isolation_enabled and not mp.current_process().daemon:
+        return _extract_text_isolated(
+            content,
+            filename,
+            timeout_seconds=_ocr_hard_timeout_seconds(),
+        )
+    return _extract_text_from_bytes_impl(content, filename)
+
+
 def extract_text_from_path(file_path: str) -> str:
     if not file_path:
         raise HTTPException(status_code=400, detail="file_path is required")
@@ -1090,36 +1658,13 @@ def extract_text_from_path(file_path: str) -> str:
     if ext not in SUPPORTED_FILE_PATH_EXTENSIONS:
         raise HTTPException(status_code=400, detail=f"Unsupported file extension: {ext}")
 
-    if ext in {".txt", ".md"}:
-        text = _read_text_file(path)
-    elif ext == ".pdf":
-        try:
-            text = _extract_text_from_pdf_bytes(path.read_bytes())
-        except HTTPException:
-            raise
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"Failed to parse PDF: {exc}") from exc
-    else:
-        try:
-            doc = DocxDocument(str(path))
-            text = _extract_text_from_docx_document(doc)
-            if len(text) < 20:
-                xml_text = _extract_text_from_docx_xml_bytes(path.read_bytes())
-                if len(xml_text) > len(text):
-                    logger.info(
-                        "DOCX XML fallback improved text extraction | path=%s before_chars=%s after_chars=%s",
-                        file_path,
-                        len(text),
-                        len(xml_text),
-                    )
-                    text = xml_text
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"Failed to parse DOCX: {exc}") from exc
-
-    text = _normalize_extracted_resume_text(text)
-    if not text:
-        raise HTTPException(status_code=400, detail="No valid text extracted from file")
-    return text
+    try:
+        payload = path.read_bytes()
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to read file_path: {exc}") from exc
+    # Keep path-based callers on the same signature validation, OCR hard timeout,
+    # scanned-PDF fallback and normalization path as uploaded bytes.
+    return extract_text_from_bytes(payload, path.name)
 
 
 def resolve_resume_text(resume_content: Optional[str], file_path: Optional[str]) -> str:

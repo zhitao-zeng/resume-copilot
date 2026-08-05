@@ -307,10 +307,13 @@ def test_sparse_query_does_not_claim_unprovided_experience():
         "v2_pipeline.optimize_resume", side_effect=lambda resume, jd: resume
     ):
         result = run_v2_pipeline("", "我是做智能硬件产品的，帮我优化简历。", "IoT产品经理")
-    assert result.resume.summary == ""
+    assert "全生命周期管理" not in result.resume.summary
+    assert "完整落地经验" not in result.resume.summary
+    assert "智能硬件" in result.resume.summary
     assert result.resume.meta.target_role == "IoT智能硬件产品经理"
-    assert result.resume_dict["framework"]["mode"] == "empty_profile"
-    assert "不代表候选人已有事实" in result.resume_dict["framework"]["notice"]
+    assert result.resume.experience == []
+    assert result.resume.projects == []
+    assert "framework" not in result.resume_dict
 
 
 def test_jd_derived_temporary_records_still_produce_structured_framework():
@@ -414,12 +417,10 @@ def test_summary_is_deterministic_and_contains_no_subjective_filler():
         "summary": "具备扎实基础、敏锐洞察力，致力于成为优秀人才。",
     })
     summary = _build_evidence_summary(resume)
-    assert "某医科大学" in summary
     assert "某医院检验科实习生" in summary
     assert "病理切片制备" in summary
-    assert "病理标本处理项目" in summary
     assert "求职方向为病理科技师" in summary
-    assert len(summary) <= 180
+    assert len(summary) <= 100
     assert not any(word in summary for word in ("扎实", "敏锐", "致力于", "优秀"))
 
 
@@ -463,7 +464,7 @@ def test_summary_prioritizes_grounded_quantified_achievement():
     ranked = _rank_resume_content(resume, "涂布工艺参数优化")
     compacted = _compact_canonical(ranked)
     assert "4.8%降至3.1%" in compacted.summary
-    assert len(compacted.summary) <= 180
+    assert len(compacted.summary) <= 100
     assert "4.8%降至3.1%" in compacted.projects[0].bullets[0]
 
 

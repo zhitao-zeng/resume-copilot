@@ -49,7 +49,22 @@ from resume_validator import (
     FabricationReport,
 )
 from schemas import ResumeCopilotResponse, StructuredResumeLLMOutput
-from server_runtime import AVATAR_DIR, DEFAULT_TEMPLATE, DRAFTS_DIR, MAX_FILE_SIZE, OUTPUT_DIR, REQUEST_TIMEOUT_SECONDS, call_llm_text, call_llm_typed, llm_enabled, logger, sanitize_user_text
+from server_runtime import (
+    AVATAR_DIR,
+    DEFAULT_TEMPLATE,
+    DRAFTS_DIR,
+    MAX_FILE_SIZE,
+    OUTPUT_DIR,
+    REQUEST_TIMEOUT_SECONDS,
+    call_llm_text,
+    call_llm_typed,
+    llm_enabled,
+    logger,
+    remaining_request_seconds,
+    reset_request_deadline,
+    sanitize_user_text,
+    set_request_deadline,
+)
 from prompts import REPLY_GENERATION_SYSTEM_PROMPT
 
 
@@ -63,6 +78,31 @@ def _dicts(items: list[Any]) -> list[dict[str, Any]]:
         else:
             result.append(dict(getattr(item, "__dict__", {})))
     return result
+
+
+def _collect_content_conflicts(
+    resume_data: dict[str, Any],
+    jd_text: str = "",
+) -> list[Any]:
+    conflicts = [
+        *check_time_conflicts(resume_data),
+        *check_sort_order(resume_data),
+        *check_summary_jd_alignment(
+            str(resume_data.get("summary", "") or ""),
+            jd_text,
+        ),
+    ]
+    unique: list[Any] = []
+    seen: set[tuple[str, str]] = set()
+    for item in conflicts:
+        key = (
+            str(getattr(item, "field", "")),
+            str(getattr(item, "description", "")),
+        )
+        if key not in seen:
+            seen.add(key)
+            unique.append(item)
+    return unique
 
 
 def _looks_like_url(value: str) -> bool:
@@ -716,7 +756,7 @@ def generate_resume_with_llm_from_profile(
         "2) 【目标JD】只能用于确定表达方向、关键词侧重和个人总结，不得写成候选人已具备事实。\n"
         "3) 缺失的姓名、电话、邮箱、学校、学历、时间、岗位、成果、技能必须留空或保留原文弱表达，不得猜测。\n"
         "4) 原文没有数字结果时，不得编造百分比、金额、人数、病例数、学生数、客户数。\n"
-        "5) 个人总结使用2-4个完整句子，建议120-180字，不得从句中截断，且要匹配目标行业。\n"
+        "5) 个人总结使用2-4个完整句子，控制在100字以内，不得从句中截断，且要匹配目标行业。\n"
         "6) 输出必须是结构化简历 JSON，不要输出解释或 markdown。\n"
         "7) 输出语言必须与用户输入保持一致：用户用中文，则全部字段用中文输出。\n"
         "8) 不得使用知页、WonderCV 等模板网站的示例占位数据，必须使用描述中真实的用户信息。"
@@ -822,6 +862,26 @@ async def _resume_copilot_service_impl(
         user_stage=ctx.user_stage,
         source_text=candidate_truth,
     )
+    # The production V2 path used to bypass all conflict checks, leaving
+    # ``ctx.conflicts`` permanently empty even for overlapping full-time jobs.
+    ctx.conflicts = _collect_content_conflicts(ctx.resume_data, ctx.jd_text)
+    quality_started = time.perf_counter()
+    try:
+        from quality_report import build_quality_report
+        ctx.quality_report = build_quality_report(
+            source=truth_bundle,
+            resume=v2_result.resume,
+            evidence_bindings=v2_result.evidence_bindings,
+            changes=v2_result.changes,
+            missing_fields=ctx.missing_fields,
+            jd_text=ctx.jd_text,
+            target_role=ctx.target_role,
+            framework_mode=isinstance(ctx.resume_data.get("framework"), dict),
+        )
+    except Exception as exc:
+        logger.warning("Quality report generation failed: %s", exc)
+        ctx.quality_report = {}
+    ctx.perf["quality_report_s"] = round(time.perf_counter() - quality_started, 3)
     logger.info("V2 pipeline done in %.1fs (has_cv=%s), %d missing fields",
                  time.perf_counter() - t_v2, ctx.has_cv, len(ctx.missing_fields))
 
@@ -867,8 +927,12 @@ async def resume_copilot_service(
     template: str = DEFAULT_TEMPLATE,
 ) -> ResumeCopilotResponse:
     """Run the complete pipeline under a real wall-clock request deadline."""
+    deadline_token = set_request_deadline(timeout_seconds=REQUEST_TIMEOUT_SECONDS)
     try:
-        async with asyncio.timeout(REQUEST_TIMEOUT_SECONDS):
+        # Respect a stricter deadline installed by an outer queue/request
+        # boundary; this function must never extend it back to 480 seconds.
+        remaining = remaining_request_seconds()
+        async with asyncio.timeout(max(0.0, remaining or 0.0)):
             return await _resume_copilot_service_impl(
                 query=query,
                 cv=cv,
@@ -885,3 +949,5 @@ async def resume_copilot_service(
             status_code=504,
             detail=f"resume-copilot exceeded the {REQUEST_TIMEOUT_SECONDS}s request budget",
         ) from exc
+    finally:
+        reset_request_deadline(deadline_token)

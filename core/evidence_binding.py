@@ -79,7 +79,10 @@ def _best_block(value: str, blocks: list[SourceBlock]) -> tuple[SourceBlock | No
         candidate = _bigrams(block.text)
         if not candidate:
             continue
-        score = len(target & candidate) / max(1, min(len(target), len(candidate)))
+        # Truth checking is asymmetric: every part of the generated value must
+        # be supported by the source.  Dividing by the shorter side allowed a
+        # short shared prefix to validate a much longer fabricated claim.
+        score = len(target & candidate) / max(1, len(target))
         if score > best_score:
             best_block, best_score = block, score
     return best_block, best_score, "rewritten"
@@ -104,9 +107,45 @@ def _bind(path: str, value: str, blocks: list[SourceBlock], *, minimum: float = 
         path=path,
         block_id=block.block_id,
         quote=quote,
+        claim=str(value).strip(),
         mode=mode,
         similarity=round(similarity, 4),
     )
+
+
+def _strong_matching_blocks(
+    value: str,
+    blocks: list[SourceBlock],
+    *,
+    minimum: float,
+) -> list[SourceBlock]:
+    """Return every strong direct/date match, or the single best fuzzy match."""
+
+    normalized_value = _normalize(value)
+    if not normalized_value:
+        return []
+    direct = [
+        block for block in blocks
+        if normalized_value in _normalize(block.text)
+    ]
+    if direct:
+        return direct
+
+    date_signature = _date_signature(value)
+    if date_signature:
+        date_matches = []
+        for block in blocks:
+            block_signature = _date_signature(block.text)
+            if len(block_signature) >= len(date_signature) and any(
+                block_signature[index:index + len(date_signature)] == date_signature
+                for index in range(len(block_signature) - len(date_signature) + 1)
+            ):
+                date_matches.append(block)
+        if date_matches:
+            return date_matches
+
+    block, similarity, _ = _best_block(value, blocks)
+    return [block] if block is not None and similarity >= minimum else []
 
 
 def _record_scope_key(
@@ -123,6 +162,11 @@ def _record_scope_key(
     job. Lines before the first dated header belong to that first record so
     layouts with organization/title above the date remain supported.
     """
+
+    if block.record_id and block.section_hint == section:
+        return block.record_id
+    if block.section_hint and block.section_hint != section:
+        return None
 
     eligible = candidate_blocks(source)
     section_blocks = [
@@ -161,23 +205,22 @@ def _find_incoherent_records(
     incoherent: dict[str, set[int]] = {section: set() for section in section_fields}
     for section, fields in section_fields.items():
         for index, record in enumerate(getattr(resume, section)):
-            scopes: set[str] = set()
+            scope_options: list[set[str]] = []
             explicit_hints: set[str] = set()
             for field in fields:
                 value = str(getattr(record, field, "") or "").strip()
                 if not value:
                     continue
-                binding = _bind(f"{section}[{index}].{field}", value, blocks, minimum=0.65)
-                if binding is None:
-                    continue
-                source_block = block_by_id.get(binding.block_id)
-                if source_block is None:
-                    continue
-                if source_block.section_hint:
-                    explicit_hints.add(source_block.section_hint)
-                scope = _record_scope_key(source_block, source, section)
-                if scope:
-                    scopes.add(scope)
+                matching_blocks = _strong_matching_blocks(value, blocks, minimum=0.65)
+                field_scopes: set[str] = set()
+                for source_block in matching_blocks:
+                    if source_block.section_hint:
+                        explicit_hints.add(source_block.section_hint)
+                    scope = _record_scope_key(source_block, source, section)
+                    if scope:
+                        field_scopes.add(scope)
+                if field_scopes:
+                    scope_options.append(field_scopes)
             if hasattr(record, "bullets"):
                 for bullet_index, value in enumerate(record.bullets):
                     binding = _bind(
@@ -189,7 +232,16 @@ def _find_incoherent_records(
                     source_block = block_by_id.get(binding.block_id) if binding else None
                     if source_block and source_block.section_hint:
                         explicit_hints.add(source_block.section_hint)
-            if len(scopes) > 1:
+                    if source_block is not None:
+                        scope = _record_scope_key(source_block, source, section)
+                        if scope:
+                            scope_options.append({scope})
+            # A repeated value such as "本科" legitimately matches several
+            # education records. The record is coherent when at least one
+            # source scope can satisfy every scoped identity field; binding a
+            # repeated short value to the first global match must not delete a
+            # later valid record.
+            if len(scope_options) > 1 and not set.intersection(*scope_options):
                 incoherent[section].add(index)
             elif explicit_hints and explicit_hints.issubset(_NON_RECORD_SECTION_HINTS):
                 # A publication/certificate/training line may not be duplicated
@@ -211,6 +263,11 @@ def bind_resume_evidence(resume: CanonicalResume, source: SourceBundle) -> list[
 
     for key in ("name", "phone", "email", "work_experience"):
         add(f"meta.{key}", getattr(resume.meta, key), 0.8)
+
+    for index, sentence in enumerate(
+        item.strip() for item in re.split(r"[。！？!?；;]+", resume.summary) if item.strip()
+    ):
+        add(f"summary[{index}]", sentence, 0.68)
 
     section_fields = {
         "education": ("school", "degree", "major", "period"),
@@ -263,6 +320,17 @@ def enforce_resume_evidence(
         if getattr(gated.meta, key) and path not in bound_paths:
             setattr(gated.meta, key, "")
             removed.append(path)
+
+    grounded_summary: list[str] = []
+    for index, sentence in enumerate(
+        item.strip() for item in re.split(r"[。！？!?；;]+", gated.summary) if item.strip()
+    ):
+        binding = _bind(f"summary[{index}]", sentence, eligible_blocks, minimum=0.68)
+        if binding is not None and (binding.mode in {"direct", "normalized"} or binding.similarity >= 0.78):
+            grounded_summary.append(sentence)
+        else:
+            removed.append(f"summary[{index}]")
+    gated.summary = "。".join(grounded_summary) + ("。" if grounded_summary else "")
 
     section_fields = {
         "education": ("school", "degree", "major", "period"),
@@ -344,28 +412,99 @@ def enforce_resume_evidence(
     return gated, bindings, removed
 
 
+_SOURCE_FIELD_LABEL = re.compile(
+    r"^(?:姓名|电话|手机|邮箱|学校|院校|学历|学位|专业|公司|单位|岗位|职位|"
+    r"项目名称|项目角色|技能|证书|奖项|任职时间|起止时间|个人总结|自我评价)\s*[:：]\s*"
+)
+_FACT_SPLIT = re.compile(r"(?:[。；;]+|[|｜]+|(?<=[^\s])[,，、](?=[^\s]))")
+_STRONG_FACT_ANCHOR = re.compile(
+    r"(?<![A-Za-z0-9])\d+(?:\.\d+)?(?:%|万|亿|w|k|人|次|个|条|元|年|月|日)?|"
+    r"[A-Za-z][A-Za-z0-9+.#/_-]{1,}",
+    re.IGNORECASE,
+)
+
+
+def source_fact_units(source: SourceBundle) -> list[dict[str, str]]:
+    """Split candidate source into auditable facts, including OCR-long lines."""
+
+    result: list[dict[str, str]] = []
+    for block in candidate_blocks(source):
+        compact = re.sub(r"[\s:：|｜/\\【】\[\]()（）]+", "", block.text)
+        if not compact or compact in _SOURCE_HEADINGS or len(compact) < 2:
+            continue
+        stripped = _SOURCE_FIELD_LABEL.sub("", block.text.strip())
+        raw_parts = [part.strip(" \t-•·▪◦") for part in _FACT_SPLIT.split(stripped)]
+        parts = [part for part in raw_parts if len(_normalize(part)) >= 2]
+        if not parts:
+            continue
+        # Preserve the original punctuation in reports for ordinary one-fact
+        # lines. Multi-fact/OCR-compressed lines expose each missing clause.
+        displays = [block.text.strip()] if len(parts) == 1 else parts
+        for index, (part, display) in enumerate(zip(parts, displays)):
+            unit_id = block.block_id if len(parts) == 1 else f"{block.block_id}#u{index}"
+            result.append({
+                "unit_id": unit_id,
+                "block_id": block.block_id,
+                "source_type": block.source_type,
+                "section_hint": block.section_hint or "",
+                "text": display,
+                "match_text": part,
+            })
+    return result
+
+
+def _unit_is_represented(unit: dict[str, str], claims: list[str]) -> bool:
+    source_value = _normalize(unit.get("match_text", ""))
+    if not source_value:
+        return True
+    anchors = {item.casefold() for item in _STRONG_FACT_ANCHOR.findall(unit.get("match_text", ""))}
+    source_bigrams = _bigrams(source_value)
+    for claim in claims:
+        claim_value = _normalize(claim)
+        if not claim_value:
+            continue
+        claim_anchors = {item.casefold() for item in _STRONG_FACT_ANCHOR.findall(claim)}
+        if anchors and not anchors.issubset(claim_anchors):
+            continue
+        if source_value in claim_value:
+            return True
+        if len(source_value) <= 4 and claim_value in source_value:
+            return True
+        claim_bigrams = _bigrams(claim_value)
+        recall = len(source_bigrams & claim_bigrams) / max(1, len(source_bigrams))
+        if recall >= 0.58:
+            return True
+    return False
+
+
 def measure_source_coverage(
     source: SourceBundle,
     bindings: list[EvidenceBinding],
 ) -> tuple[float, list[str]]:
-    """Measure source-line coverage in the generated resume.
+    """Measure source fact-unit coverage in the generated resume.
 
-    This is the reverse of hallucination checking: it detects factual source
-    lines that disappeared entirely. Headings are excluded because they are
-    structure rather than candidate facts.
+    This is the reverse of hallucination checking. A long OCR line may contain
+    several duties, methods and results; one short binding no longer marks all
+    of them as represented.
     """
 
-    content_blocks: list[SourceBlock] = []
-    for block in candidate_blocks(source):
-        compact = re.sub(r"[\s:：|｜/\\【】\[\]()（）]+", "", block.text)
-        if not compact or compact in _SOURCE_HEADINGS:
-            continue
-        if len(compact) < 3:
-            continue
-        content_blocks.append(block)
-    if not content_blocks:
+    units = source_fact_units(source)
+    if not units:
         return 1.0, []
-    covered = {binding.block_id for binding in bindings}
-    missing = [block.block_id for block in content_blocks if block.block_id not in covered]
-    ratio = (len(content_blocks) - len(missing)) / len(content_blocks)
+    claims_by_block: dict[str, list[str]] = {}
+    legacy_covered: set[str] = set()
+    for binding in bindings:
+        legacy_covered.add(binding.block_id)
+        if binding.claim.strip():
+            claims_by_block.setdefault(binding.block_id, []).append(binding.claim)
+    missing: list[str] = []
+    for unit in units:
+        block_id = unit["block_id"]
+        claims = claims_by_block.get(block_id, [])
+        # Bindings serialized before claim tracing was introduced remain
+        # backward-compatible at block granularity.
+        represented = _unit_is_represented(unit, claims) if claims else block_id in legacy_covered
+        if not represented:
+            missing.append(unit["unit_id"])
+    ratio = (len(units) - len(missing)) / len(units)
     return round(ratio, 4), missing

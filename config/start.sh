@@ -4,8 +4,8 @@ set -e
 log() { echo "[$(date '+%H:%M:%S')] $1"; }
 
 # === 版本信息 ===
-VERSION_COMMIT="91f5056"
-VERSION_DATE="2026-07-30"
+VERSION_COMMIT="${RESUME_BUILD_COMMIT:-unknown}"
+VERSION_DATE="${RESUME_BUILD_DATE:-unknown}"
 log "============================================"
 log "  resume-copilot 版本: ${VERSION_COMMIT} (${VERSION_DATE})"
 log "============================================"
@@ -37,12 +37,21 @@ fi
 
 # ═══ vLLM 启动并等待模型加载完成 ═══
 export MALLOC_ARENA_MAX=2 OMP_NUM_THREADS=1
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-16384}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-2}"
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
+export MAX_MODEL_LEN
+export LLM_CONTEXT_WINDOW="$MAX_MODEL_LEN"
+export LLM_TOKENIZER_PATH="${LLM_TOKENIZER_PATH:-$MODEL_FOUND}"
+export LLM_INFLIGHT_LIMIT="${LLM_INFLIGHT_LIMIT:-$MAX_NUM_SEQS}"
 
 vllm serve "$MODEL_FOUND" \
     --host 0.0.0.0 --port 8000 \
     --quantization awq --dtype float16 \
     --gpu-memory-utilization 0.88 \
-    --max-model-len 8192 --max-num-seqs 1 \
+    --max-model-len "$MAX_MODEL_LEN" \
+    --max-num-seqs "$MAX_NUM_SEQS" \
+    --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS" \
     --limit-mm-per-prompt '{"image":0,"video":0}' \
     --trust-remote-code \
     --enforce-eager \

@@ -153,8 +153,14 @@ def test_chunked_read_single_pass_no_duplicate():
 # ── multipart endpoint acceptance ─────────────────────────────────────
 
 class _FakeFuture:
-    def add_done_callback(self, _cb):
-        pass
+    def done(self):
+        return True
+
+    def cancel(self):
+        return True
+
+    def add_done_callback(self, callback):
+        callback(self)
 
 
 def test_resume_optimize_multipart_accepted():

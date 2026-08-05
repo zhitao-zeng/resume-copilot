@@ -16,6 +16,10 @@ class SourceBlock(BaseModel):
     source_type: Literal["resume", "query", "jd"]
     text: str
     section_hint: Optional[str] = None
+    # Deterministic source-side record boundary.  Evidence binding uses this to
+    # prevent an organization/role/bullet from different jobs or projects from
+    # being spliced into one generated record.
+    record_id: Optional[str] = None
     # Query text mixes user instructions with optional factual additions.
     # Only blocks explicitly classified as candidate facts may support resume
     # claims. Resume blocks are always eligible; JD blocks never are.
@@ -219,6 +223,10 @@ class EvidenceBinding(BaseModel):
     path: str
     block_id: str
     quote: str
+    # Final claim text is kept internally so reverse coverage can verify which
+    # source fact units actually survived, rather than treating one binding as
+    # coverage for an entire OCR line.
+    claim: str = ""
     mode: Literal["direct", "normalized", "rewritten", "derived"]
     similarity: float = 1.0
 

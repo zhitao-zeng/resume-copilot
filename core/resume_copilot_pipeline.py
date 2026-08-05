@@ -306,6 +306,7 @@ class PipelineContext:
 
     # Stage 5 (Score) output
     user_report: dict = field(default_factory=dict)
+    quality_report: dict = field(default_factory=dict)
     score: float = 0.0
     score_breakdown: dict = field(default_factory=dict)
 
@@ -658,6 +659,7 @@ def _build_targeted_suggestions(
 def _reply_detail_block(
     missing_fields: list[dict[str, Any]],
     targeted_suggestions: list[str],
+    quality_report: dict[str, Any] | None = None,
 ) -> str:
     lines: list[str] = []
     if missing_fields:
@@ -681,12 +683,115 @@ def _reply_detail_block(
     if targeted_suggestions:
         lines.append("针对岗位的建议：")
         lines.extend(f"- {item}" for item in targeted_suggestions)
+    report = quality_report if isinstance(quality_report, dict) else {}
+    preservation = report.get("source_preservation", {})
+    unrepresented = (
+        preservation.get("unrepresented_items", [])
+        if isinstance(preservation, dict) else []
+    )
+    if unrepresented:
+        total = int(preservation.get("unrepresented_item_count", len(unrepresented)) or 0)
+        lines.append(f"原始材料中未充分写入成稿的信息（{total}项）：")
+        for item in unrepresented[:8]:
+            if not isinstance(item, dict):
+                continue
+            excerpt = str(item.get("excerpt", "")).strip()
+            if excerpt:
+                lines.append(f"- {excerpt}")
+    grounding = report.get("fact_grounding", {})
+    if isinstance(grounding, dict):
+        unsupported_count = int(grounding.get("unsupported_item_count", 0) or 0)
+        if unsupported_count:
+            lines.append(
+                f"为避免编造，已移除 {unsupported_count} 处缺少候选人事实依据的生成内容。"
+            )
+    follow_ups = report.get("follow_up_questions", [])
+    if isinstance(follow_ups, list) and follow_ups:
+        lines.append("建议补充回答：")
+        lines.extend(f"- {str(item).strip()}" for item in follow_ups[:6] if str(item).strip())
     return "\n".join(lines)
+
+
+def _resume_section_overview(resume_data: dict[str, Any] | None) -> str:
+    data = resume_data if isinstance(resume_data, dict) else {}
+    framework = data.get("framework")
+    if isinstance(framework, dict):
+        titles = [
+            str(item.get("title", "")).strip()
+            for item in framework.get("sections", [])
+            if isinstance(item, dict) and str(item.get("title", "")).strip()
+        ]
+        return "、".join(titles)
+
+    labels = {
+        "summary": "个人总结",
+        "education": "教育经历",
+        "experience": "工作/实习经历",
+        "research": "科研经历",
+        "campus_experience": "校园经历",
+        "projects": "项目经历",
+        "awards": "荣誉奖项",
+        "publications": "论文/专利",
+        "certifications": "证书与资质",
+        "training": "培训经历",
+        "teaching": "教学经历",
+        "additional_sections": "其他专业经历",
+    }
+    sections: list[str] = []
+    for key, label in labels.items():
+        value = data.get(key)
+        if (isinstance(value, str) and value.strip()) or (
+            isinstance(value, (list, dict)) and bool(value)
+        ):
+            sections.append(label)
+    skills = data.get("skills")
+    if isinstance(skills, dict) and any(
+        isinstance(value, list) and any(str(item).strip() for item in value)
+        for value in skills.values()
+    ):
+        sections.append("专业技能")
+    return "、".join(dict.fromkeys(sections))
+
+
+def _reply_result_block(
+    *,
+    direction: str,
+    resume_data: dict[str, Any] | None,
+    framework_mode: bool,
+) -> str:
+    lines = ["生成方向总结："]
+    if framework_mode:
+        lines.append("- 未收到可核验的个人信息；已生成待填写框架，框架内容不代表候选人已有经历。")
+    elif direction.strip():
+        lines.append(f"- {direction.strip()}")
+    else:
+        lines.append("- 基于已提供的个人事实完成结构化整理，并优先保留可核验的经历、方法和结果。")
+    overview = _resume_section_overview(resume_data)
+    if overview:
+        lines.append(f"- 已生成模块：{overview}。")
+    return "\n".join(lines)
+
+
+def _reply_conflict_block(conflicts: list[dict[str, Any]]) -> str:
+    if not conflicts:
+        return ""
+    lines = [f"需要确认的时间或内容冲突（{len(conflicts)}项）："]
+    for item in conflicts[:8]:
+        description = str(item.get("description", "")).strip()
+        if description:
+            lines.append(f"- {description}")
+    if len(conflicts) > 8:
+        lines.append(f"- 另有 {len(conflicts) - 8} 项，请在结构化报告中继续核对。")
+    return "\n".join(lines) if len(lines) > 1 else ""
 
 
 def _build_llm_reply(
     *, audit_report, score, missing_fields, changes,
     jd_text: str = "", resume_data: dict | None = None,
+    quality_report: dict[str, Any] | None = None,
+    conflicts: list[dict[str, Any]] | None = None,
+    direction: str = "",
+    framework_mode: bool = False,
 ) -> str:
     """Generate reply_text via LLM. Returns empty string on failure."""
     if not ENABLE_LLM_REPLY or not llm_enabled():
@@ -720,6 +825,19 @@ def _build_llm_reply(
                 summary_parts.append("简历包含：" + "、".join(sections))
             else:
                 summary_parts.append("简历内容为空或极少，需要用户补充个人信息")
+
+        if framework_mode:
+            summary_parts.append("本次没有可核验的个人事实，必须明确说明已生成待填写框架，不能声称已生成个人经历")
+        if direction.strip():
+            summary_parts.append("生成方向：" + direction.strip())
+        if conflicts:
+            summary_parts.append(
+                "需要用户确认的冲突：" + "；".join(
+                    str(item.get("description", "")).strip()
+                    for item in conflicts[:8]
+                    if str(item.get("description", "")).strip()
+                )
+            )
 
         # Audit issues (V1 path)
         if isinstance(audit_report, dict):
@@ -767,9 +885,16 @@ def _build_llm_reply(
             summary_parts.append(f"目标岗位参考：{jd_snippet}")
             summary_parts.append("请根据目标岗位给出 1-2 条针对性建议")
 
-        targeted_suggestions = _build_targeted_suggestions(
-            jd_text, resume_data, str((resume_data or {}).get("meta", {}).get("target_role", ""))
+        report = quality_report if isinstance(quality_report, dict) else {}
+        job_alignment = report.get("job_alignment", {})
+        targeted_suggestions = (
+            list(job_alignment.get("recommendations", []))
+            if isinstance(job_alignment, dict) else []
         )
+        if not targeted_suggestions:
+            targeted_suggestions = _build_targeted_suggestions(
+                jd_text, resume_data, str((resume_data or {}).get("meta", {}).get("target_role", ""))
+            )
 
         user_prompt = "请根据以下简历处理结果生成面向用户的自然语言回复（不要提及具体评分数值）：\n\n" + "\n".join(summary_parts)
         reply = call_llm_text(
@@ -777,9 +902,21 @@ def _build_llm_reply(
             user_prompt=user_prompt,
             temperature=0.3, max_tokens=768,
         )
-        detail_block = _reply_detail_block(missing_fields, targeted_suggestions)
-        if reply and detail_block and "缺失或待补充信息（" not in reply:
+        detail_block = _reply_detail_block(
+            missing_fields, targeted_suggestions, quality_report=report,
+        )
+        if reply and detail_block and detail_block not in reply:
             reply += "\n\n" + detail_block
+        result_block = _reply_result_block(
+            direction=direction,
+            resume_data=resume_data,
+            framework_mode=framework_mode,
+        )
+        if reply and result_block and result_block not in reply:
+            reply += "\n\n" + result_block
+        conflict_block = _reply_conflict_block(conflicts or [])
+        if reply and conflict_block and conflict_block not in reply:
+            reply += "\n\n" + conflict_block
         rewrite_count = _rewrite_change_count(changes)
         rewrite_message = f"已在不新增事实的前提下优化 {rewrite_count} 条经历/项目表述。"
         if reply and rewrite_count and f"优化 {rewrite_count} 条" not in reply:
@@ -806,6 +943,9 @@ def build_reply_text(
     *, scenario, industry, user_stage, missing_fields, conflicts,
     ocr_warnings, direction, score_total, changes=None,
     targeted_suggestions=None,
+    quality_report: dict[str, Any] | None = None,
+    resume_data: dict[str, Any] | None = None,
+    framework_mode: bool = False,
 ) -> str:
     scenario_label = {
         "scenario1": "原始简历与目标 JD 优化",
@@ -813,22 +953,31 @@ def build_reply_text(
         "scenario3": "原始简历按目标岗位优化",
         "scenario4": "个人信息结合目标 JD 生成简历",
     }.get(scenario, "简历生成/优化")
+    if framework_mode:
+        scenario_label = "目标 JD 待填写简历框架"
     header = "已按\"" + scenario_label + "\"完成一版可编辑 DOCX，识别方向为" + product_logic.display_industry(industry) + "，用户阶段为" + product_logic.display_user_stage(user_stage) + "。"
-    parts = [header, direction]
+    parts = [header, _reply_result_block(
+        direction=direction,
+        resume_data=resume_data,
+        framework_mode=framework_mode,
+    )]
     rewrite_count = _rewrite_change_count(changes)
     if rewrite_count:
         parts.append(f"已在不新增事实的前提下优化 {rewrite_count} 条经历/项目表述。")
     if missing_fields:
-        parts.append(_reply_detail_block(missing_fields, targeted_suggestions or []))
+        parts.append(_reply_detail_block(
+            missing_fields, targeted_suggestions or [], quality_report=quality_report,
+        ))
         parts.append("建议补齐上述信息后再用于正式投递。")
     else:
         parts.append("未检测到必填信息缺失；正式投递前请人工复核联系方式、时间和成果表述。")
-        if targeted_suggestions:
-            parts.append(_reply_detail_block([], targeted_suggestions))
-    if conflicts:
-        reasons = "; ".join(item.get("description", "") for item in conflicts[:3] if item.get("description"))
-        if reasons:
-            parts.append("需要确认: " + reasons)
+        if targeted_suggestions or quality_report:
+            parts.append(_reply_detail_block(
+                [], targeted_suggestions or [], quality_report=quality_report,
+            ))
+    conflict_block = _reply_conflict_block(conflicts)
+    if conflict_block:
+        parts.append(conflict_block)
     if ocr_warnings:
         warnings = "; ".join(item.get("message", "") for item in ocr_warnings[:3] if item.get("message"))
         parts.append("OCR/文件提示: " + warnings)
@@ -1194,7 +1343,9 @@ async def stage_classify(ctx: PipelineContext) -> PipelineContext:
         ctx.source_truth_text = ctx.query_text
         ctx.generation_text = ctx.query_text
 
-    if not ctx.generation_text.strip():
+    # A JD-only request is valid: V2 renders a structured, explicitly
+    # unfilled resume framework without inventing candidate facts.
+    if not ctx.generation_text.strip() and not ctx.has_jd:
         raise HTTPException(status_code=400, detail="query or cv is required")
 
     t_classify = time.perf_counter()
@@ -1692,11 +1843,22 @@ async def stage_prepare_report(ctx: PipelineContext) -> PipelineContext:
         fabrication=fab_dict, direction=direction,
         ocr_warnings=ctx.ocr_warnings, template_notes=ctx.template_notes,
     )
-    targeted_suggestions = _build_targeted_suggestions(
-        ctx.jd_text, ctx.resume_data, ctx.target_role,
+    job_alignment = (
+        ctx.quality_report.get("job_alignment", {})
+        if isinstance(ctx.quality_report, dict) else {}
     )
+    targeted_suggestions = (
+        list(job_alignment.get("recommendations", []))
+        if isinstance(job_alignment, dict) else []
+    )
+    if not targeted_suggestions:
+        targeted_suggestions = _build_targeted_suggestions(
+            ctx.jd_text, ctx.resume_data, ctx.target_role,
+        )
     if targeted_suggestions:
         ctx.user_report["targeted_suggestions"] = targeted_suggestions
+    if ctx.quality_report:
+        ctx.user_report["quality_report"] = ctx.quality_report
     if isinstance(ctx.resume_data.get("framework"), dict):
         ctx.user_report["framework_mode"] = True
     if ctx.changes:
@@ -1728,6 +1890,10 @@ async def stage_render(ctx: PipelineContext) -> PipelineContext:
         audit_report=ctx.audit_report, score=ctx.score,
         missing_fields=missing_dict, changes=ctx.changes,
         jd_text=ctx.jd_text, resume_data=ctx.resume_data,
+        quality_report=ctx.quality_report,
+        conflicts=conflict_dict,
+        direction=ctx.user_report.get("generation_direction", ""),
+        framework_mode=bool(ctx.user_report.get("framework_mode")),
     )
     if not reply_text:
         reply_text = build_reply_text(
@@ -1738,6 +1904,9 @@ async def stage_render(ctx: PipelineContext) -> PipelineContext:
             score_total=ctx.score,
             changes=ctx.changes,
             targeted_suggestions=ctx.user_report.get("targeted_suggestions", []),
+            quality_report=ctx.quality_report,
+            resume_data=ctx.resume_data,
+            framework_mode=bool(ctx.user_report.get("framework_mode")),
         )
     ctx.reply_text = reply_text
 
