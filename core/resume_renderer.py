@@ -1,5 +1,7 @@
 import html as html_lib
 import copy
+import hashlib
+import io
 import logging
 import os
 import re
@@ -7,6 +9,7 @@ import shutil
 import subprocess
 import tempfile
 import uuid
+import zipfile
 from pathlib import Path
 from typing import Any, Optional
 
@@ -18,6 +21,15 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Inches, Mm, Pt, RGBColor
+from lxml import etree
+
+try:
+    from fontTools import subset as font_subset
+    from fontTools.ttLib import TTCollection, TTFont
+except ImportError:
+    font_subset = None
+    TTCollection = None
+    TTFont = None
 
 try:
     import fitz  # PyMuPDF
@@ -32,6 +44,11 @@ except ImportError:
 SUPPORTED_TEMPLATES = {"classic", "modern", "minimal"}
 DEFAULT_DOC_FONT = os.getenv("RESUME_DOC_FONT", "Noto Sans CJK SC")
 DEFAULT_DOC_MONO_FONT = os.getenv("RESUME_DOC_MONO_FONT", "DejaVu Sans Mono")
+DEFAULT_DOC_EAST_ASIA_FONT = os.getenv("RESUME_DOC_EAST_ASIA_FONT", "Noto Sans CJK SC")
+DEFAULT_DOC_EMBED_CJK_FONT = os.getenv("RESUME_DOC_EMBED_CJK_FONT", "1").strip().lower() not in {
+    "0", "false", "no",
+}
+DEFAULT_DOC_MAX_EMBEDDED_FONT_BYTES = 4 * 1024 * 1024
 PDF_ACCENT_COLORS = {
     "classic": (0x0F, 0x34, 0x60),
     "modern": (0x00, 0x5A, 0x64),
@@ -41,6 +58,24 @@ PDF_BODY_COLOR = (0x22, 0x22, 0x22)
 PDF_MUTED_COLOR = (0x66, 0x66, 0x66)
 PDF_MARGIN_MM = os.getenv("RESUME_PDF_MARGIN_MM", "10mm")
 logger = logging.getLogger(__name__)
+logging.getLogger("fontTools.subset").setLevel(logging.WARNING)
+
+_OOXML_WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+_OOXML_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_OOXML_PACKAGE_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+_OOXML_CONTENT_TYPES_NS = "http://schemas.openxmlformats.org/package/2006/content-types"
+_OOXML_FONT_REL_TYPE = (
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/font"
+)
+_OOXML_OBFUSCATED_FONT_CONTENT_TYPE = (
+    "application/vnd.openxmlformats-officedocument.obfuscatedFont"
+)
+_DOCX_CJK_FONT_CANDIDATES = (
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
+    "/usr/share/fonts/truetype/noto/NotoSansCJKsc-Regular.otf",
+)
 
 _RESUME_SECTION_TITLES = {
     "个人简介", "个人总结", "基本信息", "求职信息", "工作经历", "工作/实习经历", "实习经历",
@@ -75,6 +110,397 @@ def _normalize_template(template: str) -> str:
 
 def _contains_cjk(text: str) -> bool:
     return bool(re.search(r"[\u4e00-\u9fff]", text or ""))
+
+
+def _contains_east_asian_text(text: str) -> bool:
+    """Return whether text needs the portable CJK font path."""
+
+    return bool(
+        re.search(
+            r"[\u2e80-\u2fff\u3000-\u303f\u3040-\u30ff\u31f0-\u31ff"
+            r"\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff"
+            r"\U00020000-\U0002ffff]",
+            text or "",
+        )
+    )
+
+
+def _font_family_names(font: Any) -> list[str]:
+    names: list[str] = []
+    name_table = font.get("name")
+    if name_table is None:
+        return names
+    for record in name_table.names:
+        if record.nameID != 1:
+            continue
+        try:
+            value = record.toUnicode().strip()
+        except Exception:
+            continue
+        if value and value not in names:
+            names.append(value)
+    return names
+
+
+def _docx_cjk_font_paths() -> list[Path]:
+    configured = os.getenv("RESUME_DOC_CJK_FONT_PATH", "").strip()
+    values = ([configured] if configured else []) + list(_DOCX_CJK_FONT_CANDIDATES)
+    paths: list[Path] = []
+    for value in values:
+        path = Path(value)
+        if path.is_file() and path not in paths:
+            paths.append(path)
+    return paths
+
+
+def _docx_max_embedded_font_bytes() -> int:
+    raw = os.getenv(
+        "RESUME_DOC_MAX_EMBEDDED_FONT_BYTES",
+        str(DEFAULT_DOC_MAX_EMBEDDED_FONT_BYTES),
+    ).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_DOC_MAX_EMBEDDED_FONT_BYTES
+    return value if value > 0 else DEFAULT_DOC_MAX_EMBEDDED_FONT_BYTES
+
+
+def _build_cjk_font_subset(characters: set[str]) -> tuple[str, bytes]:
+    """Build a license-checked, used-glyph CJK font subset for one DOCX."""
+
+    if font_subset is None or TTCollection is None or TTFont is None:
+        raise RuntimeError("fonttools is unavailable")
+    if not characters:
+        raise ValueError("no characters were supplied for the CJK font subset")
+
+    desired_family = DEFAULT_DOC_EAST_ASIA_FONT.casefold()
+    last_error: Optional[Exception] = None
+    for path in _docx_cjk_font_paths():
+        collection = None
+        standalone_font = None
+        try:
+            if path.suffix.lower() in {".ttc", ".otc"}:
+                collection = TTCollection(str(path), lazy=False)
+                faces = list(collection.fonts)
+            else:
+                standalone_font = TTFont(str(path), lazy=False)
+                faces = [standalone_font]
+
+            selected = next(
+                (
+                    face
+                    for face in faces
+                    if desired_family in {name.casefold() for name in _font_family_names(face)}
+                ),
+                None,
+            )
+            if selected is None:
+                selected = next(
+                    (
+                        face
+                        for face in faces
+                        if any("cjk sc" in name.casefold() for name in _font_family_names(face))
+                    ),
+                    faces[0] if faces else None,
+                )
+            if selected is None:
+                raise RuntimeError(f"no font face found in {path}")
+
+            family_names = _font_family_names(selected)
+            family = next(
+                (name for name in family_names if name.casefold() == desired_family),
+                family_names[0] if family_names else DEFAULT_DOC_EAST_ASIA_FONT,
+            )
+            os2 = selected.get("OS/2")
+            fs_type = int(getattr(os2, "fsType", 0) or 0)
+            if fs_type & 0x0002:
+                raise RuntimeError(f"font embedding is restricted by OS/2 fsType: {path}")
+
+            options = font_subset.Options()
+            options.name_IDs = [0, 1, 2, 3, 4, 5, 6]
+            options.name_legacy = True
+            options.name_languages = [0x409, 0x804]
+            options.notdef_glyph = True
+            options.notdef_outline = True
+            options.recalc_timestamp = False
+            subsetter = font_subset.Subsetter(options=options)
+            subsetter.populate(text="".join(sorted(characters)))
+            subsetter.subset(selected)
+
+            target = io.BytesIO()
+            selected.save(target)
+            payload = target.getvalue()
+            maximum = _docx_max_embedded_font_bytes()
+            if len(payload) > maximum:
+                raise RuntimeError(
+                    f"CJK font subset is {len(payload)} bytes, above configured {maximum}-byte cap"
+                )
+            return family, payload
+        except Exception as exc:
+            last_error = exc
+        finally:
+            if collection is not None:
+                collection.close()
+            elif standalone_font is not None:
+                standalone_font.close()
+
+    if last_error is not None:
+        raise RuntimeError(f"unable to create CJK font subset: {last_error}") from last_error
+    raise FileNotFoundError("no embeddable CJK font file was found")
+
+
+def _obfuscate_ooxml_font(font_data: bytes, font_key: uuid.UUID) -> bytes:
+    """Apply the reversible OOXML font obfuscation to the first 32 bytes."""
+
+    result = bytearray(font_data)
+    key = font_key.bytes[::-1]
+    for index in range(min(32, len(result))):
+        result[index] ^= key[index % 16]
+    return bytes(result)
+
+
+def _serialize_ooxml(root: Any) -> bytes:
+    return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+
+
+def _parse_ooxml(payload: bytes) -> Any:
+    parser = etree.XMLParser(resolve_entities=False, no_network=True, huge_tree=False)
+    return etree.fromstring(payload, parser=parser)
+
+
+def _ensure_run_east_asia_font(run: Any, font_family: str) -> None:
+    r_pr = run.find(f"{{{_OOXML_WORD_NS}}}rPr")
+    if r_pr is None:
+        r_pr = etree.Element(f"{{{_OOXML_WORD_NS}}}rPr")
+        run.insert(0, r_pr)
+    r_fonts = r_pr.find(f"{{{_OOXML_WORD_NS}}}rFonts")
+    if r_fonts is None:
+        r_fonts = etree.Element(f"{{{_OOXML_WORD_NS}}}rFonts")
+        r_pr.insert(0, r_fonts)
+    r_fonts.set(f"{{{_OOXML_WORD_NS}}}eastAsia", font_family)
+    r_fonts.attrib.pop(f"{{{_OOXML_WORD_NS}}}eastAsiaTheme", None)
+
+
+def _patch_docx_cjk_xml(
+    members: dict[str, bytes],
+    font_family: str,
+) -> tuple[bool, set[str]]:
+    """Set direct CJK run fonts and replace non-portable Symbol bullets."""
+
+    visible_parts = {
+        name
+        for name in members
+        if name == "word/document.xml"
+        or re.fullmatch(
+            r"word/(?:header\d+|footer\d+|footnotes|endnotes|comments)\.xml",
+            name,
+        )
+    }
+    parsed: dict[str, Any] = {}
+    characters: set[str] = set()
+    has_east_asian_text = False
+    namespaces = {"w": _OOXML_WORD_NS}
+
+    for name in visible_parts:
+        root = _parse_ooxml(members[name])
+        parsed[name] = root
+        for node in root.xpath("//w:t | //w:instrText", namespaces=namespaces):
+            characters.update(node.text or "")
+        for run in root.xpath("//w:r", namespaces=namespaces):
+            text = "".join(
+                node.text or ""
+                for node in run.xpath(".//w:t | .//w:instrText", namespaces=namespaces)
+            )
+            if _contains_east_asian_text(text):
+                has_east_asian_text = True
+                _ensure_run_east_asia_font(run, font_family)
+
+    if not has_east_asian_text:
+        return False, characters
+
+    numbering_name = "word/numbering.xml"
+    if numbering_name in members:
+        numbering = _parse_ooxml(members[numbering_name])
+        parsed[numbering_name] = numbering
+        for level in numbering.xpath(
+            "//w:lvl[w:numFmt[@w:val='bullet']]",
+            namespaces=namespaces,
+        ):
+            level_text = level.find(f"{{{_OOXML_WORD_NS}}}lvlText")
+            if level_text is None:
+                continue
+            value = level_text.get(f"{{{_OOXML_WORD_NS}}}val", "")
+            if any(0xE000 <= ord(char) <= 0xF8FF for char in value):
+                value = "\u2022"
+                level_text.set(f"{{{_OOXML_WORD_NS}}}val", value)
+            characters.update(value.replace("%1", ""))
+            r_pr = level.find(f"{{{_OOXML_WORD_NS}}}rPr")
+            if r_pr is None:
+                r_pr = etree.SubElement(level, f"{{{_OOXML_WORD_NS}}}rPr")
+            r_fonts = r_pr.find(f"{{{_OOXML_WORD_NS}}}rFonts")
+            if r_fonts is None:
+                r_fonts = etree.SubElement(r_pr, f"{{{_OOXML_WORD_NS}}}rFonts")
+            for attribute in ("ascii", "hAnsi", "eastAsia"):
+                r_fonts.set(f"{{{_OOXML_WORD_NS}}}{attribute}", font_family)
+            for attribute in ("asciiTheme", "hAnsiTheme", "eastAsiaTheme"):
+                r_fonts.attrib.pop(f"{{{_OOXML_WORD_NS}}}{attribute}", None)
+
+    for name, root in parsed.items():
+        members[name] = _serialize_ooxml(root)
+    return True, characters
+
+
+def _add_embedded_cjk_font(
+    members: dict[str, bytes],
+    font_family: str,
+    font_data: bytes,
+) -> str:
+    required = {"word/fontTable.xml", "[Content_Types].xml", "word/settings.xml"}
+    missing = sorted(required.difference(members))
+    if missing:
+        raise RuntimeError(f"DOCX is missing required OOXML parts: {', '.join(missing)}")
+
+    font_key = uuid.uuid5(uuid.NAMESPACE_URL, hashlib.sha256(font_data).hexdigest())
+    font_part_name = f"word/fonts/{font_key.hex}.odttf"
+    relationship_id = "rIdPortableCjkFont"
+    namespaces = {"w": _OOXML_WORD_NS}
+
+    font_table = _parse_ooxml(members["word/fontTable.xml"])
+    font_entry = next(
+        (
+            item
+            for item in font_table.xpath("./w:font", namespaces=namespaces)
+            if item.get(f"{{{_OOXML_WORD_NS}}}name", "").casefold()
+            == font_family.casefold()
+        ),
+        None,
+    )
+    if font_entry is None:
+        font_entry = etree.SubElement(font_table, f"{{{_OOXML_WORD_NS}}}font")
+        font_entry.set(f"{{{_OOXML_WORD_NS}}}name", font_family)
+    for old_embed in font_entry.findall(f"{{{_OOXML_WORD_NS}}}embedRegular"):
+        font_entry.remove(old_embed)
+    embed = etree.SubElement(font_entry, f"{{{_OOXML_WORD_NS}}}embedRegular")
+    embed.set(f"{{{_OOXML_REL_NS}}}id", relationship_id)
+    embed.set(f"{{{_OOXML_WORD_NS}}}fontKey", "{" + str(font_key).upper() + "}")
+    members["word/fontTable.xml"] = _serialize_ooxml(font_table)
+
+    relationships_name = "word/_rels/fontTable.xml.rels"
+    if relationships_name in members:
+        relationships = _parse_ooxml(members[relationships_name])
+    else:
+        relationships = etree.Element(
+            f"{{{_OOXML_PACKAGE_REL_NS}}}Relationships",
+            nsmap={None: _OOXML_PACKAGE_REL_NS},
+        )
+    existing_ids = {
+        item.get("Id", "")
+        for item in relationships.findall(f"{{{_OOXML_PACKAGE_REL_NS}}}Relationship")
+    }
+    if relationship_id in existing_ids:
+        suffix = 2
+        while f"{relationship_id}{suffix}" in existing_ids:
+            suffix += 1
+        relationship_id = f"{relationship_id}{suffix}"
+        embed.set(f"{{{_OOXML_REL_NS}}}id", relationship_id)
+        members["word/fontTable.xml"] = _serialize_ooxml(font_table)
+    relationship = etree.SubElement(
+        relationships,
+        f"{{{_OOXML_PACKAGE_REL_NS}}}Relationship",
+    )
+    relationship.set("Id", relationship_id)
+    relationship.set("Type", _OOXML_FONT_REL_TYPE)
+    relationship.set("Target", f"fonts/{font_key.hex}.odttf")
+    members[relationships_name] = _serialize_ooxml(relationships)
+
+    content_types = _parse_ooxml(members["[Content_Types].xml"])
+    defaults = content_types.findall(f"{{{_OOXML_CONTENT_TYPES_NS}}}Default")
+    font_type = next(
+        (item for item in defaults if item.get("Extension", "").casefold() == "odttf"),
+        None,
+    )
+    if font_type is None:
+        font_type = etree.SubElement(
+            content_types,
+            f"{{{_OOXML_CONTENT_TYPES_NS}}}Default",
+        )
+        font_type.set("Extension", "odttf")
+    font_type.set("ContentType", _OOXML_OBFUSCATED_FONT_CONTENT_TYPE)
+    members["[Content_Types].xml"] = _serialize_ooxml(content_types)
+
+    settings = _parse_ooxml(members["word/settings.xml"])
+    embed_setting = settings.find(f"{{{_OOXML_WORD_NS}}}embedTrueTypeFonts")
+    if embed_setting is None:
+        embed_setting = etree.SubElement(settings, f"{{{_OOXML_WORD_NS}}}embedTrueTypeFonts")
+    embed_setting.set(f"{{{_OOXML_WORD_NS}}}val", "true")
+    members["word/settings.xml"] = _serialize_ooxml(settings)
+    members[font_part_name] = _obfuscate_ooxml_font(font_data, font_key)
+    return font_part_name
+
+
+def _rewrite_docx_package(
+    output_path: Path,
+    original_entries: list[zipfile.ZipInfo],
+    members: dict[str, bytes],
+) -> None:
+    temporary = output_path.with_name(f".{output_path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        original_names = {entry.filename for entry in original_entries}
+        with zipfile.ZipFile(temporary, "w") as archive:
+            for entry in original_entries:
+                archive.writestr(entry, members[entry.filename])
+            for name in sorted(set(members).difference(original_names)):
+                archive.writestr(name, members[name], compress_type=zipfile.ZIP_DEFLATED)
+        os.replace(temporary, output_path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _make_docx_cjk_portable(output_path: Path) -> bool:
+    """Finalize CJK font declarations and embed a used-glyph portable fallback."""
+
+    try:
+        with zipfile.ZipFile(output_path, "r") as archive:
+            original_entries = archive.infolist()
+            members = {entry.filename: archive.read(entry.filename) for entry in original_entries}
+
+        font_family = DEFAULT_DOC_EAST_ASIA_FONT
+        has_cjk, characters = _patch_docx_cjk_xml(members, font_family)
+        if not has_cjk:
+            return False
+
+        embedded = False
+        font_bytes = 0
+        if DEFAULT_DOC_EMBED_CJK_FONT:
+            try:
+                font_family, font_data = _build_cjk_font_subset(characters)
+                # Reapply direct declarations if an operator-supplied font file
+                # exposes a family name different from the requested default.
+                _patch_docx_cjk_xml(members, font_family)
+                _add_embedded_cjk_font(members, font_family, font_data)
+                embedded = True
+                font_bytes = len(font_data)
+            except Exception as exc:
+                logger.warning(
+                    "CJK font embedding unavailable; keeping explicit East Asia font mapping | "
+                    "path=%s error=%s",
+                    output_path,
+                    exc,
+                )
+
+        _rewrite_docx_package(output_path, original_entries, members)
+        logger.info(
+            "DOCX CJK portability finalized | path=%s family=%s embedded=%s font_bytes=%d",
+            output_path,
+            font_family,
+            embedded,
+            font_bytes,
+        )
+        return embedded
+    except Exception as exc:
+        logger.warning("DOCX CJK portability finalization failed | path=%s error=%s", output_path, exc)
+        return False
 
 
 def _rgb01(color: tuple[int, int, int]) -> tuple[float, float, float]:
@@ -1853,6 +2279,7 @@ def render_docx(
                     _apply_docx_compact_typography(doc)
                 _apply_docx_pagination_guards(doc)
                 doc.save(str(output_path))
+                _make_docx_cjk_portable(output_path)
                 actual_report = inspect_docx_layout(output_path)
                 logger.info("DOCX Visual QA: renderer=%s pages=%s issues=%s",
                             actual_report.get("renderer"), actual_report.get("page_count"), actual_report.get("issues"))
@@ -1913,6 +2340,7 @@ def render_docx(
     if _layout_retry:
         _apply_docx_compact_typography(doc)
     doc.save(str(output_path))
+    _make_docx_cjk_portable(output_path)
 
     actual_report = inspect_docx_layout(output_path)
     if actual_report.get("available"):
