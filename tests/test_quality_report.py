@@ -68,6 +68,40 @@ def test_quality_report_separates_source_omissions_from_input_noise():
     assert "六西格玛" not in joined
 
 
+def test_quality_report_does_not_flag_headings_or_distributed_record_fields():
+    source = build_source_bundle(
+        "个人信息\n张晨\n教育经历\n复旦大学 本科 计算机科学 09-2016 - 06-2020\n"
+        "工作经历\n07-2022 - 05-2026 第四范式 产品经理\n"
+        "负责企业数据平台需求调研、版本规划与跨团队推进，推动报表配置效率提升30%。",
+        "",
+        "",
+    )
+    resume = CanonicalResume.model_validate({
+        "meta": {"name": "张晨"},
+        "education": [{
+            "school": "复旦大学", "degree": "本科", "major": "计算机科学",
+            "period": "09-2016 - 06-2020",
+        }],
+        "experience": [{
+            "organization": "第四范式", "role": "产品经理",
+            "period": "07-2022 - 05-2026",
+            "bullets": [
+                "负责企业数据平台需求调研、版本规划与跨团队推进",
+                "推动报表配置效率提升30%",
+            ],
+        }],
+    })
+
+    report = build_quality_report(
+        source=source,
+        resume=resume,
+        evidence_bindings=bind_resume_evidence(resume, source),
+    )
+
+    assert report["source_preservation"]["status"] == "no_unrepresented_items_detected"
+    assert report["source_preservation"]["unrepresented_items"] == []
+
+
 def test_quality_report_lists_generated_items_removed_without_evidence():
     source = build_source_bundle("姓名：李明", "", "")
     resume = CanonicalResume.model_validate({"meta": {"name": "李明"}})

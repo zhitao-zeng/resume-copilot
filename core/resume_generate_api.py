@@ -118,9 +118,13 @@ _TASK_STATE_TTL = max(60, int(os.getenv("TASK_STATE_TTL_SECONDS", "86400")))
 _TASK_DEADLINE_SECONDS = max(
     1.0,
     min(
-        _positive_float_env("TASK_DEADLINE_SECONDS", 450.0),
+        _positive_float_env("TASK_DEADLINE_SECONDS", 475.0),
         max(1.0, float(REQUEST_TIMEOUT_SECONDS) - 5.0),
     ),
+)
+_TASK_FINALIZATION_RESERVE_SECONDS = min(
+    max(0.0, _positive_float_env("TASK_FINALIZATION_RESERVE_SECONDS", 30.0)),
+    max(0.0, _TASK_DEADLINE_SECONDS - 1.0),
 )
 _TASK_PROCESS_KILL_GRACE_SECONDS = max(
     0.2, _positive_float_env("TASK_PROCESS_KILL_GRACE_SECONDS", 1.5)
@@ -131,6 +135,12 @@ UPLOADS_DIR = OUTPUT_DIR / "uploads"
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 _json_logger = logging.getLogger("resume_api")
+
+
+def _llm_work_deadline(deadline_at: float) -> float:
+    """Return the optional-work cutoff while preserving hard finalization time."""
+
+    return float(deadline_at) - _TASK_FINALIZATION_RESERVE_SECONDS
 
 
 def _discard_future(task_id: str, run_id: str) -> None:
@@ -488,6 +498,7 @@ def _execute_resume_job(task_id: str, form_data: Any, deadline_at: float) -> dic
                 jd_text=jd_text_value,
                 jd_url=None,
                 template=DEFAULT_TEMPLATE,
+                hard_deadline_at=deadline_at,
             )
         )
     finally:
@@ -513,7 +524,11 @@ def _resume_job_child(connection, task_id: str, run_id: str, form_data: Any, dea
             group_ready = True
             os.environ["RESUME_TASK_PROCESS_GROUP"] = "1"
         connection.send(("ready", {"process_group": group_ready, "run_id": run_id}))
-        deadline_token = set_request_deadline(deadline_at=deadline_at)
+        # LLM work is optional once the finalization window begins.  Keep the
+        # child alive until the hard deadline so deterministic reply fallback,
+        # DOCX rendering and atomic publication can still complete.
+        llm_deadline_at = _llm_work_deadline(deadline_at)
+        deadline_token = set_request_deadline(deadline_at=llm_deadline_at)
         result = _execute_resume_job(task_id, form_data, deadline_at)
         connection.send(("result", result))
     except BaseException as exc:
@@ -924,7 +939,9 @@ def generate_progress(task_id: str):
         "success": True,
         "task_id": task_id,
         "finished": status.get("finished", False),
+        "status": status.get("status", "unknown"),
         "summary": status.get("summary", ""),
+        "error": status.get("error"),
     })
 
 

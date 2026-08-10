@@ -227,6 +227,11 @@ class EvidenceBinding(BaseModel):
     # source fact units actually survived, rather than treating one binding as
     # coverage for an entire OCR line.
     claim: str = ""
+    # For an optimizer rewrite that passed the hard fact guard, retain the
+    # exact pre-rewrite claim used to establish provenance.  Coverage checks
+    # use this source claim while renderers and audits still see ``claim`` as
+    # the final user-facing wording.
+    source_claim: str = ""
     mode: Literal["direct", "normalized", "rewritten", "derived"]
     similarity: float = 1.0
 

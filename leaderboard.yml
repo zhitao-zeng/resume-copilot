@@ -9,4 +9,4 @@ inferenceVolumeMounts:
 
 inferenceImage:
   repository: "harbor-contest.4pd.io/zengzhitao/resume-copilot"
-  tag: "latest"
+  tag: "grounded-richness-20260810-2332"

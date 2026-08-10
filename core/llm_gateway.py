@@ -661,6 +661,11 @@ class LLMGateway:
             response = None
             last_context_error: Optional[Exception] = None
             for _attempt in range(4):
+                # ``_effective_request_timeout`` itself raises when the inherited
+                # request deadline is already exhausted.  Initialize the flag
+                # before that call so the broad transport-error handler can
+                # never mask the real deadline exception with UnboundLocalError.
+                deadline_limited_timeout = False
                 try:
                     request_kwargs = {
                         "model": self._model_name,
@@ -675,6 +680,8 @@ class LLMGateway:
                         request_kwargs["timeout"] = request_timeout
                     response = client.chat.completions.create(**request_kwargs)
                     break
+                except LLMDeadlineExceeded:
+                    raise
                 except Exception as exc:
                     if deadline_limited_timeout and self._is_timeout_exception(exc):
                         raise LLMDeadlineExceeded(

@@ -35,15 +35,17 @@ def _parse_mm_yyyy(text: str) -> Optional[tuple[int, int]]:
     if not text or text == "至今" or text == "present":
         return None
 
-    # Try yyyy-mm or yyyy/mm
-    m = re.match(r"(19|20)(\d{2})[./-](0[1-9]|1[0-2])", text)
+    # Try yyyy-mm, yyyy/mm, or Chinese yyyy年m月.  Resume text commonly
+    # contains one-digit months, so accepting only 01..12 loses otherwise
+    # obvious overlaps before they reach the user confirmation report.
+    m = re.match(r"(19|20)(\d{2})(?:[./-]|年\s*)(0?[1-9]|1[0-2])(?:月)?", text)
     if m:
         year = int(m.group(1) + m.group(2))
         month = int(m.group(3))
         return (year, month)
 
     # Try mm-yyyy or mm/yyyy
-    m = re.match(r"(0[1-9]|1[0-2])[./-](19|20)(\d{2})", text)
+    m = re.match(r"(0?[1-9]|1[0-2])[./-](19|20)(\d{2})", text)
     if m:
         month = int(m.group(1))
         year = int(m.group(2) + m.group(3))
@@ -702,7 +704,7 @@ def check_fabrication_heuristic(original_text: str, resume_data: dict[str, Any])
         text = " ".join(text.split())
         return text.strip()
 
-    def _supported_text(value: str) -> bool:
+    def _supported_text(value: str, *, allow_unverifiable_short: bool = True) -> bool:
         value = str(value or "").strip()
         if not value or value in {"至今", "present", "Present"}:
             return True
@@ -776,7 +778,7 @@ def check_fabrication_heuristic(original_text: str, resume_data: dict[str, Any])
                 )
                 return year_ok and month_ok
         if len(value) <= 2:
-            return True
+            return allow_unverifiable_short
         return False
 
     def _check_period(period: str, label: str) -> None:
@@ -829,7 +831,7 @@ def check_fabrication_heuristic(original_text: str, resume_data: dict[str, Any])
                     _add_detail("company", company, "该公司/机构名称未出现在用户原始输入中")
 
             role = str(exp.get("role", "")).strip()
-            if role and not _supported_text(role):
+            if role and not _supported_text(role, allow_unverifiable_short=False):
                 _add_detail("role", role, "该岗位名称未出现在用户原始输入中")
             _check_period(str(exp.get("period", "")).strip(), company or role or "工作经历")
 
@@ -872,7 +874,7 @@ def check_fabrication_heuristic(original_text: str, resume_data: dict[str, Any])
 
             for key, label in (("degree", "学位/学历"), ("major", "专业")):
                 value = str(edu.get(key, "")).strip()
-                if value and not _supported_text(value):
+                if value and not _supported_text(value, allow_unverifiable_short=False):
                     _add_detail(key, value, f"该{label}未出现在用户原始输入中")
             _check_period(str(edu.get("period", "")).strip(), school or "教育经历")
 
@@ -890,14 +892,20 @@ def check_fabrication_heuristic(original_text: str, resume_data: dict[str, Any])
                 # Strip common Chinese role suffixes ("者","员","人","师") before checking
                 if key == "role" and any(value.endswith(s) for s in ("者", "员", "人", "师")):
                     stem = value[:-1]
-                    if stem and len(stem) >= 2 and _supported_text(stem):
+                    if stem and len(stem) >= 2 and _supported_text(
+                        stem,
+                        allow_unverifiable_short=False,
+                    ):
                         continue
                 if key == "company" and re.search(r"(?:指导|导师|教授|大学|学院|学校)", value):
                     # Project company is a supervisor's institution — extract core name and check
                     core = re.sub(r"\s*[（(].*[）)]\s*", "", value).strip()
-                    if core and (_supported_text(core) or _supported_text(value)):
+                    if core and (
+                        _supported_text(core, allow_unverifiable_short=False)
+                        or _supported_text(value, allow_unverifiable_short=False)
+                    ):
                         continue
-                if not _supported_text(value):
+                if not _supported_text(value, allow_unverifiable_short=False):
                     _add_detail(key, value, f"该{label}未出现在用户原始输入中")
             _check_period(str(proj.get("period", "")).strip(), str(proj.get("name", "") or "项目经历"))
 
@@ -908,7 +916,10 @@ def check_fabrication_heuristic(original_text: str, resume_data: dict[str, Any])
                 continue
             for value in values:
                 text = str(value or "").strip()
-                if text and len(text) > 1 and not _supported_text(text):
+                if text and len(text) > 1 and not _supported_text(
+                    text,
+                    allow_unverifiable_short=False,
+                ):
                     _add_detail("skill", text, f"技能/领域项未出现在用户原始输入中（{bucket}）")
 
     # Check meta.work_experience — common fabrication for student profiles.

@@ -277,17 +277,28 @@ def final_fact_guard(
     source_truth_text: str,
     resume_data: dict[str, Any],
     *,
-    max_iterations: int = 1,
+    max_iterations: int = 2,
 ) -> tuple[dict[str, Any], FabricationReport]:
-    """Check fabrication against source text; WARN only, do NOT delete fields.
+    """Remove exact unsupported values and verify the cleaned result again.
 
-    Previously this function deleted fabricated fields from resume_data and
-    the hard-zero fabrication score wiped out the entire result. Now fabrication
-    findings are reported as user_report entries but the data is preserved.
-    Scoring uses graduated penalties instead of a binary pass/fail.
+    The platform evaluator treats any fabricated candidate fact as a hard veto.
+    Cleanup is deliberately narrower than generation: it only clears values
+    identified by the deterministic heuristic and never substitutes JD facts.
     """
-    fab = check_fabrication_heuristic(source_truth_text, resume_data)
-    return resume_data, fab
+    if not source_truth_text.strip():
+        return resume_data, FabricationReport(fabrication_found=False, details=[])
+
+    data = resume_data
+    report = check_fabrication_heuristic(source_truth_text, data)
+    for _ in range(max(1, int(max_iterations))):
+        if not report.fabrication_found:
+            break
+        cleaned = _remove_fabricated_fields(data, report, source_truth_text)
+        if cleaned == data:
+            break
+        data = cleaned
+        report = check_fabrication_heuristic(source_truth_text, data)
+    return data, report
 
 
 def _remove_fabricated_fields(
@@ -304,39 +315,42 @@ def _remove_fabricated_fields(
         content = detail.content
 
         if kind == "company":
-            # Remove experience entries with fabricated company names
-            experience = data.get("experience", [])
-            if isinstance(experience, list):
-                data["experience"] = [
-                    exp for exp in experience
-                    if not (isinstance(exp, dict) and str(exp.get("company", "")).strip() == content)
-                ]
+            for section in ("experience", "projects", "research", "campus_experience"):
+                for record in data.get(section, []) if isinstance(data.get(section), list) else []:
+                    if isinstance(record, dict) and str(record.get("company", "")).strip() == content:
+                        record["company"] = ""
 
         elif kind == "school":
-            # Remove education entries with fabricated school names
-            education = data.get("education", [])
-            if isinstance(education, list):
-                data["education"] = [
-                    edu for edu in education
-                    if not (isinstance(edu, dict) and str(edu.get("school", "")).strip() == content)
-                ]
+            for record in data.get("education", []) if isinstance(data.get("education"), list) else []:
+                if isinstance(record, dict) and str(record.get("school", "")).strip() == content:
+                    record["school"] = ""
 
         elif kind == "name":
-            # Remove project entries with fabricated names
-            projects = data.get("projects", [])
-            if isinstance(projects, list):
-                data["projects"] = [
-                    proj for proj in projects
-                    if not (isinstance(proj, dict) and str(proj.get("name", "")).strip() == content)
-                ]
+            for record in data.get("projects", []) if isinstance(data.get("projects"), list) else []:
+                if isinstance(record, dict) and str(record.get("name", "")).strip() == content:
+                    record["name"] = ""
 
         elif kind == "role":
-            # Clear fabricated roles but keep the experience entry
-            experience = data.get("experience", [])
-            if isinstance(experience, list):
-                for exp in experience:
-                    if isinstance(exp, dict) and str(exp.get("role", "")).strip() == content:
-                        exp["role"] = ""
+            for section in ("experience", "projects", "research", "campus_experience"):
+                for record in data.get(section, []) if isinstance(data.get(section), list) else []:
+                    if isinstance(record, dict) and str(record.get("role", "")).strip() == content:
+                        record["role"] = ""
+
+        elif kind in {"degree", "major"}:
+            for record in data.get("education", []) if isinstance(data.get("education"), list) else []:
+                if isinstance(record, dict) and str(record.get(kind, "")).strip() == content:
+                    record[kind] = ""
+
+        elif kind == "date":
+            for section in ("education", "experience", "projects", "research", "campus_experience"):
+                for record in data.get(section, []) if isinstance(data.get(section), list) else []:
+                    if isinstance(record, dict) and str(record.get("period", "")).strip() == content:
+                        record["period"] = ""
+
+        elif kind in {"work_experience", "education_level"}:
+            meta = data.get("meta", {})
+            if isinstance(meta, dict) and str(meta.get(kind, "")).strip() == content:
+                meta[kind] = ""
 
         elif kind == "skill":
             # Remove fabricated skills
@@ -362,21 +376,20 @@ def _remove_metric_from_data(data: dict[str, Any], metric_value: str) -> None:
         rf"{re.escape(metric_value)}\s*(?:%|万元|万|人|个|次|条|倍|客户|学生|病例|日活|月活|转化|CTR|GMV|QPS|TPS)",
         re.IGNORECASE,
     )
-    for section in ("experience", "projects"):
-        items = data.get(section, [])
-        if not isinstance(items, list):
-            continue
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            for key in ("function_description", "result_description", "achievements", "bullets"):
-                val = item.get(key)
-                if isinstance(val, str):
-                    item[key] = metric_pattern.sub("", val).strip("，, 。; ")
-                elif isinstance(val, list):
-                    item[key] = [metric_pattern.sub("", str(v)).strip("，, 。; ") if isinstance(v, str) else v for v in val]
-                    # Remove empty bullets
-                    item[key] = [b for b in item[key] if b and len(str(b).strip()) > 0]
+
+    def scrub(value: Any) -> Any:
+        if isinstance(value, str):
+            return metric_pattern.sub("", value).strip("，, 。; ")
+        if isinstance(value, list):
+            cleaned = [scrub(item) for item in value]
+            return [item for item in cleaned if not isinstance(item, str) or item.strip()]
+        if isinstance(value, dict):
+            return {key: scrub(item) for key, item in value.items()}
+        return value
+
+    cleaned = scrub(data)
+    data.clear()
+    data.update(cleaned)
 
 
 def _clean_projects(resume_data: dict[str, Any], source_truth_text: str) -> dict[str, Any]:
@@ -842,13 +855,16 @@ async def _resume_copilot_service_impl(
     ctx.user_stage = reconcile_user_stage(
         ctx.user_stage, ctx.resume_data, candidate_truth,
     )
+    framework = ctx.resume_data.get("framework")
     fact_resume_data = dict(ctx.resume_data)
     fact_resume_data.pop("framework", None)
-    ctx.fabrication_report = (
-        check_fabrication_heuristic(candidate_truth, fact_resume_data)
-        if candidate_truth.strip()
-        else FabricationReport(fabrication_found=False, details=[])
+    fact_resume_data, ctx.fabrication_report = final_fact_guard(
+        candidate_truth,
+        fact_resume_data,
     )
+    if isinstance(framework, dict):
+        fact_resume_data["framework"] = framework
+    ctx.resume_data = fact_resume_data
 
     # Pass V2 changes for reply context
     ctx.changes = [
@@ -925,13 +941,22 @@ async def resume_copilot_service(
     jd_text: Optional[str],
     jd_url: Optional[str],
     template: str = DEFAULT_TEMPLATE,
+    hard_deadline_at: Optional[float] = None,
 ) -> ResumeCopilotResponse:
-    """Run the complete pipeline under a real wall-clock request deadline."""
+    """Run the complete pipeline under a real wall-clock request deadline.
+
+    ``hard_deadline_at`` may be later than the inherited LLM deadline.  The
+    outer task supervisor uses that gap to reserve deterministic finalization
+    time without permitting additional model calls.
+    """
     deadline_token = set_request_deadline(timeout_seconds=REQUEST_TIMEOUT_SECONDS)
     try:
-        # Respect a stricter deadline installed by an outer queue/request
-        # boundary; this function must never extend it back to 480 seconds.
-        remaining = remaining_request_seconds()
+        if hard_deadline_at is None:
+            # Respect a stricter deadline installed by an outer request when no
+            # separate supervisor boundary was provided.
+            remaining = remaining_request_seconds()
+        else:
+            remaining = max(0.0, float(hard_deadline_at) - time.monotonic())
         async with asyncio.timeout(max(0.0, remaining or 0.0)):
             return await _resume_copilot_service_impl(
                 query=query,

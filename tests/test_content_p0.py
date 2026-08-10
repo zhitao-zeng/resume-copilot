@@ -9,7 +9,7 @@ from unittest.mock import patch
 from docx import Document
 
 from evidence_binding import bind_resume_evidence, enforce_resume_evidence, measure_source_coverage
-from resume_composer import compose_from_query, compose_resume
+from resume_composer import compose_from_query, compose_resume, compose_resume_with_outcome
 from resume_copilot_pipeline import PipelineContext, _build_llm_reply, stage_classify
 from resume_copilot_service import _collect_content_conflicts
 from resume_renderer import render_docx
@@ -77,6 +77,39 @@ def test_structured_query_sections_remain_candidate_facts():
     assert "工作经历" not in facts
 
 
+def test_compact_query_project_survives_deterministic_fallback():
+    query = (
+        "姓名程洛，电话13210008017，邮箱chengluo@example.com，"
+        "上海交通大学软件工程本科09-2022到06-2026，"
+        "做过课程选课系统项目，负责需求分析和原型设计，技能SQL、Axure。"
+    )
+
+    resume = _deterministic_fallback("", query, "产品经理岗位")
+
+    assert len(resume.projects) == 1
+    assert resume.projects[0].name == "课程选课系统项目"
+    assert resume.projects[0].bullets == ["负责需求分析和原型设计"]
+    assert [item.name for item in resume.skills.items] == ["SQL", "Axure"]
+
+
+def test_compact_query_project_survives_full_no_cv_pipeline_and_atomizes():
+    query = (
+        "姓名程洛，电话13210008017，邮箱chengluo@example.com，"
+        "上海交通大学软件工程本科09-2022到06-2026，"
+        "做过课程选课系统项目，负责需求分析和原型设计，技能SQL、Axure。"
+    )
+
+    with patch("v2_pipeline.compose_from_query", return_value=CanonicalResume()), patch(
+        "v2_pipeline._needs_optimizer", return_value=False,
+    ):
+        result = run_v2_pipeline("", query, "产品经理岗位")
+
+    assert len(result.resume.projects) == 1
+    assert result.resume.projects[0].name == "课程选课系统项目"
+    assert result.resume.projects[0].bullets == ["负责需求分析", "负责原型设计"]
+    assert "framework" not in result.resume_dict
+
+
 def test_no_cv_long_candidate_query_uses_chunked_path_without_2000_char_cut():
     marker = "唯一证书：注册安全工程师"
     query = "工作经历\n甲公司｜工程师｜2020.01-2024.01\n" + ("负责现场巡检与问题闭环。" * 220) + "\n" + marker
@@ -101,7 +134,7 @@ def test_sparse_no_cv_profile_keeps_explicit_domain_and_target_role():
     assert any(item.name == "智能硬件产品" for item in result.skills.items)
 
 
-def test_composer_discards_partial_result_when_any_fact_chunk_is_empty():
+def test_composer_retains_successful_result_when_another_fact_chunk_is_empty():
     chunks = [
         SourceBundle(blocks=[SourceBlock(block_id="resume_0", source_type="resume", text="甲公司｜工程师")]),
         SourceBundle(blocks=[SourceBlock(block_id="resume_1", source_type="resume", text="乙公司｜工程师")]),
@@ -113,8 +146,12 @@ def test_composer_discards_partial_result_when_any_fact_chunk_is_empty():
     with patch("resume_composer.llm_enabled", return_value=True), patch(
         "resume_composer._split_source_bundle", return_value=chunks,
     ), patch("resume_composer.call_llm_typed", side_effect=responses):
-        result = compose_resume(SourceBundle(blocks=chunks[0].blocks + chunks[1].blocks))
-    assert result == DraftResume()
+        outcome = compose_resume_with_outcome(
+            SourceBundle(blocks=chunks[0].blocks + chunks[1].blocks)
+        )
+    assert outcome.draft.experience[0].organization == "甲公司"
+    assert outcome.completed_chunks == 1
+    assert len(outcome.failed_chunks) == 1
 
 
 def test_fabricated_bullet_with_short_shared_prefix_cannot_survive():

@@ -815,7 +815,11 @@ def build_quality_report(
 
     units = source_fact_units(source)
     unit_by_id = {unit["unit_id"]: unit for unit in units}
-    _, missing_unit_ids = measure_source_coverage(source, bindings)
+    _, missing_unit_ids = measure_source_coverage(
+        source,
+        bindings,
+        allow_distributed=True,
+    )
     missing_units = [unit_by_id[unit_id] for unit_id in missing_unit_ids if unit_id in unit_by_id]
     source_item_count = len(units)
 

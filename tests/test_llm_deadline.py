@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 from types import SimpleNamespace
@@ -119,6 +120,22 @@ def test_gateway_deadline_exhaustion_does_not_open_shared_circuit():
     assert gateway._consecutive_failures == 0
 
 
+def test_text_gateway_deadline_exhaustion_does_not_mask_error_or_open_circuit():
+    completions = _FakeCompletions(["unused"])
+    gateway = _gateway(
+        completions,
+        call_timeout_seconds=20,
+        request_time_remaining=lambda: 1,
+        deadline_reserve_seconds=2,
+    )
+
+    with pytest.raises(LLMDeadlineExceeded):
+        gateway.call_text("system", "user")
+
+    assert completions.calls == []
+    assert gateway._consecutive_failures == 0
+
+
 def test_deadline_limited_transport_timeout_does_not_open_shared_circuit():
     completions = _FakeCompletions([APITimeoutError("read timed out")])
     gateway = _gateway(
@@ -165,7 +182,36 @@ def test_nested_deadline_never_extends_outer_budget():
     assert get_request_deadline() is None
 
 
-def test_composer_discards_partial_chunks_when_deadline_budget_runs_low():
+def test_service_hard_deadline_can_outlive_optional_llm_deadline():
+    from resume_copilot_service import resume_copilot_service
+
+    async def fake_impl(**_kwargs):
+        await asyncio.sleep(0.04)
+        return "rendered"
+
+    llm_deadline = time.monotonic() + 0.01
+    hard_deadline = time.monotonic() + 0.2
+    outer_token = set_request_deadline(deadline_at=llm_deadline)
+    try:
+        with patch("resume_copilot_service._resume_copilot_service_impl", side_effect=fake_impl):
+            result = asyncio.run(resume_copilot_service(
+                query=None,
+                cv=None,
+                cv_template=None,
+                target_jd=None,
+                target_jd_file=None,
+                target_jd_url=None,
+                jd_text=None,
+                jd_url=None,
+                hard_deadline_at=hard_deadline,
+            ))
+    finally:
+        reset_request_deadline(outer_token)
+
+    assert result == "rendered"
+
+
+def test_composer_retains_partial_chunks_when_deadline_budget_runs_low():
     source = SourceBundle(blocks=[
         SourceBlock(block_id="resume_0", source_type="resume", text="候选人事实"),
     ])
@@ -180,5 +226,5 @@ def test_composer_discards_partial_chunks_when_deadline_budget_runs_low():
     ) as llm_call:
         result = compose_resume(source)
 
-    assert result == DraftResume()
+    assert result.meta.name == "张三"
     assert llm_call.call_count == 1

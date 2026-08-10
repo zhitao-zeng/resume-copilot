@@ -12,6 +12,7 @@ import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
+from dataclasses import dataclass, field
 from typing import Any
 
 from llm_gateway import (
@@ -34,8 +35,19 @@ _COMPOSER_MIN_FACT_TOKENS = 1024
 _COMPOSER_CONTEXT_CHARS = 1800
 _MAX_COMPOSER_FACT_CHARS = 60_000
 _MAX_COMPOSER_CHUNKS = 16
+_DEFAULT_COMPOSER_MAX_FACT_BLOCKS = 36
 _DEFAULT_COMPOSER_MIN_REMAINING_SECONDS = 10
 _MAX_COMPOSER_CONCURRENCY = 2
+
+
+@dataclass(frozen=True)
+class ComposeOutcome:
+    """Partial Composer result with explicit recovery metadata."""
+
+    draft: DraftResume
+    failed_chunks: list[SourceBundle] = field(default_factory=list)
+    total_chunks: int = 0
+    completed_chunks: int = 0
 
 
 def _safe_positive_env_int(name: str) -> int | None:
@@ -76,6 +88,19 @@ def _composer_concurrency() -> int:
 
     configured = _safe_positive_env_int("LLM_COMPOSER_CONCURRENCY") or 2
     return max(1, min(_MAX_COMPOSER_CONCURRENCY, configured))
+
+
+def _composer_max_fact_blocks() -> int:
+    """Bound output complexity independently from input token length.
+
+    Resume lines are short, so a request can fit the context window while its
+    structured JSON still exceeds the 4096-token completion budget.  Platform
+    truncations started with 45-60 factual blocks in one request; 36 preserves
+    the largest observed non-truncated boundary and lets the two supported
+    model sequences process the first pair in parallel.
+    """
+
+    return _safe_positive_env_int("LLM_COMPOSER_MAX_FACT_BLOCKS") or _DEFAULT_COMPOSER_MAX_FACT_BLOCKS
 
 
 def _build_source_text(source: SourceBundle) -> str:
@@ -315,7 +340,11 @@ def _select_shared_context(
     return selected
 
 
-def _split_source_bundle(source: SourceBundle, max_fact_chars: int = 6000) -> list[SourceBundle]:
+def _split_source_bundle(
+    source: SourceBundle,
+    max_fact_chars: int = 6000,
+    max_fact_blocks: int | None = None,
+) -> list[SourceBundle]:
     """Chunk evidence so each complete typed request fits the LLM context.
 
     The budget includes the system prompt, JSON schema, output rules, chat
@@ -325,6 +354,7 @@ def _split_source_bundle(source: SourceBundle, max_fact_chars: int = 6000) -> li
     """
 
     context_window = _llm_context_window()
+    fact_block_limit = max(1, int(max_fact_blocks or _composer_max_fact_blocks()))
     prompt_limit = context_window - _COMPOSER_MAX_TOKENS - _COMPOSER_SAFETY_TOKENS
     if prompt_limit <= 0:
         raise ValueError(
@@ -372,6 +402,7 @@ def _split_source_bundle(source: SourceBundle, max_fact_chars: int = 6000) -> li
         candidate_bundle = SourceBundle(blocks=[*candidate_facts, *shared_context])
         candidate_fits = (
             current_chars + fragment_size <= max_fact_chars
+            and len(candidate_facts) <= fact_block_limit
             and _composer_prompt_token_estimate(candidate_bundle) <= prompt_limit
         )
         if current and not candidate_fits:
@@ -388,11 +419,12 @@ def _split_source_bundle(source: SourceBundle, max_fact_chars: int = 6000) -> li
         for chunk in chunks
     ]
     logger.info(
-        "ResumeComposer budgeted %d factual block(s) into %d chunk(s) | context_window=%d | prompt_limit=%d",
+        "ResumeComposer budgeted %d factual block(s) into %d chunk(s) | context_window=%d | prompt_limit=%d | fact_block_limit=%d",
         len(factual),
         len(result),
         context_window,
         prompt_limit,
+        fact_block_limit,
     )
     return result
 
@@ -505,10 +537,14 @@ def _compose_chunk(chunk: SourceBundle) -> DraftResume:
     return parsed_draft
 
 
-def compose_resume(source: SourceBundle) -> DraftResume:
-    """Call LLM to extract structured resume from source material."""
+def compose_resume_with_outcome(source: SourceBundle) -> ComposeOutcome:
+    """Extract every recoverable chunk and report incomplete source chunks."""
+
     if not llm_enabled():
-        return DraftResume()
+        return ComposeOutcome(
+            draft=DraftResume(),
+            failed_chunks=[source] if candidate_blocks(source) else [],
+        )
 
     factual_chars = sum(len(block.text) for block in candidate_blocks(source))
     if factual_chars > _MAX_COMPOSER_FACT_CHARS:
@@ -517,7 +553,7 @@ def compose_resume(source: SourceBundle) -> DraftResume:
             factual_chars,
             _MAX_COMPOSER_FACT_CHARS,
         )
-        return DraftResume()
+        return ComposeOutcome(draft=DraftResume(), failed_chunks=[source], total_chunks=1)
 
     chunks = _split_source_bundle(source)
     pending: list[tuple[tuple[int, ...], SourceBundle]] = [
@@ -529,8 +565,13 @@ def compose_resume(source: SourceBundle) -> DraftResume:
             len(pending),
             _MAX_COMPOSER_CHUNKS,
         )
-        return DraftResume()
+        return ComposeOutcome(
+            draft=DraftResume(),
+            failed_chunks=list(chunks),
+            total_chunks=len(chunks),
+        )
     drafts: dict[tuple[int, ...], DraftResume] = {}
+    failed_chunks: list[SourceBundle] = []
     worker_count = _composer_concurrency()
     with ThreadPoolExecutor(
         max_workers=worker_count,
@@ -539,34 +580,35 @@ def compose_resume(source: SourceBundle) -> DraftResume:
         while pending:
             if len(drafts) + len(pending) > _MAX_COMPOSER_CHUNKS:
                 logger.warning(
-                    "ResumeComposer backend required more than %d chunks; discarding partial extraction for deterministic fallback",
+                    "ResumeComposer backend required more than %d chunks; retaining completed chunks and recovering the remainder deterministically",
                     _MAX_COMPOSER_CHUNKS,
                 )
-                return DraftResume()
+                failed_chunks.extend(chunk for _, chunk in pending)
+                pending.clear()
+                break
 
             wave = pending[:worker_count]
             del pending[:len(wave)]
             futures = []
-            budget_exhausted = False
-            for key, chunk in wave:
+            budget_exhausted_at: int | None = None
+            for wave_index, (key, chunk) in enumerate(wave):
                 if not _composer_has_time_budget():
-                    budget_exhausted = True
+                    budget_exhausted_at = wave_index
                     break
                 futures.append((
                     key,
                     chunk,
                     executor.submit(copy_context().run, _compose_chunk, chunk),
                 ))
-            if budget_exhausted:
+            if budget_exhausted_at is not None:
                 logger.warning(
-                    "ResumeComposer stopped with source chunks remaining: request deadline budget is too low; using deterministic fallback",
+                    "ResumeComposer stopped with source chunks remaining: request deadline budget is too low; retaining completed chunks",
                 )
-                # A partial structured extraction can silently omit the remaining
-                # source records. Empty output deliberately selects the complete,
-                # evidence-preserving deterministic fallback in V2.
-                return DraftResume()
+                failed_chunks.extend(chunk for _, chunk in wave[budget_exhausted_at:])
+                failed_chunks.extend(chunk for _, chunk in pending)
+                pending.clear()
             retries: list[tuple[tuple[int, ...], SourceBundle]] = []
-            fatal_error: Exception | None = None
+            deadline_reached = False
             for key, chunk, future in futures:
                 try:
                     drafts[key] = future.result()
@@ -574,7 +616,7 @@ def compose_resume(source: SourceBundle) -> DraftResume:
                     smaller_chunks = _bisect_source_bundle(chunk)
                     if not smaller_chunks:
                         logger.warning("ResumeComposer irreducible chunk failed: %s", exc)
-                        fatal_error = exc
+                        failed_chunks.append(chunk)
                         continue
                     retries.extend(
                         (key + (child_index,), child)
@@ -587,37 +629,56 @@ def compose_resume(source: SourceBundle) -> DraftResume:
                     )
                 except LLMDeadlineExceeded as exc:
                     logger.warning(
-                        "ResumeComposer stopped at request deadline: %s; using deterministic fallback",
+                        "ResumeComposer stopped at request deadline: %s; retaining completed chunks",
                         exc,
                     )
-                    fatal_error = exc
+                    failed_chunks.append(chunk)
+                    deadline_reached = True
                 except Exception as exc:
                     logger.warning(
-                        "ResumeComposer chunk failed: %s; discarding partial extraction for deterministic fallback",
+                        "ResumeComposer chunk failed: %s; recovering this chunk deterministically",
                         exc,
                     )
-                    fatal_error = exc
-            if fatal_error is not None:
-                return DraftResume()
+                    failed_chunks.append(chunk)
+            if deadline_reached:
+                failed_chunks.extend(chunk for _, chunk in retries)
+                failed_chunks.extend(chunk for _, chunk in pending)
+                pending.clear()
+                retries.clear()
             if len(drafts) + len(retries) + len(pending) > _MAX_COMPOSER_CHUNKS:
                 logger.warning(
-                    "ResumeComposer backend required more than %d chunks; discarding partial extraction for deterministic fallback",
+                    "ResumeComposer backend required more than %d chunks; retaining completed chunks and recovering the remainder deterministically",
                     _MAX_COMPOSER_CHUNKS,
                 )
-                return DraftResume()
+                failed_chunks.extend(chunk for _, chunk in retries)
+                failed_chunks.extend(chunk for _, chunk in pending)
+                pending.clear()
+                retries.clear()
             # Retry split children before later source chunks, matching the old
             # lossless queue behavior. Final merge still uses the logical key.
             pending[0:0] = retries
 
-    if not drafts:
-        return DraftResume()
     ordered_drafts = [drafts[key] for key in sorted(drafts)]
+    draft = _merge_drafts(ordered_drafts) if ordered_drafts else DraftResume()
+    terminal_chunk_count = len(ordered_drafts) + len(failed_chunks)
     logger.info(
-        "ResumeComposer extracted %d/%d completed chunk(s)",
+        "ResumeComposer extracted %d/%d completed chunk(s); failed=%d",
         len(ordered_drafts),
-        len(ordered_drafts),
+        terminal_chunk_count,
+        len(failed_chunks),
     )
-    return _merge_drafts(ordered_drafts)
+    return ComposeOutcome(
+        draft=draft,
+        failed_chunks=failed_chunks,
+        total_chunks=terminal_chunk_count,
+        completed_chunks=len(ordered_drafts),
+    )
+
+
+def compose_resume(source: SourceBundle) -> DraftResume:
+    """Compatibility wrapper returning the recoverable partial draft."""
+
+    return compose_resume_with_outcome(source).draft
 
 
 def compose_from_query(query_text: str, jd_text: str) -> CanonicalResume:

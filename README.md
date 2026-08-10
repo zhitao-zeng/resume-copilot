@@ -81,6 +81,9 @@ python main.py
 
 - `LLM_TIMEOUT_SECONDS`：单次 LLM 调用超时，默认 `180`
 - `REQUEST_TIMEOUT_SECONDS`：单请求总预算，默认 `480`
+- `TASK_DEADLINE_SECONDS`：异步任务硬截止时间，默认 `475`，并始终限制在请求预算前至少 5 秒
+- `TASK_FINALIZATION_RESERVE_SECONDS`：硬截止前停止可选 LLM 调用、专用于回复降级和 DOCX 发布的窗口，默认 `30`
+- `LLM_COMPOSER_MAX_FACT_BLOCKS`：单个 Composer 请求最多包含的候选事实块，默认 `36`，用于避免结构化输出达到 4096-token 上限
 - `ENABLE_LLM_JSON_REPAIR`：LLM JSON 失败后进行一次纠错重试，默认开启
 - `ENABLE_LLM_FAILURE_DUMP`：是否落盘 LLM 失败原文，默认关闭；开启后会做邮箱和手机号脱敏
 - `API_AUTH_TOKEN`：生产环境建议设置；设置后除健康检查外均要求 `Authorization: Bearer ...`
@@ -88,11 +91,7 @@ python main.py
 - `ENABLE_LLM_CLASSIFIER` / `ENABLE_LLM_REPLY`：是否用 LLM 分类/生成回复；Docker 默认关闭以减少两次调用
 - `TASK_QUEUE_LIMIT`：兼容异步接口的最大排队任务数，默认 8
 
-图片 OCR 需要系统安装 Tesseract。Docker 镜像已安装：
-
-- `tesseract-ocr`
-- `tesseract-ocr-chi-sim`
-- `tesseract-ocr-eng`
+图片 OCR 默认使用镜像内置的 PP-OCRv6-small ONNX 模型，通过 RapidOCR/ONNX Runtime 在 CPU 上执行；Tesseract 仅作为兼容降级路径。
 
 ## Docker
 

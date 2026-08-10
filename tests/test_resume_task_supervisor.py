@@ -153,6 +153,38 @@ def test_success_file_and_state_publish_are_atomic(tmp_path):
             api.async_tasks.pop(task_id, None)
 
 
+def test_llm_work_deadline_reserves_finalization_window():
+    hard_deadline = 1_000.0
+
+    assert api._llm_work_deadline(hard_deadline) == pytest.approx(
+        hard_deadline - api._TASK_FINALIZATION_RESERVE_SECONDS
+    )
+    assert 0 < api._TASK_FINALIZATION_RESERVE_SECONDS < api._TASK_DEADLINE_SECONDS
+
+
+def test_progress_exposes_terminal_error_without_hiding_finished_state():
+    task_id = "terminal-error"
+    with api.task_lock:
+        api.async_tasks[task_id] = {
+            "run_id": "run-error",
+            "finished": True,
+            "status": "error",
+            "summary": "生成失败: deadline",
+            "error": "end-to-end task deadline exceeded",
+            "end_time": time.time(),
+        }
+    try:
+        response = api.app.test_client().get(f"/optimize_progress/{task_id}")
+        payload = response.get_json()
+        assert response.status_code == 200
+        assert payload["finished"] is True
+        assert payload["status"] == "error"
+        assert payload["error"] == "end-to-end task deadline exceeded"
+    finally:
+        with api.task_lock:
+            api.async_tasks.pop(task_id, None)
+
+
 @pytest.mark.skipif(os.name != "posix" or not Path("/proc").is_dir(), reason="Linux procfs required")
 def test_outer_supervisor_kills_detached_grandchild():
     context = api.mp.get_context("spawn")

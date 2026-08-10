@@ -10,7 +10,11 @@ from resume_product_logic import (
     _is_student_with_internals,
 )
 from resume_scoring import score_resume
-from resume_validator import check_fabrication_heuristic, check_required_fields
+from resume_validator import (
+    check_fabrication_heuristic,
+    check_required_fields,
+    check_time_conflicts,
+)
 
 
 class ResumeCopilotServiceTest(unittest.TestCase):
@@ -30,6 +34,19 @@ class ResumeCopilotServiceTest(unittest.TestCase):
         self.assertEqual(start, "03-2020")
         self.assertEqual(end, "06-2025")
         self.assertEqual(period, "03-2020 - 06-2025")
+
+    def test_chinese_periods_are_checked_for_full_time_overlap(self):
+        resume = {
+            "experience": [
+                {"company": "A公司", "role": "运营", "period": "2020年3月到2025年6月"},
+                {"company": "B公司", "role": "运营主管", "period": "2024年1月到2025年5月"},
+            ]
+        }
+
+        conflicts = check_time_conflicts(resume)
+
+        self.assertEqual(len(conflicts), 1)
+        self.assertIn("时间段有重叠", conflicts[0].description)
 
     def test_heuristic_resume_generation_keeps_user_facts(self):
         text = "姓名：张小二，电话13800138000，邮箱 zhang@example.com。2020年3月到25年6月在中国银行工作，主要负责贷款管理岗位，期间做对公大客户贷款审核。"
@@ -180,6 +197,27 @@ class ResumeClassifierTest(unittest.TestCase):
         self.assertEqual(result.evidence.industry[0].source, "query")
         self.assertEqual(result.evidence.industry[0].usage, "fact")
 
+    def test_high_confidence_free_text_label_is_normalized_to_public_taxonomy(self):
+        import resume_classifier
+        from unittest.mock import patch
+
+        llm_output = resume_classifier._ClassifierLLMOutput(
+            industry="医疗健康", user_stage="experienced", target_role="内科医师",
+            confidence=0.9, evidence=resume_classifier._LLMEvidence(
+                industry=[resume_classifier._EvidenceItem(text="内科医师", source="query", usage="fact")],
+                user_stage=[resume_classifier._EvidenceItem(text="医生", source="cv", usage="fact")],
+                target_role=[resume_classifier._EvidenceItem(text="内科医师", source="query", usage="direction")],
+            ), warnings=[],
+        )
+        with patch.object(resume_classifier, "call_llm_typed", return_value=llm_output.model_dump()), \
+                patch.object(resume_classifier, "llm_enabled", return_value=True):
+            result = resume_classifier.classify_resume_request(
+                query="请按内科医师方向优化", cv_text="医院内科工作经历",
+                jd_text="", has_cv=True, has_jd=False,
+            )
+
+        self.assertEqual(result.industry, "doctor")
+
 
 class StudentExperienceTest(unittest.TestCase):
     def test_student_with_internship_not_overridden(self):
@@ -270,6 +308,40 @@ class FinalFactGuardTest(unittest.TestCase):
         report = check_fabrication_heuristic(source_text, cleaned)
         project_details = [d for d in report.details if d.type == "name"]
         self.assertEqual(len(project_details), 0)
+
+    def test_final_fact_guard_clears_exact_unsupported_values_and_rechecks(self):
+        from resume_copilot_service import final_fact_guard
+
+        source_text = (
+            "姓名：张三。甲公司产品经理，2020年3月至2023年5月，"
+            "负责需求分析，使用Python。"
+        )
+        resume = {
+            "meta": {"name": "张三", "work_experience": "8年"},
+            "experience": [{
+                "company": "乙公司",
+                "role": "资深总监",
+                "period": "01-2024 - 12-2024",
+                "bullets": ["负责需求分析，提升转化率88%"],
+            }],
+            "education": [{"school": "虚构大学", "degree": "博士", "major": "金融学", "period": ""}],
+            "projects": [],
+            "skills": {"languages": ["Python"], "certifications": ["PMP"]},
+        }
+
+        cleaned, report = final_fact_guard(source_text, resume)
+
+        self.assertFalse(report.fabrication_found)
+        self.assertEqual(cleaned["meta"]["work_experience"], "")
+        self.assertEqual(cleaned["experience"][0]["company"], "")
+        self.assertEqual(cleaned["experience"][0]["role"], "")
+        self.assertEqual(cleaned["experience"][0]["period"], "")
+        self.assertNotIn("88%", cleaned["experience"][0]["bullets"][0])
+        self.assertEqual(cleaned["education"][0]["school"], "")
+        self.assertEqual(cleaned["education"][0]["degree"], "")
+        self.assertEqual(cleaned["education"][0]["major"], "")
+        self.assertEqual(cleaned["skills"]["languages"], ["Python"])
+        self.assertEqual(cleaned["skills"]["certifications"], [])
 
 
 if __name__ == "__main__":

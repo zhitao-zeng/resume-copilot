@@ -22,6 +22,7 @@ from server_runtime import (
     call_llm_text,
     llm_enabled,
     logger,
+    remaining_request_seconds,
 )
 
 
@@ -187,17 +188,28 @@ _FIDELITY_SYSTEM_PROMPT = """你是简历事实审核专家。判断「改写版
 输出 JSON: {"pass": true/false, "reason": ""}"""
 
 
-def _llm_check_entailment_batch(
+def review_entailment_batch(
     checks: list[tuple[str, str]],  # list of (source_text, candidate_text)
-) -> list[bool]:
+) -> list[bool] | None:
     """Batch LLM entailment check. One call for up to 6 candidate pairs.
 
-    Returns list of bool: True = pass, False = fail.
+    Returns one verdict per pair, or ``None`` when review is unavailable or
+    inconclusive.  Deterministic hard-fact checks remain authoritative; a
+    transport or JSON failure must not masquerade as a semantic approval.
     """
-    if not checks or not llm_enabled():
-        return [True] * len(checks)
+    if not checks:
+        return []
+    if not llm_enabled():
+        return None
+    remaining = remaining_request_seconds()
+    if remaining is not None and remaining < 20:
+        logger.info(
+            "Semantic rewrite review skipped: %.1fs request budget remains",
+            remaining,
+        )
+        return None
 
-    results: list[bool] = [True] * len(checks)
+    results: list[bool | None] = [None] * len(checks)
 
     # Process in batches of 6
     for batch_start in range(0, len(checks), 6):
@@ -208,7 +220,7 @@ def _llm_check_entailment_batch(
 
         prompt = (
             "请对以下 {n} 对（原文, 改写）逐一判断是否存在事实夸大。"
-            "输出 JSON: {\"results\": [{\"index\": 0, \"pass\": true/false, \"reason\": \"\"}]}\n\n"
+            "输出 JSON: {{\"results\": [{{\"index\": 0, \"pass\": true/false, \"reason\": \"\"}}]}}\n\n"
             .format(n=len(batch))
             + "\n---\n".join(items)
         )
@@ -253,10 +265,26 @@ def _llm_check_entailment_batch(
                     results[batch_start + idx] = passes
         except Exception as exc:
             logger.warning("LLM entailment batch check failed: %s", exc)
-            # On failure, be conservative: don't reject candidates
-            continue
+            return None
 
-    return results
+    if any(value is None for value in results):
+        logger.warning("LLM entailment batch response omitted one or more verdicts")
+        return None
+    return [bool(value) for value in results]
+
+
+def _llm_check_entailment_batch(
+    checks: list[tuple[str, str]],
+) -> list[bool]:
+    """Backward-compatible wrapper for the legacy selector.
+
+    The legacy path is currently disabled.  If it is re-enabled, an
+    unavailable advisory review preserves deterministic decisions rather than
+    failing an entire resume.
+    """
+
+    reviewed = review_entailment_batch(checks)
+    return reviewed if reviewed is not None else [True] * len(checks)
 
 
 # ── Expression Proxy Scorer ────────────────────────────────────────────────────

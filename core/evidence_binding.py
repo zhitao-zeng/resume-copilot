@@ -7,13 +7,15 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections.abc import Mapping
 
 from source_adapter import candidate_blocks
 from v2_schemas import CanonicalResume, EvidenceBinding, SourceBlock, SourceBundle
 
 
 _SOURCE_HEADINGS = {
-    "个人总结", "个人简介", "职业概述", "自我评价", "教育经历", "教育背景", "学历信息",
+    "个人信息", "基本信息", "联系方式", "个人总结", "个人简介", "职业概述", "自我评价",
+    "教育经历", "教育背景", "学历信息",
     "工作经历", "实习经历", "任职经历", "职业经历", "科研经历", "研究经历", "实验室经历",
     "项目经历", "项目经验", "课程项目", "个人项目", "开源项目", "校园经历", "社团经历",
     "志愿经历", "社会实践", "学生工作", "专业技能", "技能清单", "技术栈", "工具", "语言能力",
@@ -113,6 +115,37 @@ def _bind(path: str, value: str, blocks: list[SourceBlock], *, minimum: float = 
     )
 
 
+def _bind_with_provenance(
+    path: str,
+    value: str,
+    blocks: list[SourceBlock],
+    *,
+    minimum: float,
+    trusted_rewrites: Mapping[str, str] | None = None,
+) -> EvidenceBinding | None:
+    """Bind a final rewrite through its already-verified source wording.
+
+    A rewrite is trusted only when the optimizer supplied a stable path and
+    the original wording still binds to candidate evidence.  JD-only text can
+    therefore never become evidence through this escape hatch.
+    """
+
+    source_value = (
+        str(trusted_rewrites.get(path, "") or "").strip()
+        if trusted_rewrites else ""
+    )
+    if source_value:
+        source_binding = _bind(path, source_value, blocks, minimum=minimum)
+        if source_binding is not None:
+            return source_binding.model_copy(update={
+                "claim": str(value or "").strip(),
+                "source_claim": source_value,
+                "mode": "rewritten",
+            })
+        return None
+    return _bind(path, value, blocks, minimum=minimum)
+
+
 def _strong_matching_blocks(
     value: str,
     blocks: list[SourceBlock],
@@ -191,6 +224,7 @@ def _find_incoherent_records(
     resume: CanonicalResume,
     source: SourceBundle,
     blocks: list[SourceBlock],
+    trusted_rewrites: Mapping[str, str] | None = None,
 ) -> dict[str, set[int]]:
     """Find records whose identity fields resolve to different source records."""
 
@@ -223,11 +257,13 @@ def _find_incoherent_records(
                     scope_options.append(field_scopes)
             if hasattr(record, "bullets"):
                 for bullet_index, value in enumerate(record.bullets):
-                    binding = _bind(
-                        f"{section}[{index}].bullets[{bullet_index}]",
+                    path = f"{section}[{index}].bullets[{bullet_index}]"
+                    binding = _bind_with_provenance(
+                        path,
                         str(value),
                         blocks,
                         minimum=0.30,
+                        trusted_rewrites=trusted_rewrites,
                     )
                     source_block = block_by_id.get(binding.block_id) if binding else None
                     if source_block and source_block.section_hint:
@@ -250,14 +286,25 @@ def _find_incoherent_records(
     return incoherent
 
 
-def bind_resume_evidence(resume: CanonicalResume, source: SourceBundle) -> list[EvidenceBinding]:
+def bind_resume_evidence(
+    resume: CanonicalResume,
+    source: SourceBundle,
+    *,
+    trusted_rewrites: Mapping[str, str] | None = None,
+) -> list[EvidenceBinding]:
     """Bind final fields and bullets to Resume/Query blocks, never JD blocks."""
 
     blocks = candidate_blocks(source)
     bindings: list[EvidenceBinding] = []
 
     def add(path: str, value: str, minimum: float = 0.22) -> None:
-        binding = _bind(path, value, blocks, minimum=minimum)
+        binding = _bind_with_provenance(
+            path,
+            value,
+            blocks,
+            minimum=minimum,
+            trusted_rewrites=trusted_rewrites,
+        )
         if binding is not None:
             bindings.append(binding)
 
@@ -300,6 +347,8 @@ def bind_resume_evidence(resume: CanonicalResume, source: SourceBundle) -> list[
 def enforce_resume_evidence(
     resume: CanonicalResume,
     source: SourceBundle,
+    *,
+    trusted_rewrites: Mapping[str, str] | None = None,
 ) -> tuple[CanonicalResume, list[EvidenceBinding], list[str]]:
     """Remove final candidate claims that cannot bind to Resume/Query evidence.
 
@@ -309,10 +358,19 @@ def enforce_resume_evidence(
     """
 
     gated = resume.model_copy(deep=True)
-    initial = bind_resume_evidence(gated, source)
+    initial = bind_resume_evidence(
+        gated,
+        source,
+        trusted_rewrites=trusted_rewrites,
+    )
     bound_paths = {binding.path for binding in initial}
     eligible_blocks = candidate_blocks(source)
-    incoherent_records = _find_incoherent_records(gated, source, eligible_blocks)
+    incoherent_records = _find_incoherent_records(
+        gated,
+        source,
+        eligible_blocks,
+        trusted_rewrites=trusted_rewrites,
+    )
     removed: list[str] = []
 
     for key in ("name", "phone", "email", "work_experience"):
@@ -354,7 +412,13 @@ def enforce_resume_evidence(
             kept_bullets: list[str] = []
             for bullet_index, bullet in enumerate(record.bullets):
                 path = f"{section}[{index}].bullets[{bullet_index}]"
-                binding = _bind(path, bullet, eligible_blocks, minimum=0.30)
+                binding = _bind_with_provenance(
+                    path,
+                    bullet,
+                    eligible_blocks,
+                    minimum=0.30,
+                    trusted_rewrites=trusted_rewrites,
+                )
                 if binding is None:
                     removed.append(path)
                 else:
@@ -408,13 +472,21 @@ def enforce_resume_evidence(
             kept_additional[title] = kept_items
     gated.additional_sections = kept_additional
 
-    bindings = bind_resume_evidence(gated, source)
+    bindings = bind_resume_evidence(
+        gated,
+        source,
+        trusted_rewrites=trusted_rewrites,
+    )
     return gated, bindings, removed
 
 
 _SOURCE_FIELD_LABEL = re.compile(
     r"^(?:姓名|电话|手机|邮箱|学校|院校|学历|学位|专业|公司|单位|岗位|职位|"
     r"项目名称|项目角色|技能|证书|奖项|任职时间|起止时间|个人总结|自我评价)\s*[:：]\s*"
+)
+_COMPACT_SOURCE_FIELD_LABEL = re.compile(
+    r"^(?:姓名|电话|手机|邮箱)\s*[:：]?\s*",
+    re.IGNORECASE,
 )
 _FACT_SPLIT = re.compile(r"(?:[。；;]+|[|｜]+|(?<=[^\s])[,，、](?=[^\s]))")
 _STRONG_FACT_ANCHOR = re.compile(
@@ -433,6 +505,7 @@ def source_fact_units(source: SourceBundle) -> list[dict[str, str]]:
         if not compact or compact in _SOURCE_HEADINGS or len(compact) < 2:
             continue
         stripped = _SOURCE_FIELD_LABEL.sub("", block.text.strip())
+        stripped = _COMPACT_SOURCE_FIELD_LABEL.sub("", stripped)
         raw_parts = [part.strip(" \t-•·▪◦") for part in _FACT_SPLIT.split(stripped)]
         parts = [part for part in raw_parts if len(_normalize(part)) >= 2]
         if not parts:
@@ -453,7 +526,12 @@ def source_fact_units(source: SourceBundle) -> list[dict[str, str]]:
     return result
 
 
-def _unit_is_represented(unit: dict[str, str], claims: list[str]) -> bool:
+def _unit_is_represented(
+    unit: dict[str, str],
+    claims: list[str],
+    *,
+    allow_distributed: bool = False,
+) -> bool:
     source_value = _normalize(unit.get("match_text", ""))
     if not source_value:
         return True
@@ -474,12 +552,29 @@ def _unit_is_represented(unit: dict[str, str], claims: list[str]) -> bool:
         recall = len(source_bigrams & claim_bigrams) / max(1, len(source_bigrams))
         if recall >= 0.58:
             return True
+    # Structural source lines commonly distribute one fact across multiple
+    # final fields (period + organization + role, or school + degree + major).
+    # Evaluate their aggregate only after every individual claim check, so a
+    # heading or unrelated short value cannot mark the whole unit represented.
+    if allow_distributed and len(claims) >= 2:
+        aggregate = " ".join(claims)
+        aggregate_value = _normalize(aggregate)
+        aggregate_anchors = {
+            item.casefold() for item in _STRONG_FACT_ANCHOR.findall(aggregate)
+        }
+        if not anchors or anchors.issubset(aggregate_anchors):
+            aggregate_bigrams = _bigrams(aggregate_value)
+            recall = len(source_bigrams & aggregate_bigrams) / max(1, len(source_bigrams))
+            if source_value in aggregate_value or recall >= 0.58:
+                return True
     return False
 
 
 def measure_source_coverage(
     source: SourceBundle,
     bindings: list[EvidenceBinding],
+    *,
+    allow_distributed: bool = False,
 ) -> tuple[float, list[str]]:
     """Measure source fact-unit coverage in the generated resume.
 
@@ -495,15 +590,23 @@ def measure_source_coverage(
     legacy_covered: set[str] = set()
     for binding in bindings:
         legacy_covered.add(binding.block_id)
-        if binding.claim.strip():
-            claims_by_block.setdefault(binding.block_id, []).append(binding.claim)
+        coverage_claim = str(binding.source_claim or binding.claim).strip()
+        if coverage_claim:
+            claims_by_block.setdefault(binding.block_id, []).append(coverage_claim)
     missing: list[str] = []
     for unit in units:
         block_id = unit["block_id"]
         claims = claims_by_block.get(block_id, [])
         # Bindings serialized before claim tracing was introduced remain
         # backward-compatible at block granularity.
-        represented = _unit_is_represented(unit, claims) if claims else block_id in legacy_covered
+        represented = (
+            _unit_is_represented(
+                unit,
+                claims,
+                allow_distributed=allow_distributed,
+            )
+            if claims else block_id in legacy_covered
+        )
         if not represented:
             missing.append(unit["unit_id"])
     ratio = (len(units) - len(missing)) / len(units)

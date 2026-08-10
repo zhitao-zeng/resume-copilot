@@ -45,12 +45,48 @@ _QUERY_NEGATIVE_INSTRUCTION = re.compile(r"(?:不要|禁止|删除|去掉|避免
 _QUERY_STRUCTURED_FACT = re.compile(
     r"(?:姓名|电话|手机|邮箱|学校|院校|学历|学位|专业|公司|单位|岗位|职位|"
     r"项目名称|项目角色|技能|证书|奖项|任职时间|起止时间)\s*[:：]|"
-    r"(?:19|20)\d{2}(?:[./年-]\d{1,2})?\s*(?:[-—~至到]|年\s*[-—~至到])\s*"
-    r"(?:(?:19|20)\d{2}(?:[./年-]\d{1,2})?|至今|现在)|"
+    r"姓名\s*[\u4e00-\u9fff·]{2,16}(?:\s|$)|"
+    r"(?:做过|参与|负责|主导|开发|设计|搭建|完成|开展)[^。；;]{0,80}"
+    r"(?:项目|系统|平台|课题|作品)|"
+    r"(?:19|20)\d{2}(?:[./年-]\d{1,2}月?)?\s*(?:[-—~至到]|年\s*[-—~至到])\s*"
+    r"(?:(?:19|20)\d{2}(?:[./年-]\d{1,2}月?)?|至今|现在)|"
     r"(?:本科|硕士|博士|大专|专科|高中)(?:在读|毕业)?|"
     r"[\u4e00-\u9fffA-Za-z0-9·.&（）()_-]{2,40}(?:大学|学院|学校|医院|公司|集团|研究院|实验室)",
     re.IGNORECASE,
 )
+
+_INLINE_PROJECT_FACT = re.compile(
+    r"(?:做过|参与|负责|主导|开发|设计|搭建|完成|开展)[^。；;]{0,80}"
+    r"(?:项目|系统|平台|课题|作品)",
+    re.IGNORECASE,
+)
+_INLINE_EDUCATION_FACT = re.compile(
+    r"(?:大学|学院|学校|本科|硕士|博士|大专|专科|高中)",
+    re.IGNORECASE,
+)
+_INLINE_EXPERIENCE_FACT = re.compile(
+    r"(?:(?:19|20)\d{2}[^。；;]{0,80}(?:公司|医院|银行|学校|机构|中心|集团|"
+    r"事务所|研究院|实验室|部门)|(?:在|于)[^。；;]{1,40}(?:任职|工作|担任|负责))",
+    re.IGNORECASE,
+)
+_INLINE_SKILL_FACT = re.compile(r"^(?:技能|专业技能|工具|技术栈|语言能力)\s*[:：]?", re.IGNORECASE)
+
+
+def _query_inline_section_hint(value: str) -> str:
+    """Classify compact profile clauses by structure, not profession."""
+
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if _INLINE_PROJECT_FACT.search(text):
+        return "projects"
+    if _INLINE_EXPERIENCE_FACT.search(text):
+        return "experience"
+    if _INLINE_EDUCATION_FACT.search(text):
+        return "education"
+    if _INLINE_SKILL_FACT.search(text):
+        return "skills"
+    return ""
 
 
 def _is_section_heading(value: str) -> bool:
@@ -128,8 +164,8 @@ _RECORD_RESULT_SIGNAL = re.compile(
     r"(?:提升|降低|增长|减少|缩短|节省|达到|达成|上线|交付|完成|获奖|录用|复核|验证)"
 )
 _RECORD_DATE = re.compile(
-    r"(?:19|20)\d{2}(?:[./年-]\d{1,2})?(?:\s*[-—~至到]\s*"
-    r"(?:(?:19|20)\d{2}(?:[./年-]\d{1,2})?|至今|现在))?"
+    r"(?:19|20)\d{2}(?:[./年-]\d{1,2}月?)?(?:\s*[-—~至到]\s*"
+    r"(?:(?:19|20)\d{2}(?:[./年-]\d{1,2}月?)?|至今|现在))?"
 )
 _RECORD_ENTITY = re.compile(
     r"(?:大学|学院|学校|医院|公司|集团|研究院|实验室|中心|部门|协会|学会|"
@@ -274,12 +310,26 @@ def build_source_bundle(
         segmented_query = re.sub(r"[，；;。]+", "\n", query_text)
         query_blocks = _split_into_blocks(segmented_query, "query")
         has_cv = bool(cv_text.strip())
+        active_record_section = ""
         for block in query_blocks:
+            inferred_section = _query_inline_section_hint(block.text)
+            if inferred_section:
+                block.section_hint = inferred_section
+                active_record_section = (
+                    inferred_section if inferred_section in _RECORD_SECTIONS else ""
+                )
+            elif active_record_section and _looks_like_record_body(block.text):
+                block.section_hint = active_record_section
+            elif block.section_hint not in _RECORD_SECTIONS:
+                active_record_section = ""
             block.fact_eligible = _query_line_is_fact(
                 block.text,
                 has_cv=has_cv,
                 section_hint=block.section_hint,
             )
+        # Inline hints are assigned after the initial line split, so rebuild
+        # record boundaries once the compact clauses have been classified.
+        _assign_record_ids(query_blocks)
         blocks.extend(query_blocks)
 
     # JD is still target context only, but section hints help the model avoid

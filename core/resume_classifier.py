@@ -344,10 +344,26 @@ def _validate_and_correct(
     resume_data: Optional[dict[str, Any]] = None,
     query: str = "",
     cv_text: str = "",
+    jd_text: str = "",
 ) -> ClassificationResult:
     warnings = list(result.warnings)
 
-    # 1. Validate user_stage (industry is free-text, not validated against a fixed list)
+    # 1. Preserve free-text long-tail industries, but normalize recognized
+    # product taxonomy categories for the public API.  Prefer explicit query
+    # evidence, then candidate CV evidence, and consult the JD only when the
+    # candidate-side text does not establish a known category.
+    canonical_industry = product_logic.infer_industry(query)
+    if canonical_industry == "other":
+        canonical_industry = product_logic.infer_industry(query, cv_text)
+    if canonical_industry == "other":
+        canonical_industry = product_logic.infer_industry(query, cv_text, jd_text)
+    if canonical_industry != "other" and result.industry != canonical_industry:
+        warnings.append(
+            f"industry '{result.industry}' normalized to '{canonical_industry}'"
+        )
+        result.industry = canonical_industry
+
+    # 2. Validate user_stage (unknown industry values remain valid free text)
     if result.user_stage not in VALID_USER_STAGES:
         warnings.append(f"Invalid user_stage '{result.user_stage}', correcting to 'job_seeker'")
         result.user_stage = "job_seeker"
@@ -438,7 +454,10 @@ def classify_resume_request(
 
         # High confidence: use LLM result directly
         if result.confidence >= 0.6 and result.evidence.has_fact_evidence:
-            return _validate_and_correct(result, resume_data=resume_data, query=query, cv_text=cv_text)
+            return _validate_and_correct(
+                result, resume_data=resume_data, query=query,
+                cv_text=cv_text, jd_text=jd_text,
+            )
 
         # Low confidence OR empty evidence: merge with rules
         rule_result = _rule_fallback(query=query, cv_text=cv_text, jd_text=jd_text, resume_data=resume_data)
@@ -452,7 +471,10 @@ def classify_resume_request(
             if not result.target_role or not result.evidence.target_role:
                 result.target_role = rule_result.target_role
 
-        return _validate_and_correct(result, resume_data=resume_data, query=query, cv_text=cv_text)
+        return _validate_and_correct(
+            result, resume_data=resume_data, query=query,
+            cv_text=cv_text, jd_text=jd_text,
+        )
 
     # LLM failed entirely — pure rule fallback
     return _validate_and_correct(
@@ -463,4 +485,5 @@ def classify_resume_request(
         resume_data=resume_data,
         query=query,
         cv_text=cv_text,
+        jd_text=jd_text,
     )

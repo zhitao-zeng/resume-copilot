@@ -32,6 +32,7 @@ from v2_pipeline import (
     _empty_profile_framework,
     _needs_optimizer,
     _rank_resume_content,
+    _atomize_resume_bullets,
     run_v2_pipeline,
 )
 from v2_schemas import CanonicalResume, DraftResume
@@ -235,6 +236,10 @@ def test_reply_uses_readable_stage_and_no_false_missing_advice():
     assert "experienced" not in reply
     assert "未检测到必填信息缺失" in reply
     assert "优先补齐联系方式" not in reply
+    assert "生成方向总结：" in reply
+    assert "缺失信息：" in reply
+    assert "岗位匹配与建议：" in reply
+    assert "时间或内容冲突：" in reply
 
 
 def test_reply_lists_every_missing_field_and_gives_targeted_advice():
@@ -304,7 +309,7 @@ def test_sparse_query_does_not_claim_unprovided_experience():
         "skills": {"items": [{"name": "智能硬件", "category": "domain"}]},
     })
     with patch("v2_pipeline.compose_from_query", return_value=generated), patch(
-        "v2_pipeline.optimize_resume", side_effect=lambda resume, jd: resume
+        "v2_pipeline._needs_optimizer", return_value=False,
     ):
         result = run_v2_pipeline("", "我是做智能硬件产品的，帮我优化简历。", "IoT产品经理")
     assert "全生命周期管理" not in result.resume.summary
@@ -330,7 +335,7 @@ def test_jd_derived_temporary_records_still_produce_structured_framework():
         }],
     })
     with patch("v2_pipeline.compose_from_query", return_value=generated), patch(
-        "v2_pipeline.optimize_resume", side_effect=lambda resume, jd: resume
+        "v2_pipeline._needs_optimizer", return_value=False,
     ):
         result = run_v2_pipeline(
             "",
@@ -464,8 +469,30 @@ def test_summary_prioritizes_grounded_quantified_achievement():
     ranked = _rank_resume_content(resume, "涂布工艺参数优化")
     compacted = _compact_canonical(ranked)
     assert "4.8%降至3.1%" in compacted.summary
-    assert len(compacted.summary) <= 100
+    assert 100 < len(compacted.summary) <= 220
     assert "4.8%降至3.1%" in compacted.projects[0].bullets[0]
+
+
+def test_compound_grounded_bullet_is_split_without_new_facts():
+    original = "负责企业数据平台需求调研、版本规划与跨团队推进，推动报表配置效率提升30%"
+    resume = CanonicalResume.model_validate({
+        "experience": [{
+            "organization": "第四范式",
+            "role": "产品经理",
+            "bullets": [original],
+        }],
+    })
+
+    atomized, provenance = _atomize_resume_bullets(resume)
+
+    assert atomized.experience[0].bullets == [
+        "负责企业数据平台需求调研",
+        "负责版本规划",
+        "负责跨团队推进",
+        "推动报表配置效率提升30%",
+    ]
+    assert set(provenance.values()) == {original}
+    assert all(path.startswith("experience[0].bullets[") for path in provenance)
 
 
 def test_independent_project_with_bullets_has_no_false_missing_warnings():
@@ -753,6 +780,125 @@ def test_optimizer_preserves_ownership_level_and_rejects_overcompression():
 
     detailed = "负责收集用户反馈、开展竞品分析并维护需求文档，协同研发跟进交付"
     assert _safe_rewrite(detailed, "负责产品工作") is False
+
+
+def test_optimizer_provenance_preserves_reviewed_low_overlap_rewrite():
+    from resume_optimizer import optimize_resume_with_provenance
+
+    resume = CanonicalResume.model_validate({
+        "experience": [{
+            "organization": "甲公司",
+            "role": "产品经理",
+            "bullets": ["负责收集用户反馈并维护需求文档"],
+        }],
+    })
+    response = json.dumps({
+        "experience": [{
+            "index": 0,
+            "bullets": ["负责围绕用户反馈开展整理归纳，持续维护需求文档"],
+        }],
+    }, ensure_ascii=False)
+    with patch("resume_optimizer.llm_enabled", return_value=True), patch(
+        "resume_optimizer.call_llm_text", return_value=response,
+    ), patch(
+        "resume_optimizer.review_entailment_batch", return_value=[True],
+    ):
+        outcome = optimize_resume_with_provenance(resume, "产品经理")
+
+    path = "experience[0].bullets[0]"
+    assert outcome.resume.experience[0].bullets[0].startswith("负责围绕用户反馈")
+    assert outcome.trusted_rewrites[path] == "负责收集用户反馈并维护需求文档"
+
+    source = build_source_bundle(
+        "工作经历\n甲公司｜产品经理\n负责收集用户反馈并维护需求文档",
+        "",
+        "",
+    )
+    gated, bindings, removed = enforce_resume_evidence(
+        outcome.resume,
+        source,
+        trusted_rewrites=outcome.trusted_rewrites,
+    )
+    assert removed == []
+    assert gated.experience[0].bullets == outcome.resume.experience[0].bullets
+    binding = next(item for item in bindings if item.path == path)
+    assert binding.source_claim == "负责收集用户反馈并维护需求文档"
+    coverage, missing = measure_source_coverage(source, bindings)
+    assert coverage == 1.0
+    assert missing == []
+
+
+def test_optimizer_reverts_high_risk_rewrite_when_semantic_review_rejects():
+    from resume_optimizer import optimize_resume_with_provenance
+
+    original = "参与课堂观察和作业批改"
+    resume = CanonicalResume.model_validate({
+        "experience": [{"bullets": [original]}],
+    })
+    response = json.dumps({
+        "experience": [{
+            "index": 0,
+            "bullets": ["协助开展课堂观察记录与作业批改工作，支持日常教学运行"],
+        }],
+    }, ensure_ascii=False)
+    with patch("resume_optimizer.llm_enabled", return_value=True), patch(
+        "resume_optimizer.call_llm_text", return_value=response,
+    ), patch(
+        "resume_optimizer.review_entailment_batch", return_value=[False],
+    ):
+        outcome = optimize_resume_with_provenance(resume, "教师")
+
+    assert outcome.resume.experience[0].bullets == [original]
+    assert outcome.trusted_rewrites == {}
+    assert outcome.semantic_rejected == 1
+
+
+def test_semantic_review_parses_fenced_batch_and_reports_inconclusive_failure():
+    from semantic_guard import review_entailment_batch
+
+    response = """```json
+    {"results": [
+      {"index": 0, "pass": true, "reason": "同义改写"},
+      {"index": 1, "pass": false, "reason": "责任升级"}
+    ]}
+    ```"""
+    with patch("semantic_guard.llm_enabled", return_value=True), patch(
+        "semantic_guard.remaining_request_seconds", return_value=60,
+    ), patch("semantic_guard.call_llm_text", return_value=response):
+        assert review_entailment_batch([("原文一", "改写一"), ("原文二", "改写二")]) == [True, False]
+
+    with patch("semantic_guard.llm_enabled", return_value=True), patch(
+        "semantic_guard.remaining_request_seconds", return_value=60,
+    ), patch("semantic_guard.call_llm_text", return_value="not-json"):
+        assert review_entailment_batch([("原文", "改写")]) is None
+
+
+def test_semantic_review_respects_deadline_and_hard_fact_guard_runs_first():
+    from resume_optimizer import optimize_resume_with_provenance
+    from semantic_guard import review_entailment_batch
+
+    with patch("semantic_guard.llm_enabled", return_value=True), patch(
+        "semantic_guard.remaining_request_seconds", return_value=10,
+    ), patch("semantic_guard.call_llm_text") as llm_call:
+        assert review_entailment_batch([("原文", "改写")]) is None
+        llm_call.assert_not_called()
+
+    resume = CanonicalResume.model_validate({
+        "experience": [{"bullets": ["负责用户反馈整理"]}],
+    })
+    response = json.dumps({
+        "experience": [{
+            "index": 0,
+            "bullets": ["负责1000名用户反馈整理"],
+        }],
+    }, ensure_ascii=False)
+    with patch("resume_optimizer.llm_enabled", return_value=True), patch(
+        "resume_optimizer.call_llm_text", return_value=response,
+    ), patch("resume_optimizer.review_entailment_batch") as reviewer:
+        outcome = optimize_resume_with_provenance(resume, "产品经理")
+
+    assert outcome.resume.experience[0].bullets == ["负责用户反馈整理"]
+    reviewer.assert_not_called()
 
 
 def test_long_resume_optimizer_batches_keep_global_record_indexes():

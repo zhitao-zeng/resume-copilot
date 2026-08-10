@@ -17,8 +17,8 @@ from resume_composer import (
     _typed_prompt_token_estimate,
     compose_resume,
 )
-from source_adapter import build_source_bundle
-from v2_pipeline import _deterministic_fallback, run_v2_pipeline
+from source_adapter import build_source_bundle, candidate_blocks
+from v2_pipeline import _deterministic_fallback, _merge_source_recovery, run_v2_pipeline
 from v2_schemas import (
     CanonicalResume,
     Change,
@@ -61,6 +61,39 @@ def _gateway(completions: _FakeCompletions) -> LLMGateway:
         enable_json_repair=False,
         dump_failure_payload=lambda *_args: None,
     )
+
+
+def test_query_adapter_accepts_compact_name_and_chinese_date_records():
+    query = (
+        "姓名白宁，电话13210008025，邮箱baining@example.com，"
+        "2020年3月到2025年6月在A银行信贷审核，"
+        "2024年6月到2025年5月在B银行风控审核。"
+    )
+
+    blocks = build_source_bundle("", query, "").blocks
+    eligible = [block.text for block in blocks if block.fact_eligible]
+
+    assert "姓名白宁" in eligible
+    assert "2020年3月到2025年6月在A银行信贷审核" in eligible
+    assert "2024年6月到2025年5月在B银行风控审核" in eligible
+
+
+def test_query_adapter_groups_compact_project_and_following_action():
+    query = (
+        "姓名程洛，上海交通大学软件工程本科09-2022到06-2026，"
+        "做过课程选课系统项目，负责需求分析和原型设计，技能SQL、Axure。"
+    )
+
+    project_blocks = [
+        block for block in candidate_blocks(build_source_bundle("", query, ""))
+        if block.section_hint == "projects"
+    ]
+
+    assert [block.text for block in project_blocks] == [
+        "做过课程选课系统项目",
+        "负责需求分析和原型设计",
+    ]
+    assert project_blocks[0].record_id == project_blocks[1].record_id
 
 
 def test_gateway_retries_context_overflow_with_backend_safe_budget():
@@ -212,6 +245,30 @@ def test_composer_splits_single_oversized_line_without_losing_text(monkeypatch):
     assert len(chunks) >= 2
     assert reconstructed == long_line
     assert all(_composer_prompt_token_estimate(chunk) <= prompt_limit for chunk in chunks)
+
+
+def test_composer_caps_short_fact_count_to_prevent_output_truncation(monkeypatch):
+    monkeypatch.setenv("LLM_CONTEXT_WINDOW", "16384")
+    source = SourceBundle(blocks=[
+        SourceBlock(
+            block_id=f"resume_{index}",
+            source_type="resume",
+            section_hint="experience",
+            text=f"第{index}条真实职责",
+        )
+        for index in range(80)
+    ])
+
+    chunks = _split_source_bundle(source, max_fact_chars=60_000, max_fact_blocks=36)
+    reconstructed = [
+        block.text
+        for chunk in chunks
+        for block in candidate_blocks(chunk)
+    ]
+
+    assert len(chunks) == 3
+    assert all(len(candidate_blocks(chunk)) <= 36 for chunk in chunks)
+    assert reconstructed == [f"第{index}条真实职责" for index in range(80)]
 
 
 def test_composer_bisects_backend_rejected_chunk_without_losing_facts(monkeypatch):
@@ -366,8 +423,81 @@ def test_low_coverage_repair_keeps_repeated_degrees_and_rebuilds_changes():
         result = run_v2_pipeline(cv_text, "请优化", "目标岗位：分析师")
 
     assert len(result.resume.education) == 4
-    assert result.changes[0].path == "*"
+    assert all(change.path != "*" for change in result.changes)
     assert all(change.reason != "stale optimizer change" for change in result.changes)
+
+
+def test_complete_fallback_is_merged_before_the_single_optimizer_pass():
+    cv_text = (
+        "工作经历\n甲公司｜工程师｜2020.01-2023.01\n"
+        "负责需求分析\n负责项目交付"
+    )
+    sparse = VerifiedResult(
+        resume=CanonicalResume(meta=Meta(name="张三")),
+    )
+    full_fallback = CanonicalResume.model_validate({
+        "experience": [{
+            "organization": "甲公司",
+            "role": "工程师",
+            "period": "2020.01-2023.01",
+            "bullets": ["负责需求分析", "负责项目交付"],
+        }],
+    })
+    optimized_inputs = []
+
+    def fake_optimize(resume, _jd):
+        from resume_optimizer import OptimizationOutcome
+
+        optimized_inputs.append(resume.model_copy(deep=True))
+        return OptimizationOutcome(resume=resume)
+
+    with patch("v2_pipeline.compose_resume", return_value=DraftResume()), patch(
+        "v2_pipeline._deterministic_verify_draft", return_value=sparse,
+    ), patch(
+        "v2_pipeline._deterministic_fallback", return_value=full_fallback,
+    ), patch(
+        "v2_pipeline.optimize_resume_with_provenance", side_effect=fake_optimize,
+    ):
+        result = run_v2_pipeline(cv_text, "请优化", "目标岗位：工程师")
+
+    assert optimized_inputs
+    assert optimized_inputs[0].experience[0].organization == "甲公司"
+    assert set(result.resume.experience[0].bullets) == {"负责需求分析", "负责项目交付"}
+    assert all(change.path != "*" for change in result.changes)
+
+
+def test_source_recovery_keeps_optimized_bullet_and_appends_only_missing_fact():
+    optimized = CanonicalResume.model_validate({
+        "experience": [{
+            "organization": "甲公司",
+            "role": "工程师",
+            "period": "2020.01-2023.01",
+            "bullets": ["负责梳理业务需求并形成可执行方案"],
+        }],
+    })
+    fallback = CanonicalResume.model_validate({
+        "experience": [{
+            "organization": "甲公司",
+            "role": "工程师",
+            "period": "2020.01-2023.01",
+            "bullets": ["负责需求分析", "负责项目交付"],
+        }],
+    })
+
+    merged, stats = _merge_source_recovery(
+        optimized,
+        fallback,
+        trusted_rewrites={
+            "experience[0].bullets[0]": "负责需求分析",
+        },
+    )
+
+    assert merged.experience[0].bullets == [
+        "负责梳理业务需求并形成可执行方案",
+        "负责项目交付",
+    ]
+    assert stats.appended_bullets == 1
+    assert stats.appended_records == 0
 
 
 def test_production_startup_shares_configurable_context_window():

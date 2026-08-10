@@ -15,7 +15,7 @@ def _load(path: Path) -> dict:
     return value
 
 
-def test_latest_submission_yaml_is_minimal_and_mirrored():
+def test_submission_yaml_is_minimal_mirrored_and_immutable():
     root_manifest = _load(ROOT / "leaderboard.yml")
     config_manifest = _load(ROOT / "config" / "leaderboard.yml")
 
@@ -27,7 +27,9 @@ def test_latest_submission_yaml_is_minimal_and_mirrored():
         "source": "ceph_customer",
         "srcRelativePath": "zengzhitao/resume-copilot/models/Qwen3.5-27B-AWQ",
     }]
-    assert root_manifest["inferenceImage"] == {
-        "repository": "harbor-contest.4pd.io/zengzhitao/resume-copilot",
-        "tag": "latest",
-    }
+    image = root_manifest["inferenceImage"]
+    assert image["repository"] == "harbor-contest.4pd.io/zengzhitao/resume-copilot"
+    assert set(image) == {"repository", "tag"}
+    assert image["tag"]
+    assert image["tag"] != "latest"
+    assert all(character.isalnum() or character in "._-" for character in image["tag"])

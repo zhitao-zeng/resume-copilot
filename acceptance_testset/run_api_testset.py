@@ -28,6 +28,25 @@ def _load_cases(path: Path) -> list[dict[str, Any]]:
     return cases
 
 
+def _filter_cases(
+    cases: list[dict[str, Any]],
+    requested_ids: list[str] | None,
+) -> list[dict[str, Any]]:
+    if not requested_ids:
+        return cases
+    selected_ids = [
+        item.strip()
+        for value in requested_ids
+        for item in str(value).split(",")
+        if item.strip()
+    ]
+    by_id = {str(case.get("id")): case for case in cases}
+    missing = [case_id for case_id in selected_ids if case_id not in by_id]
+    if missing:
+        raise SystemExit(f"Unknown --case-id value(s): {', '.join(missing)}")
+    return [by_id[case_id] for case_id in selected_ids]
+
+
 def _part_text(boundary: str, name: str, value: str) -> bytes:
     return (
         f"--{boundary}\r\n"
@@ -154,9 +173,16 @@ def main() -> None:
     parser.add_argument("--out", default=None, help="Output JSON path. If omitted, auto-creates results_<timestamp>/results.json")
     parser.add_argument("--timeout", type=int, default=520)
     parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument(
+        "--case-id",
+        action="append",
+        default=[],
+        help="Run selected case ID(s); repeat the option or pass comma-separated IDs",
+    )
     args = parser.parse_args()
 
     cases = _load_cases(Path(args.cases))
+    cases = _filter_cases(cases, args.case_id)
     if args.limit:
         cases = cases[: args.limit]
 

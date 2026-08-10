@@ -661,7 +661,7 @@ def _reply_detail_block(
     targeted_suggestions: list[str],
     quality_report: dict[str, Any] | None = None,
 ) -> str:
-    lines: list[str] = []
+    lines: list[str] = ["缺失信息："]
     if missing_fields:
         unique_items: list[dict[str, Any]] = []
         seen: set[tuple[str, str]] = set()
@@ -680,9 +680,14 @@ def _reply_detail_block(
                 label += f"（第{int(indexed.group(2)) + 1}{noun}）"
             reason = str(item.get("reason", "")).strip()
             lines.append(f"- {label}：{reason}" if reason else f"- {label}")
+    else:
+        lines.append("- 未检测到必填信息缺失；仍建议核对联系方式、时间和成果数据。")
+    lines.append("岗位匹配与建议：")
     if targeted_suggestions:
         lines.append("针对岗位的建议：")
         lines.extend(f"- {item}" for item in targeted_suggestions)
+    else:
+        lines.append("- 暂无足够岗位信息形成具体匹配结论；提供完整JD后可进一步优化关键词与经历排序。")
     report = quality_report if isinstance(quality_report, dict) else {}
     preservation = report.get("source_preservation", {})
     unrepresented = (
@@ -774,8 +779,8 @@ def _reply_result_block(
 
 def _reply_conflict_block(conflicts: list[dict[str, Any]]) -> str:
     if not conflicts:
-        return ""
-    lines = [f"需要确认的时间或内容冲突（{len(conflicts)}项）："]
+        return "时间或内容冲突：\n- 未检测到明显时间或内容冲突；正式投递前仍请人工复核。"
+    lines = ["时间或内容冲突：", f"需要确认的时间或内容冲突（{len(conflicts)}项）："]
     for item in conflicts[:8]:
         description = str(item.get("description", "")).strip()
         if description:
@@ -922,7 +927,7 @@ def _build_llm_reply(
         if reply and rewrite_count and f"优化 {rewrite_count} 条" not in reply:
             reply += "\n\n" + rewrite_message
         if reply:
-            logger.info("回复信息: %s", reply)
+            logger.info("Reply generated: chars=%d", len(reply))
         return reply if reply else ""
     except Exception as exc:
         logger.warning("LLM reply generation failed: %s", exc)
@@ -964,20 +969,14 @@ def build_reply_text(
     rewrite_count = _rewrite_change_count(changes)
     if rewrite_count:
         parts.append(f"已在不新增事实的前提下优化 {rewrite_count} 条经历/项目表述。")
+    parts.append(_reply_detail_block(
+        missing_fields,
+        targeted_suggestions or [],
+        quality_report=quality_report,
+    ))
     if missing_fields:
-        parts.append(_reply_detail_block(
-            missing_fields, targeted_suggestions or [], quality_report=quality_report,
-        ))
         parts.append("建议补齐上述信息后再用于正式投递。")
-    else:
-        parts.append("未检测到必填信息缺失；正式投递前请人工复核联系方式、时间和成果表述。")
-        if targeted_suggestions or quality_report:
-            parts.append(_reply_detail_block(
-                [], targeted_suggestions or [], quality_report=quality_report,
-            ))
-    conflict_block = _reply_conflict_block(conflicts)
-    if conflict_block:
-        parts.append(conflict_block)
+    parts.append(_reply_conflict_block(conflicts))
     if ocr_warnings:
         warnings = "; ".join(item.get("message", "") for item in ocr_warnings[:3] if item.get("message"))
         parts.append("OCR/文件提示: " + warnings)
@@ -1520,10 +1519,11 @@ async def rewrite_path(ctx: PipelineContext) -> PipelineContext:
                 # (ledger is otherwise stale — its bullets still have original text)
                 ledger = build_ledger(ctx.resume_data, ctx.source_truth_text, run_repair=False)
                 logger.info("Applied %d bullet patches to resume_data", len(patches))
-                for p_i, p in enumerate(patches[:5]):
-                    _b = _bullet_map.get(p.bullet_id)
-                    _before = _b.source_text[:80] if _b else "?"
-                    logger.info("  patch[%d] %s: '%s' -> '%s'", p_i, p.bullet_id, _before, p.new_text[:80])
+                logger.info(
+                    "Applied bullet patch telemetry: accepted=%d sampled_paths=%d",
+                    len(patches),
+                    min(5, len(patches)),
+                )
             else:
                 logger.info("No patches applied, keeping original resume_data")
 
@@ -1885,29 +1885,23 @@ async def stage_render(ctx: PipelineContext) -> PipelineContext:
             logger.info("  清除: %s", _w)
     _prune_empty_resume_values(ctx.resume_data)
 
-    reply_text = await asyncio.to_thread(
-        _build_llm_reply,
-        audit_report=ctx.audit_report, score=ctx.score,
-        missing_fields=missing_dict, changes=ctx.changes,
-        jd_text=ctx.jd_text, resume_data=ctx.resume_data,
-        quality_report=ctx.quality_report,
-        conflicts=conflict_dict,
+    # The free-form reply model could relabel a factual role (for example,
+    # calling a product-assistant job an internship) even though the resume
+    # itself remained grounded.  Build the public reply exclusively from the
+    # validated structured report; this is also faster and keeps every role,
+    # omission and conflict traceable to the final document.
+    reply_text = build_reply_text(
+        scenario=ctx.scenario, industry=ctx.industry,
+        user_stage=ctx.user_stage, missing_fields=missing_dict,
+        conflicts=conflict_dict, ocr_warnings=ctx.ocr_warnings,
         direction=ctx.user_report.get("generation_direction", ""),
+        score_total=ctx.score,
+        changes=ctx.changes,
+        targeted_suggestions=ctx.user_report.get("targeted_suggestions", []),
+        quality_report=ctx.quality_report,
+        resume_data=ctx.resume_data,
         framework_mode=bool(ctx.user_report.get("framework_mode")),
     )
-    if not reply_text:
-        reply_text = build_reply_text(
-            scenario=ctx.scenario, industry=ctx.industry,
-            user_stage=ctx.user_stage, missing_fields=missing_dict,
-            conflicts=conflict_dict, ocr_warnings=ctx.ocr_warnings,
-            direction=ctx.user_report.get("generation_direction", ""),
-            score_total=ctx.score,
-            changes=ctx.changes,
-            targeted_suggestions=ctx.user_report.get("targeted_suggestions", []),
-            quality_report=ctx.quality_report,
-            resume_data=ctx.resume_data,
-            framework_mode=bool(ctx.user_report.get("framework_mode")),
-        )
     ctx.reply_text = reply_text
 
     t_export = time.perf_counter()

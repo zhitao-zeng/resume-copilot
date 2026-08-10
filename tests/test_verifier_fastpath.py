@@ -67,20 +67,21 @@ def test_complete_split_fields_skip_llm_verifier_despite_low_raw_coverage():
 
     # This documents the original false negative: names can bind to their
     # first duplicate occurrence, while education/job header lines are split
-    # into multiple canonical fields. The old per-claim metric sees only 60.9%.
+    # into multiple canonical fields. The strict per-claim metric remains
+    # below the fast-path threshold even though every required field exists.
     raw_resume = CanonicalResume.model_validate(draft.model_dump())
     raw_coverage, _ = measure_source_coverage(
         source,
         bind_resume_evidence(raw_resume, source),
     )
-    assert raw_coverage == 0.6087
+    assert raw_coverage < 0.80
 
     result = _deterministic_verify_draft(source, draft)
     assert result is not None
     assert len(result.resume.experience) == 2
     assert result.resume.experience[0].organization == "第四范式"
     assert result.resume.experience[0].period == "07-2022 - 05-2026"
-    assert "30%" in result.resume.experience[0].bullets[0]
+    assert any("30%" in bullet for bullet in result.resume.experience[0].bullets)
 
 
 def test_final_coverage_keeps_complete_structured_result_instead_of_raw_fallback():
@@ -97,7 +98,7 @@ def test_final_coverage_keeps_complete_structured_result_instead_of_raw_fallback
     fallback.assert_not_called()
     assert len(result.resume.experience) == 2
     assert result.resume.education[0].school == "复旦大学"
-    assert "30%" in result.resume.experience[0].bullets[0]
+    assert any("30%" in bullet for bullet in result.resume.experience[0].bullets)
 
 
 def test_high_coverage_source_fallback_skips_verifier_that_would_be_discarded():

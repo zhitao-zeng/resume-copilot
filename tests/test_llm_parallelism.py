@@ -193,7 +193,7 @@ def test_composer_initial_chunks_use_two_workers_and_merge_in_input_order(monkey
     ]
 
 
-def test_composer_parallel_failure_discards_every_partial_chunk(monkeypatch):
+def test_composer_parallel_failure_retains_successful_chunks(monkeypatch):
     chunks = _composer_chunks(3)
 
     def fake_call(_model, _system, prompt, **_kwargs):
@@ -217,7 +217,7 @@ def test_composer_parallel_failure_discards_every_partial_chunk(monkeypatch):
         blocks=[block for chunk in chunks for block in chunk.blocks],
     ))
 
-    assert result == DraftResume()
+    assert {item.organization for item in result.experience} == {"公司0", "公司2"}
 
 
 def test_composer_workers_inherit_request_deadline_context(monkeypatch):
@@ -278,8 +278,8 @@ def test_optimizer_batches_use_two_workers_and_apply_stable_indexes_on_caller_th
     })
     probe = _ConcurrencyProbe()
     caller_thread = threading.get_ident()
-    apply_threads: list[int] = []
-    original_apply = resume_optimizer._apply_section_patches
+    collect_threads: list[int] = []
+    original_collect = resume_optimizer._section_patch_proposals
 
     def fake_call(_system, prompt, **_kwargs):
         payload = json.loads(prompt.split("【只读事实与原始 bullets】\n", 1)[1])
@@ -302,13 +302,13 @@ def test_optimizer_batches_use_two_workers_and_apply_stable_indexes_on_caller_th
         finally:
             probe.leave()
 
-    def recording_apply(optimized, section, patches):
-        apply_threads.append(threading.get_ident())
-        return original_apply(optimized, section, patches)
+    def recording_collect(optimized, section, patches):
+        collect_threads.append(threading.get_ident())
+        return original_collect(optimized, section, patches)
 
     monkeypatch.setattr(resume_optimizer, "llm_enabled", lambda: True)
     monkeypatch.setattr(resume_optimizer, "call_llm_text", fake_call)
-    monkeypatch.setattr(resume_optimizer, "_apply_section_patches", recording_apply)
+    monkeypatch.setattr(resume_optimizer, "_section_patch_proposals", recording_collect)
 
     deadline_at = time.monotonic() + 60
     deadline_token = set_request_deadline(deadline_at=deadline_at)
@@ -320,7 +320,7 @@ def test_optimizer_batches_use_two_workers_and_apply_stable_indexes_on_caller_th
     assert probe.peak == 2
     assert all(thread_id != caller_thread for thread_id in probe.thread_ids)
     assert all(value == deadline_at for value in probe.deadlines)
-    assert apply_threads and set(apply_threads) == {caller_thread}
+    assert collect_threads and set(collect_threads) == {caller_thread}
     assert [item.organization for item in result.experience] == [
         "甲公司", "乙公司", "丙公司", "丁公司",
     ]

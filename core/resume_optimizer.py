@@ -14,15 +14,42 @@ import re
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
+from dataclasses import dataclass, field
 from typing import Any
 
 from llm_gateway import LLMDeadlineExceeded, parse_json_content
 from server_runtime import call_llm_text, llm_enabled
+from semantic_guard import review_entailment_batch
 from v2_schemas import CanonicalResume
 
 logger = logging.getLogger(__name__)
 
 _MAX_OPTIMIZER_CONCURRENCY = 2
+
+
+@dataclass(frozen=True)
+class OptimizationOutcome:
+    """Optimizer result plus stable provenance for accepted bullet rewrites."""
+
+    resume: CanonicalResume
+    trusted_rewrites: dict[str, str] = field(default_factory=dict)
+    proposed: int = 0
+    accepted: int = 0
+    semantic_reviewed: int = 0
+    semantic_rejected: int = 0
+
+
+@dataclass(frozen=True)
+class _RewriteProposal:
+    section: str
+    record_index: int
+    bullet_index: int
+    before: str
+    after: str
+
+    @property
+    def path(self) -> str:
+        return f"{self.section}[{self.record_index}].bullets[{self.bullet_index}]"
 
 
 _STRONG_ACTIONS = ("主导", "统筹", "牵头", "独立负责", "全权负责", "从0到1", "从零到一")
@@ -134,35 +161,75 @@ def _safe_rewrite(original: str, rewritten: str) -> bool:
     return True
 
 
+def _rewrite_requires_semantic_review(original: str, rewritten: str) -> bool:
+    """Flag large but hard-rule-safe paraphrases for bounded LLM review."""
+
+    def bigrams(value: str) -> set[str]:
+        compact = re.sub(r"[^\w\u4e00-\u9fff]+", "", value).casefold()
+        return {compact[index:index + 2] for index in range(max(0, len(compact) - 1))}
+
+    source = bigrams(original)
+    candidate = bigrams(rewritten)
+    if not source or not candidate:
+        return True
+    generated_coverage = len(source & candidate) / len(candidate)
+    source_recall = len(source & candidate) / len(source)
+    # Moderate expansion is normal when a terse source bullet is turned into
+    # a readable sentence.  Review only when most candidate wording is new or
+    # a material part of the source disappeared; the previous 0.58 generated
+    # coverage threshold classified ordinary connective wording as risky.
+    return generated_coverage < 0.35 or source_recall < 0.45
+
+
+def _semantic_guard_mode() -> str:
+    value = os.getenv("LLM_SEMANTIC_GUARD_MODE", "high_risk").strip().lower()
+    return value if value in {"off", "high_risk", "all"} else "high_risk"
+
+
+def _section_patch_proposals(
+    resume: CanonicalResume,
+    section: str,
+    patches: Any,
+) -> list[_RewriteProposal]:
+    records = getattr(resume, section, None)
+    if not isinstance(records, list) or not isinstance(patches, list):
+        return []
+    proposals: list[_RewriteProposal] = []
+    for patch in patches:
+        if not isinstance(patch, dict) or not isinstance(patch.get("index"), int):
+            continue
+        record_index = patch["index"]
+        if record_index < 0 or record_index >= len(records):
+            continue
+        proposed = patch.get("bullets")
+        original = list(records[record_index].bullets)
+        if not isinstance(proposed, list) or len(proposed) != len(original):
+            continue
+        for bullet_index, (before, after) in enumerate(zip(original, proposed)):
+            before_text = str(before or "").strip()
+            after_text = str(after or "").strip()
+            if after_text == before_text or not _safe_rewrite(before_text, after_text):
+                continue
+            proposals.append(_RewriteProposal(
+                section=section,
+                record_index=record_index,
+                bullet_index=bullet_index,
+                before=before_text,
+                after=after_text,
+            ))
+    return proposals
+
+
 def _apply_section_patches(
     optimized: CanonicalResume,
     section: str,
     patches: Any,
 ) -> int:
-    records = getattr(optimized, section, None)
-    if not isinstance(records, list) or not isinstance(patches, list):
-        return 0
-    accepted = 0
-    for patch in patches:
-        if not isinstance(patch, dict) or not isinstance(patch.get("index"), int):
-            continue
-        index = patch["index"]
-        if index < 0 or index >= len(records):
-            continue
-        proposed = patch.get("bullets")
-        original = list(records[index].bullets)
-        if not isinstance(proposed, list) or len(proposed) != len(original):
-            continue
-        merged: list[str] = []
-        for before, after in zip(original, proposed):
-            after_text = str(after or "").strip()
-            if _safe_rewrite(before, after_text):
-                merged.append(after_text)
-                accepted += int(after_text != before)
-            else:
-                merged.append(before)
-        records[index].bullets = merged
-    return accepted
+    proposals = _section_patch_proposals(optimized, section, patches)
+    records = getattr(optimized, section, [])
+    for proposal in proposals:
+        records[proposal.record_index].bullets[proposal.bullet_index] = proposal.after
+    return len(proposals)
 
 
 def _build_optimizer_batches(resume: CanonicalResume) -> list[dict[str, list[dict[str, Any]]]]:
@@ -275,9 +342,12 @@ def _patches_for_payload(
     ]
 
 
-def optimize_resume(resume: CanonicalResume, jd_text: str = "") -> CanonicalResume:
+def optimize_resume_with_provenance(
+    resume: CanonicalResume,
+    jd_text: str = "",
+) -> OptimizationOutcome:
     if not llm_enabled():
-        return resume
+        return OptimizationOutcome(resume=resume)
 
     total_bullets = sum(
         len(item.bullets)
@@ -286,10 +356,9 @@ def optimize_resume(resume: CanonicalResume, jd_text: str = "") -> CanonicalResu
     )
     if total_bullets < 1:
         logger.info("Optimizer skipped: only %d bullets", total_bullets)
-        return resume
+        return OptimizationOutcome(resume=resume)
 
     optimized = resume.model_copy(deep=True)
-    accepted = 0
     batches = _build_optimizer_batches(resume)
     initial_batch_count = len(batches)
     pending: list[tuple[tuple[int, ...], dict[str, list[dict[str, Any]]]]] = [
@@ -358,20 +427,70 @@ def optimize_resume(resume: CanonicalResume, jd_text: str = "") -> CanonicalResu
                 # caller thread and in stable source order.
                 pending[0:0] = retries
 
+    proposals: list[_RewriteProposal] = []
     for key in sorted(completed):
         payload, parsed = completed[key]
         for section in ("experience", "research", "activities", "projects"):
-            accepted += _apply_section_patches(
-                optimized,
+            proposals.extend(_section_patch_proposals(
+                resume,
                 section,
                 _patches_for_payload(payload, section, parsed.get(section)),
-            )
+            ))
+
+    mode = _semantic_guard_mode()
+    review_candidates = [
+        proposal for proposal in proposals
+        if mode == "all" or (
+            mode == "high_risk"
+            and _rewrite_requires_semantic_review(proposal.before, proposal.after)
+        )
+    ]
+    reviewed = review_entailment_batch([
+        (proposal.before, proposal.after) for proposal in review_candidates
+    ]) if review_candidates else []
+    review_by_path = (
+        {proposal.path: verdict for proposal, verdict in zip(review_candidates, reviewed)}
+        if reviewed is not None else {}
+    )
+
+    trusted_rewrites: dict[str, str] = {}
+    semantic_rejected = 0
+    for proposal in proposals:
+        high_risk = _rewrite_requires_semantic_review(proposal.before, proposal.after)
+        needs_review = mode == "all" or (mode == "high_risk" and high_risk)
+        verdict = review_by_path.get(proposal.path) if needs_review else True
+        # A high-risk rewrite must receive an affirmative review.  Low-risk
+        # rewrites remain governed by deterministic rules when an optional
+        # all-mode review is unavailable.
+        if verdict is False or (high_risk and verdict is not True):
+            semantic_rejected += 1
+            continue
+        records = getattr(optimized, proposal.section)
+        records[proposal.record_index].bullets[proposal.bullet_index] = proposal.after
+        trusted_rewrites[proposal.path] = proposal.before
+
+    accepted = len(trusted_rewrites)
 
     logger.info(
-        "Optimizer patches applied: %d/%d bullets across %d initial/%d attempted batch(es)",
+        "Optimizer patches applied: %d/%d bullets across %d initial/%d attempted batch(es); semantic_reviewed=%d rejected=%d",
         accepted,
         total_bullets,
         initial_batch_count,
         attempted,
+        len(review_candidates) if reviewed is not None else 0,
+        semantic_rejected,
     )
-    return optimized
+    return OptimizationOutcome(
+        resume=optimized,
+        trusted_rewrites=trusted_rewrites,
+        proposed=len(proposals),
+        accepted=accepted,
+        semantic_reviewed=len(review_candidates) if reviewed is not None else 0,
+        semantic_rejected=semantic_rejected,
+    )
+
+
+def optimize_resume(resume: CanonicalResume, jd_text: str = "") -> CanonicalResume:
+    """Compatibility wrapper returning only the optimized resume."""
+
+    return optimize_resume_with_provenance(resume, jd_text).resume
