@@ -129,6 +129,10 @@ def test_v2_c39_school_preserved():
         assert any("北京邮电大学" in s for s in schools), (
             f"北京邮电大学 not found in education: {schools}"
         )
+        assert schools == ["北京邮电大学"], (
+            f"narrative fragments leaked into duplicate education records: {schools}"
+        )
+        assert all(not e["organization"].startswith("在") for e in out["experience"])
     else:
         # If education is empty, check that at least the cv_text was processed
         # (non-empty experience or skills)

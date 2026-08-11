@@ -90,8 +90,8 @@ _RESULT_CLAIMS = (
     "确保", "保障", "关键依据", "高质量交付", "打通", "性能达标", "降低成本",
     "提高准确率", "提升准确率", "提升效率", "提升用户体验",
 )
-_SUMMARY_MAX_CHARS = 220
-_SUMMARY_MAX_SENTENCES = 6
+_SUMMARY_MAX_CHARS = 100
+_SUMMARY_MAX_SENTENCES = 4
 
 _SKILL_CATEGORY_ALIASES = {
     "language": "language",
@@ -237,10 +237,11 @@ def _ground_bullets(
                 if not value:
                     continue
                 path = f"{section_name}[{record_index}].bullets[{bullet_index}]"
-                if trusted_rewrites and path in trusted_rewrites:
-                    safe_value = value
-                else:
-                    safe_value, _status = _ground_bullet_value(value, sentences)
+                # Provenance is useful for binding an accepted paraphrase back
+                # to its source, but it must never bypass the final truth gate.
+                # The external evaluator caught rewrites that were traceable to
+                # an original bullet while still adding unsupported claims.
+                safe_value, _status = _ground_bullet_value(value, sentences)
                 if safe_value and safe_value not in safe_bullets:
                     safe_bullets.append(safe_value)
             record.bullets = safe_bullets
@@ -275,10 +276,10 @@ def _ground_optimizer_output(
             for bullet_index, bullet in enumerate(after_record.bullets):
                 value = str(bullet or "").strip()
                 path = f"{section_name}[{record_index}].bullets[{bullet_index}]"
-                if trusted_rewrites and path in trusted_rewrites:
-                    safe_value, status = value, "accepted"
-                else:
-                    safe_value, status = _ground_bullet_value(value, sentences)
+                # A semantic-review provenance entry is not evidence that every
+                # word in the rewrite is grounded. Always validate the emitted
+                # wording; keep provenance only after this check succeeds.
+                safe_value, status = _ground_bullet_value(value, sentences)
                 if status != "accepted" and bullet_index < len(before_bullets):
                     safe_value = str(before_bullets[bullet_index] or "").strip()
                     logger.info(
@@ -349,55 +350,25 @@ def _rank_resume_content(resume: CanonicalResume, target_context: str = "") -> C
     return ranked
 
 
-_FACT_ACTION_PREFIXES = (
-    "独立负责", "跨团队推进", "负责", "承担", "参与", "主导", "协助", "支持",
-    "配合", "完成", "推动", "推进", "组织", "设计", "开发", "构建", "实现",
-    "制定", "管理", "运营", "分析", "研究", "撰写", "输出", "交付", "维护",
-    "优化", "搭建", "建立", "开展", "跟进", "协调", "执行",
-)
-_FACT_ACTION_PATTERN = "|".join(
-    re.escape(value) for value in sorted(_FACT_ACTION_PREFIXES, key=len, reverse=True)
-)
-_FACT_ACTION_BOUNDARY = re.compile(
-    rf"[，,]\s*(?=(?:{_FACT_ACTION_PATTERN}))"
-)
-_PARALLEL_FACT_SPLIT = re.compile(r"\s*(?:、|以及|及|和|与)\s*")
-
-
 def _split_grounded_fact_bullet(value: str, *, limit: int = 6) -> list[str]:
-    """Split one compound factual bullet without inventing new predicates.
+    """Split only genuinely independent sentences in a grounded bullet.
 
-    Every emitted atom reuses the exact leading action verb and object words
-    from the verified bullet.  The original bullet is retained as provenance
-    for evidence binding, so this only changes presentation granularity.
+    Commas and conjunctions commonly connect Situation/Action/Result facts in
+    Chinese resumes. Repeating the leading verb across those fragments turns a
+    complete achievement into several thin task statements and can detach a
+    quantified result from its context. Sentence/semicolon boundaries are the
+    only safe deterministic split points; the optimizer can still polish each
+    complete unit afterwards.
     """
 
     text = re.sub(r"\s+", " ", str(value or "")).strip(" \t。；;")
     if not text:
         return []
-    clauses = [
+    atoms = [
         item.strip(" \t，,。；;")
-        for sentence in re.split(r"[。；;]+", text)
-        for item in _FACT_ACTION_BOUNDARY.split(sentence)
+        for item in re.split(r"[。；;]+", text)
         if item.strip(" \t，,。；;")
     ]
-    atoms: list[str] = []
-    for clause in clauses:
-        match = re.match(rf"^({ _FACT_ACTION_PATTERN })(.+)$", clause)
-        if not match:
-            atoms.append(clause)
-            continue
-        action, remainder = match.group(1), match.group(2).strip()
-        parts = [part.strip(" \t，,。；;") for part in _PARALLEL_FACT_SPLIT.split(remainder)]
-        normalized_parts = [re.sub(r"\W+", "", part) for part in parts]
-        if (
-            len(parts) < 2
-            or len(parts) > limit
-            or any(len(part) < 2 for part in normalized_parts)
-        ):
-            atoms.append(clause)
-            continue
-        atoms.extend(action + part for part in parts)
 
     deduped: list[str] = []
     seen: set[str] = set()
@@ -846,6 +817,139 @@ def _build_evidence_summary(resume: CanonicalResume) -> str:
     return "。".join(compact) + ("。" if compact else "")
 
 
+_STRUCTURED_ORG_SUFFIX = re.compile(
+    r"(?:大学|学院|学校|医院|公司|集团|研究院|实验室|中心|部门|协会|学会|"
+    r"学生会|社团|委员会|事务所|银行|基金会|工作室|团队)(?:\d+)?$"
+)
+_SCHOOL_SUFFIX = re.compile(r"(?:大学|学院|学校|研究院)(?:\d+)?")
+_NON_SCHOOL_SENTENCE = re.compile(
+    r"(?:准备找|求职|岗位|工作|简历|马上要毕业|已经毕业|毕业了|开始准备|"
+    r"相关的工作|专业硕士|专业博士)"
+)
+_NON_MAJOR_SENTENCE = re.compile(
+    r"(?:准备找|求职|岗位|工作|简历|马上要毕业|已经毕业|毕业了|开始准备|"
+    r"最近开始)"
+)
+
+
+def _clean_structured_organization(value: str) -> str:
+    """Remove narrative wrappers from an otherwise explicit organization."""
+
+    text = re.sub(r"\s+", " ", str(value or "")).strip(" ，,。；;")
+    candidate = re.sub(
+        r"^(?:我)?(?:目前)?(?:就职于|任职于|供职于|就读于|就读|毕业于|来自|在)\s*",
+        "",
+        text,
+    ).strip()
+    if candidate != text and _STRUCTURED_ORG_SUFFIX.search(candidate):
+        return candidate
+    return text
+
+
+def _clean_education_fields(item: dict) -> None:
+    """Keep grounded education facts while rejecting sentence fragments.
+
+    Evidence substring checks alone cannot distinguish a school name from a
+    nearby sentence such as “马上要毕业了”. This grammar-level cleanup is
+    profession-independent and only normalizes explicit education syntax.
+    """
+
+    school = _clean_structured_organization(str(item.get("school", "") or ""))
+    school_match = _SCHOOL_SUFFIX.search(school)
+    if school_match:
+        school = school[:school_match.end()].strip()
+    elif _NON_SCHOOL_SENTENCE.search(school) or len(school) > 50:
+        school = ""
+    item["school"] = school
+
+    major = re.sub(r"\s+", " ", str(item.get("major", "") or "")).strip(" ，,。；;")
+    explicit_major = re.search(
+        r"(?:攻读|就读|读)\s*([^，,。；;]{2,40}?)(?:专业|方向)(?:硕士|博士|本科)?$",
+        major,
+    )
+    if explicit_major:
+        major = explicit_major.group(1).strip()
+    else:
+        major = re.sub(r"^(?:攻读|就读|读)\s*", "", major)
+        major = re.sub(r"专业(?:硕士|博士|本科)?$", "", major).strip()
+    if _NON_MAJOR_SENTENCE.search(major) or len(major) > 50:
+        major = ""
+    item["major"] = major
+
+
+def _drop_subsumed_education(records: list[dict]) -> list[dict]:
+    """Drop weak duplicate rows already represented by a richer row."""
+
+    fields = ("school", "degree", "major", "period")
+    signatures = [
+        {
+            field: re.sub(r"\s+", "", str(record.get(field, "") or "")).casefold()
+            for field in fields
+            if str(record.get(field, "") or "").strip()
+        }
+        for record in records
+    ]
+    retained: list[dict] = []
+    for index, record in enumerate(records):
+        signature = signatures[index]
+        subsumed = bool(signature) and any(
+            index != other_index
+            and len(other_signature) > len(signature)
+            and all(other_signature.get(field) == value for field, value in signature.items())
+            for other_index, other_signature in enumerate(signatures)
+        )
+        if not subsumed:
+            retained.append(record)
+    return retained
+
+
+def _coalesce_compatible_education(records: list[dict]) -> list[dict]:
+    """Merge complementary rows for the same school and qualification."""
+
+    fields = ("school", "degree", "major", "period")
+    merged: list[dict] = []
+    for record in records:
+        school = re.sub(r"\s+", "", str(record.get("school", "") or "")).casefold()
+        degree = re.sub(r"\s+", "", str(record.get("degree", "") or "")).casefold()
+        destination: dict | None = None
+        if school and degree:
+            for existing in merged:
+                existing_school = re.sub(
+                    r"\s+", "", str(existing.get("school", "") or "")
+                ).casefold()
+                existing_degree = re.sub(
+                    r"\s+", "", str(existing.get("degree", "") or "")
+                ).casefold()
+                if (school, degree) != (existing_school, existing_degree):
+                    continue
+                # Different renderings of the same graduation date (for
+                # example “预计2026年毕业” and “2026年”) describe one record.
+                # Distinct non-empty majors remain a real conflict.
+                conflicts = [
+                    field for field in ("major",)
+                    if str(record.get(field, "") or "").strip()
+                    and str(existing.get(field, "") or "").strip()
+                    and re.sub(r"\s+", "", str(record.get(field))).casefold()
+                    != re.sub(r"\s+", "", str(existing.get(field))).casefold()
+                ]
+                if not conflicts:
+                    destination = existing
+                    break
+        if destination is None:
+            merged.append(record)
+            continue
+        for field in fields:
+            if not str(destination.get(field, "") or "").strip() and str(
+                record.get(field, "") or ""
+            ).strip():
+                destination[field] = record[field]
+        incoming_period = str(record.get("period", "") or "").strip()
+        current_period = str(destination.get("period", "") or "").strip()
+        if incoming_period and len(incoming_period) > len(current_period):
+            destination["period"] = incoming_period
+    return merged
+
+
 def _compact_canonical(resume: CanonicalResume) -> CanonicalResume:
     """Remove blank records/items left by model repair or leakage cleanup."""
 
@@ -893,6 +997,12 @@ def _compact_canonical(resume: CanonicalResume) -> CanonicalResume:
         for item in data.get(section, []) or []:
             if not isinstance(item, dict):
                 continue
+            if section == "education":
+                _clean_education_fields(item)
+            elif "organization" in item:
+                item["organization"] = _clean_structured_organization(
+                    str(item.get("organization", "") or "")
+                )
             if section != "education":
                 item["bullets"] = list(dict.fromkeys(
                     str(v).strip() for v in item.get("bullets", []) if str(v).strip()
@@ -913,6 +1023,9 @@ def _compact_canonical(resume: CanonicalResume) -> CanonicalResume:
                 if any(identity):
                     record_indexes[identity] = len(cleaned)
                 cleaned.append(item)
+        if section == "education":
+            cleaned = _coalesce_compatible_education(cleaned)
+            cleaned = _drop_subsumed_education(cleaned)
         data[section] = cleaned
     data["summary"] = str(data.get("summary", "") or "").strip()
     compacted = CanonicalResume.model_validate(data)

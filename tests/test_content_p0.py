@@ -92,7 +92,7 @@ def test_compact_query_project_survives_deterministic_fallback():
     assert [item.name for item in resume.skills.items] == ["SQL", "Axure"]
 
 
-def test_compact_query_project_survives_full_no_cv_pipeline_and_atomizes():
+def test_compact_query_project_survives_full_no_cv_pipeline_as_complete_action():
     query = (
         "姓名程洛，电话13210008017，邮箱chengluo@example.com，"
         "上海交通大学软件工程本科09-2022到06-2026，"
@@ -106,7 +106,7 @@ def test_compact_query_project_survives_full_no_cv_pipeline_and_atomizes():
 
     assert len(result.resume.projects) == 1
     assert result.resume.projects[0].name == "课程选课系统项目"
-    assert result.resume.projects[0].bullets == ["负责需求分析", "负责原型设计"]
+    assert result.resume.projects[0].bullets == ["负责需求分析和原型设计"]
     assert "framework" not in result.resume_dict
 
 
@@ -286,6 +286,26 @@ def test_rejected_optimizer_wording_restores_original_bullet_instead_of_dropping
     grounded = _ground_optimizer_output(original, optimized, evidence)
 
     assert grounded.experience[0].bullets == ["参与课堂观察和作业批改。"]
+
+
+def test_trusted_optimizer_rewrite_still_passes_final_fact_grounder():
+    evidence = "负责用户调研并输出分析报告"
+    original = CanonicalResume.model_validate({
+        "experience": [{"bullets": [evidence]}],
+    })
+    optimized = original.model_copy(deep=True)
+    optimized.experience[0].bullets = [
+        "负责用户调研并输出分析报告，推动全国业绩提升50%"
+    ]
+
+    grounded = _ground_optimizer_output(
+        original,
+        optimized,
+        evidence,
+        trusted_rewrites={"experience[0].bullets[0]": evidence},
+    )
+
+    assert grounded.experience[0].bullets == [evidence]
 
 
 def test_grounded_original_summary_keeps_unique_fact_and_stays_complete():

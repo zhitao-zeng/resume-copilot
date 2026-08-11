@@ -469,11 +469,12 @@ def test_summary_prioritizes_grounded_quantified_achievement():
     ranked = _rank_resume_content(resume, "涂布工艺参数优化")
     compacted = _compact_canonical(ranked)
     assert "4.8%降至3.1%" in compacted.summary
-    assert 100 < len(compacted.summary) <= 220
+    assert len(compacted.summary) <= 100
+    assert compacted.summary.endswith("。")
     assert "4.8%降至3.1%" in compacted.projects[0].bullets[0]
 
 
-def test_compound_grounded_bullet_is_split_without_new_facts():
+def test_compound_grounded_bullet_preserves_action_result_chain():
     original = "负责企业数据平台需求调研、版本规划与跨团队推进，推动报表配置效率提升30%"
     resume = CanonicalResume.model_validate({
         "experience": [{
@@ -485,14 +486,44 @@ def test_compound_grounded_bullet_is_split_without_new_facts():
 
     atomized, provenance = _atomize_resume_bullets(resume)
 
-    assert atomized.experience[0].bullets == [
-        "负责企业数据平台需求调研",
-        "负责版本规划",
-        "负责跨团队推进",
-        "推动报表配置效率提升30%",
-    ]
-    assert set(provenance.values()) == {original}
-    assert all(path.startswith("experience[0].bullets[") for path in provenance)
+    assert atomized.experience[0].bullets == [original]
+    assert provenance == {}
+
+
+def test_narrative_education_fragments_are_normalized_and_deduplicated():
+    resume = CanonicalResume.model_validate({
+        "education": [
+            {"school": "北京邮电大学", "degree": "硕士", "major": "人工智能"},
+            {
+                "school": "我目前在北京邮电大学",
+                "degree": "硕士",
+                "major": "读人工智能专业",
+                "period": "2026年",
+            },
+            {
+                "school": "北京邮电大学",
+                "degree": "硕士",
+                "major": "",
+                "period": "预计2026年毕业",
+            },
+            {
+                "school": "马上要毕业了",
+                "degree": "硕士",
+                "major": "最近开始准备找算法工程师相关的工作",
+            },
+        ],
+        "experience": [{"organization": "在实验室", "bullets": ["负责模型训练"]}],
+    })
+
+    compacted = _compact_canonical(resume)
+
+    assert [item.model_dump() for item in compacted.education] == [{
+        "school": "北京邮电大学",
+        "degree": "硕士",
+        "major": "人工智能",
+        "period": "预计2026年毕业",
+    }]
+    assert compacted.experience[0].organization == "实验室"
 
 
 def test_independent_project_with_bullets_has_no_false_missing_warnings():
