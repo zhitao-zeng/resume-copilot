@@ -9,7 +9,7 @@ import re
 import unicodedata
 from collections.abc import Mapping
 
-from source_adapter import candidate_blocks
+from source_adapter import _looks_like_record_body, candidate_blocks
 from v2_schemas import CanonicalResume, EvidenceBinding, SourceBlock, SourceBundle
 
 
@@ -181,6 +181,91 @@ def _strong_matching_blocks(
     return [block] if block is not None and similarity >= minimum else []
 
 
+_ROLE_FIELD_LABEL = re.compile(r"(?:岗位|职位|角色|职务)\s*[:：]")
+_ROLE_IDENTITY_VERB = re.compile(r"(?:担任|任职为|任职|作为|职位为|岗位为|曾任)\s*")
+_RECORD_DUTY_START = re.compile(
+    r"(?:^|[，,。；;|｜])\s*(?:负责|参与|主导|协助|支持|配合|完成|推动|推进|"
+    r"组织|设计|开发|构建|实现|制定|管理|运营|分析|研究|撰写|输出|交付|"
+    r"维护|优化|搭建|建立|开展|承担|提供|跟进|协调|带领|执行)"
+)
+_NON_ROLE_CONTEXT = re.compile(r"(?:熟悉|擅长|掌握|具备|负责|参与|协助|完成|开展)\s*$")
+
+
+def _flexible_literal(value: str) -> str:
+    return r"\s*".join(re.escape(char) for char in str(value or "").strip())
+
+
+def _role_block_is_valid(block: SourceBlock, value: str) -> bool:
+    """Require role evidence to occur in identity context, not a duty clause.
+
+    This is a field-type gate rather than an occupation dictionary.  It works
+    the same way for engineering, teaching, medicine and operations: a phrase
+    under ``负责/参与/...`` may support a bullet, but not a job title.
+    """
+
+    text = str(block.text or "").strip()
+    role = str(value or "").strip()
+    if not text or not role:
+        return False
+    literal = _flexible_literal(role)
+    occurrences = list(re.finditer(literal, text, re.IGNORECASE))
+    if not occurrences:
+        # Normalized OCR spacing may prevent positional analysis.  A clear body
+        # line is never sufficient role evidence; a non-body record header can
+        # still support the normalized title.
+        return not _looks_like_record_body(text) and bool(
+            block.section_hint in {"experience", "activities", "projects"}
+            or _normalize(text) == _normalize(role)
+        )
+
+    if re.search(rf"{_ROLE_FIELD_LABEL.pattern}\s*{literal}", text, re.IGNORECASE):
+        return True
+    if re.search(rf"{_ROLE_IDENTITY_VERB.pattern}{literal}", text, re.IGNORECASE):
+        return True
+
+    duty = _RECORD_DUTY_START.search(text)
+    for occurrence in occurrences:
+        prefix = text[max(0, occurrence.start() - 12):occurrence.start()]
+        if _NON_ROLE_CONTEXT.search(prefix):
+            continue
+        left = text[:occurrence.start()].rstrip()
+        right = text[occurrence.end():].lstrip()
+        if (
+            block.section_hint in {"experience", "activities", "projects"}
+            and (left.endswith(("|", "｜")) or right.startswith(("|", "｜")))
+        ):
+            # Delimited record headers such as ``公司｜运营专员｜日期``
+            # legitimately contain titles that are also verbs in other prose.
+            return True
+        if duty is not None and occurrence.start() >= duty.start():
+            continue
+        if block.section_hint in {"experience", "activities", "projects"}:
+            return True
+        if _normalize(text) == _normalize(role):
+            return True
+        # Compact unsectioned headers often combine organization, title and
+        # date on one line.  Accept only when no duty clause is present.
+        if duty is None and len(text) <= 100:
+            return True
+    return False
+
+
+def _bind_role(
+    path: str,
+    value: str,
+    blocks: list[SourceBlock],
+    *,
+    minimum: float = 0.65,
+) -> EvidenceBinding | None:
+    for block in _strong_matching_blocks(value, blocks, minimum=minimum):
+        if not _role_block_is_valid(block, value):
+            continue
+        binding = _bind(path, value, [block], minimum=minimum)
+        if binding is not None:
+            return binding
+    return None
+
+
 def _record_scope_key(
     block: SourceBlock,
     source: SourceBundle,
@@ -246,6 +331,11 @@ def _find_incoherent_records(
                 if not value:
                     continue
                 matching_blocks = _strong_matching_blocks(value, blocks, minimum=0.65)
+                if field == "role":
+                    matching_blocks = [
+                        block for block in matching_blocks
+                        if _role_block_is_valid(block, value)
+                    ]
                 field_scopes: set[str] = set()
                 for source_block in matching_blocks:
                     if source_block.section_hint:
@@ -298,12 +388,16 @@ def bind_resume_evidence(
     bindings: list[EvidenceBinding] = []
 
     def add(path: str, value: str, minimum: float = 0.22) -> None:
-        binding = _bind_with_provenance(
-            path,
-            value,
-            blocks,
-            minimum=minimum,
-            trusted_rewrites=trusted_rewrites,
+        binding = (
+            _bind_role(path, value, blocks, minimum=minimum)
+            if path.endswith(".role")
+            else _bind_with_provenance(
+                path,
+                value,
+                blocks,
+                minimum=minimum,
+                trusted_rewrites=trusted_rewrites,
+            )
         )
         if binding is not None:
             bindings.append(binding)

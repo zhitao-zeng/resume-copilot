@@ -92,6 +92,9 @@ _RESULT_CLAIMS = (
 )
 _SUMMARY_MAX_CHARS = 100
 _SUMMARY_MAX_SENTENCES = 4
+_INTERNAL_ADDITIONAL_SECTION = re.compile(
+    r"^(?:待整理(?:的)?原始(?:信息|经历)|教育经历补充)$"
+)
 
 _SKILL_CATEGORY_ALIASES = {
     "language": "language",
@@ -846,6 +849,33 @@ def _clean_structured_organization(value: str) -> str:
     return text
 
 
+_ROLE_WRAPPER = re.compile(
+    r"^(?:我|本人)?(?:目前|曾经|曾)?(?:担任|任职为|任职|作为|职位为|岗位为|是)\s*"
+)
+_DUTY_ONLY_ROLE = re.compile(
+    r"(?:单元|集成|功能|性能|接口|回归|压力|兼容性|验收|冒烟|安全)测试(?:工作|任务)?",
+    re.IGNORECASE,
+)
+
+
+def _clean_role_title(value: str, *, explicit: bool = False) -> str:
+    """Normalize role grammar and reject a task accidentally bound as a title.
+
+    Evidence presence alone is insufficient for typed fields: ``单元测试`` may
+    appear in a source bullet, but that does not make it a job title.  The guard
+    is deliberately grammatical and narrow rather than an industry dictionary.
+    Explicitly labelled fallback values still have their wrappers normalized;
+    canonical model output receives the stricter semantic check below.
+    """
+
+    text = re.sub(r"\s+", " ", str(value or "")).strip(" ，,。；;|｜:：")
+    text = re.sub(r"^(?:岗位|职位|角色|职务)\s*[:：]\s*", "", text)
+    text = _ROLE_WRAPPER.sub("", text).strip(" ，,。；;|｜:：")
+    if not explicit and _DUTY_ONLY_ROLE.fullmatch(text):
+        return ""
+    return text
+
+
 def _clean_education_fields(item: dict) -> None:
     """Keep grounded education facts while rejecting sentence fragments.
 
@@ -855,6 +885,7 @@ def _clean_education_fields(item: dict) -> None:
     """
 
     school = _clean_structured_organization(str(item.get("school", "") or ""))
+    school = re.sub(r"^(?:教育经历|教育背景|学历信息)\s*[:：]\s*", "", school)
     school_match = _SCHOOL_SUFFIX.search(school)
     if school_match:
         school = school[:school_match.end()].strip()
@@ -1007,6 +1038,21 @@ def _compact_canonical(resume: CanonicalResume) -> CanonicalResume:
                 item["bullets"] = list(dict.fromkeys(
                     str(v).strip() for v in item.get("bullets", []) if str(v).strip()
                 ))
+                if "role" in item:
+                    original_role = str(item.get("role", "") or "").strip()
+                    cleaned_role = _clean_role_title(original_role)
+                    item["role"] = cleaned_role
+                    if original_role and not cleaned_role:
+                        # Preserve the grounded duty as content instead of
+                        # silently deleting it after removing the bad field.
+                        normalized_role = re.sub(r"\W+", "", original_role).casefold()
+                        represented = any(
+                            normalized_role
+                            and normalized_role in re.sub(r"\W+", "", bullet).casefold()
+                            for bullet in item["bullets"]
+                        )
+                        if not represented:
+                            item["bullets"].insert(0, original_role)
             bullets = item.get("bullets", []) if section != "education" else []
             if any(str(item.get(field, "")).strip() for field in fixed_fields) or bullets:
                 identity = tuple(
@@ -1088,7 +1134,7 @@ def _organization_from_text(value: str) -> str:
 def _role_from_text(value: str, organization: str = "") -> str:
     labeled = _labeled_value(value, ("岗位", "职位", "角色", "职务"))
     if labeled:
-        return labeled
+        return _clean_role_title(labeled, explicit=True)
     # Identity normally appears before the first duty clause. Strip the period
     # and already-grounded organization so a greedy role regex cannot absorb
     # them from OCR-compressed headers.
@@ -1098,7 +1144,7 @@ def _role_from_text(value: str, organization: str = "") -> str:
         if identity:
             header = header.replace(identity, " ")
     header = re.sub(r"^[\s|｜:：\-—~至到]+|[\s|｜:：\-—~至到]+$", "", header)
-    return _first_match(_FALLBACK_ROLE, header)
+    return _clean_role_title(_first_match(_FALLBACK_ROLE, header))
 
 
 def _fallback_target_role(query_text: str, jd_text: str) -> str:
@@ -1113,6 +1159,14 @@ def _fallback_target_role(query_text: str, jd_text: str) -> str:
     )
     if not invalid:
         return extracted
+    labeled = re.search(
+        r"(?:目标岗位|应聘岗位|求职岗位|岗位)\s*(?:是|为|[:：])\s*"
+        r"([^\n，,。；;]{2,40})",
+        "\n".join(value for value in (query_text, jd_text) if value),
+        re.IGNORECASE,
+    )
+    if labeled:
+        return labeled.group(1).strip()
     embedded = re.search(
         r"(?:一个|目标(?:岗位)?\s*[:：]?)\s*"
         r"([A-Za-z0-9+.#/_\-\u4e00-\u9fff]{2,32}?)(?:的)?岗位(?:JD|描述)?",
@@ -1166,7 +1220,10 @@ def _fallback_record(section: str, lines: list[str]) -> tuple[dict, list[str]]:
     organization = _labeled_value(joined, ("公司", "单位", "组织", "机构", "学校"))
     if not organization:
         organization = _organization_from_text(joined)
-    role = _labeled_value(joined, ("岗位", "职位", "角色", "职务"))
+    role = _clean_role_title(
+        _labeled_value(joined, ("岗位", "职位", "角色", "职务")),
+        explicit=True,
+    )
     if not role:
         for line in lines:
             role = _role_from_text(line, organization)
@@ -1184,6 +1241,12 @@ def _fallback_record(section: str, lines: list[str]) -> tuple[dict, list[str]]:
             " ",
             residual,
         )
+        residual = re.sub(
+            r"^(?:我|本人)?(?:目前|曾经|曾)?(?:在|于|就职于|任职于|供职于|担任|任职为|作为)\s*",
+            "",
+            residual,
+        )
+        residual = re.sub(r"^(?:我|本人)?(?:在|于|担任|任职|作为)+\s*$", "", residual)
         residual = re.sub(r"^[\s|｜,，;；:：\-—~至到]+|[\s|｜,，;；:：\-—~至到]+$", "", residual)
         if len(re.sub(r"\W+", "", residual)) >= 2:
             bullets.append(residual)
@@ -1232,7 +1295,7 @@ def _fallback_record(section: str, lines: list[str]) -> tuple[dict, list[str]]:
     if raw_name in bullets:
         bullets.remove(raw_name)
     name = re.sub(
-        r"^(?:做过|参与|负责|主导|开发|设计|搭建|完成|开展)\s*",
+        r"^(?:我|本人)?(?:做过|参与|负责|主导|开发|设计|搭建|完成|开展)\s*",
         "",
         name,
     ).strip()
@@ -1329,7 +1392,7 @@ def _deterministic_fallback(cv_text: str, query_text: str, jd_text: str) -> Cano
         if any(record.values()):
             education.append(record)
         if leftovers:
-            additional.setdefault("教育经历补充", []).extend(leftovers)
+            additional.setdefault("补充信息", []).extend(leftovers)
 
     records: dict[str, list[dict]] = {name: [] for name in ("experience", "research", "activities", "projects")}
     for section in records:
@@ -1428,7 +1491,7 @@ def _deterministic_fallback(cv_text: str, query_text: str, jd_text: str) -> Cano
                 record, leftovers = _fallback_education([value])
                 education.append(record)
                 if leftovers:
-                    additional.setdefault("教育经历补充", []).extend(leftovers)
+                    additional.setdefault("补充信息", []).extend(leftovers)
                 unstructured_current = None
                 continue
             if explicit_work or (organization and period and compact_role):
@@ -1512,7 +1575,10 @@ def _deterministic_fallback(cv_text: str, query_text: str, jd_text: str) -> Cano
             )):
                 unclassified.append(value)
     if unclassified:
-        additional["待整理的原始信息"] = list(dict.fromkeys(unclassified))
+        # These blocks have already passed query/resume fact eligibility.  A
+        # neutral public section retains them without exposing an internal
+        # parser label or pretending that their semantic type is known.
+        additional["补充信息"] = list(dict.fromkeys(unclassified))
 
     return CanonicalResume.model_validate({
         "meta": {
@@ -1540,6 +1606,14 @@ def _deterministic_fallback(cv_text: str, query_text: str, jd_text: str) -> Cano
 def _canonical_to_v1_format(canonical: CanonicalResume) -> dict:
     """Bridge format for existing renderer compatibility."""
     data = canonical.model_dump()
+    additional = data.get("additional_sections")
+    if isinstance(additional, dict):
+        data["additional_sections"] = {
+            str(title).strip(): values
+            for title, values in additional.items()
+            if str(title).strip()
+            and not _INTERNAL_ADDITIONAL_SECTION.fullmatch(str(title).strip())
+        }
     # Rename organization → company for V1 renderer
     for exp in data.get("experience", []):
         if isinstance(exp, dict) and "organization" in exp:

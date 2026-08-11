@@ -82,6 +82,9 @@ _RESUME_SECTION_TITLES = {
     "科研经历", "校园与志愿经历", "项目经历", "教育经历", "专业技能",
     "论文成果", "荣誉与奖项", "个人技能",
 }
+_INTERNAL_ADDITIONAL_SECTION = re.compile(
+    r"^(?:待整理(?:的)?原始(?:信息|经历)|教育经历补充)$"
+)
 
 
 def _is_empty_profile_framework(resume_data: Any) -> bool:
@@ -1702,12 +1705,33 @@ def _collect_additional_sections(resume_data: dict[str, Any]) -> list[tuple[str,
     additional = resume_data.get("additional_sections", {}) if isinstance(resume_data, dict) else {}
     if isinstance(additional, dict):
         for title, values in additional.items():
-            if not str(title).strip() or not isinstance(values, list):
+            normalized_title = str(title).strip()
+            if (
+                not normalized_title
+                or _INTERNAL_ADDITIONAL_SECTION.fullmatch(normalized_title)
+                or not isinstance(values, list)
+            ):
                 continue
             clean = [str(value).strip() for value in values if str(value).strip()]
             if clean:
-                sections.append((str(title).strip(), clean))
+                sections.append((normalized_title, clean))
     return sections
+
+
+def _clear_docx_body_for_style_template(doc: DocxDocument) -> None:
+    """Remove example body content while retaining the template package.
+
+    Headers, footers, page geometry, theme, styles, numbering and section
+    properties live outside (or at the end of) the body content.  Rendering
+    into this sanitized document therefore follows a static DOCX style guide
+    substantially more closely than discarding it and creating a new file.
+    """
+
+    body = doc._element.body
+    for child in list(body):
+        if child.tag == qn("w:sectPr"):
+            continue
+        body.remove(child)
 
 
 def _render_docx_empty_profile_framework(
@@ -2289,11 +2313,36 @@ def render_docx(
                         template=template, _layout_retry=True,
                     )
                 return
-            # Style-guide template: fall through to built-in renderer
+            # A static DOCX still carries valuable page geometry, headers,
+            # footers, styles, theme and numbering.  Use it as the output
+            # package after removing example body copy instead of discarding it
+            # and silently switching to a brand-new built-in document.
             logger.info(
-                "Template %s has no tables/placeholders; using built-in renderer instead",
+                "Template %s has no tables/placeholders; rendering into preserved style package",
                 template_path.name,
             )
+            _clear_docx_body_for_style_template(doc)
+            _render_docx_classic(doc, resume_data)
+            if _layout_retry:
+                _apply_docx_compact_typography(doc)
+            _apply_docx_pagination_guards(doc)
+            doc.save(str(output_path))
+            _make_docx_cjk_portable(output_path)
+            actual_report = inspect_docx_layout(output_path)
+            logger.info(
+                "DOCX Visual QA: renderer=%s pages=%s issues=%s",
+                actual_report.get("renderer"),
+                actual_report.get("page_count"),
+                actual_report.get("issues"),
+            )
+            if _layout_needs_tightening(actual_report) and not _layout_retry:
+                render_docx(
+                    _layout_retry_data(resume_data, actual_report),
+                    output_path,
+                    template=template,
+                    _layout_retry=True,
+                )
+            return
 
     visual_report = (
         {"available": False, "issues": ["actual_docx_check_pending"]}

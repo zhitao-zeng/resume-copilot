@@ -8,4 +8,4 @@ inferenceVolumeMounts:
 
 inferenceImage:
   repository: "harbor-contest.4pd.io/zengzhitao/resume-copilot"
-  tag: "grounded-coherent-20260811-0949"
+  tag: "field-safe-template-20260811-1350"

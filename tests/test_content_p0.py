@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from docx import Document
+from docx.shared import Inches
 
 from evidence_binding import bind_resume_evidence, enforce_resume_evidence, measure_source_coverage
 from resume_composer import compose_from_query, compose_resume, compose_resume_with_outcome
@@ -17,9 +18,11 @@ from resume_validator import check_required_fields
 from source_adapter import build_source_bundle, candidate_blocks
 from v2_pipeline import (
     _compact_canonical,
+    _canonical_to_v1_format,
     _deterministic_fallback,
     _ground_bullets,
     _ground_optimizer_output,
+    _split_grounded_fact_bullet,
     run_v2_pipeline,
 )
 from v2_schemas import CanonicalResume, DraftResume, SourceBlock, SourceBundle
@@ -90,6 +93,135 @@ def test_compact_query_project_survives_deterministic_fallback():
     assert resume.projects[0].name == "课程选课系统项目"
     assert resume.projects[0].bullets == ["负责需求分析和原型设计"]
     assert [item.name for item in resume.skills.items] == ["SQL", "Axure"]
+
+
+def test_query_only_profile_keeps_dates_award_and_all_structured_facts():
+    query = (
+        "姓名：李然\n"
+        "我在星河科技公司担任产品经理，2021.03-2024.06，"
+        "负责用户调研、需求分析和产品方案设计，推动研发与测试按期上线。\n"
+        "我参与校园二手交易平台项目，负责竞品分析、原型设计和数据复盘。\n"
+        "我获得全国大学生创新创业大赛二等奖。\n"
+        "技能：Axure、SQL、Excel\n"
+        "教育经历：江南大学｜本科｜工业工程｜2017.09-2021.06"
+    )
+
+    resume = _compact_canonical(
+        _deterministic_fallback("", query, "目标岗位：产品经理")
+    )
+
+    assert resume.meta.name == "李然"
+    assert resume.meta.target_role == "产品经理"
+    assert resume.education[0].school == "江南大学"
+    assert resume.education[0].major == "工业工程"
+    assert resume.experience[0].organization == "星河科技公司"
+    assert resume.experience[0].role == "产品经理"
+    assert resume.experience[0].period == "2021.03-2024.06"
+    assert resume.experience[0].bullets == [
+        "负责用户调研、需求分析和产品方案设计",
+        "推动研发与测试按期上线",
+    ]
+    assert resume.projects[0].name == "校园二手交易平台项目"
+    assert resume.projects[0].bullets == ["负责竞品分析、原型设计和数据复盘"]
+    assert resume.awards == ["我获得全国大学生创新创业大赛二等奖"]
+    assert [item.name for item in resume.skills.items] == ["Axure", "SQL", "Excel"]
+    assert not any(title.startswith("待整理") for title in resume.additional_sections)
+
+
+def test_duty_phrase_cannot_survive_as_role_or_summary_identity():
+    resume = CanonicalResume.model_validate({
+        "experience": [
+            {
+                "organization": "字节跳动",
+                "role": "算法工程师",
+                "period": "2019-2021",
+                "bullets": ["负责模型开发"],
+            },
+            {
+                "role": "单元测试",
+                "period": "2017-2019",
+                "bullets": [
+                    "负责开发落地工作，熟练运用 TensorFlow、Caffe、Torch 等机器学习框架"
+                ],
+            },
+        ],
+    })
+
+    compact = _compact_canonical(resume)
+
+    assert compact.experience[1].role == ""
+    assert "单元测试" in compact.experience[1].bullets
+    assert "曾任字节跳动算法工程师、单元测试" not in compact.summary
+
+
+def test_role_evidence_must_come_from_identity_context_across_industries():
+    examples = (
+        ("某科技公司", "测试工程师", "单元测试"),
+        ("某实验学校", "语文教师", "课堂教学"),
+        ("某人民医院", "住院医师", "患者诊疗"),
+        ("某零售公司", "运营专员", "活动运营"),
+    )
+    for organization, valid_role, duty in examples:
+        source = build_source_bundle(
+            f"工作经历\n{organization}｜{valid_role}｜2022.01-2024.01\n负责{duty}并完成日常记录",
+            "",
+            "",
+        )
+        wrong = CanonicalResume.model_validate({
+            "experience": [{
+                "organization": organization,
+                "role": duty,
+                "period": "2022.01-2024.01",
+                "bullets": [f"负责{duty}并完成日常记录"],
+            }],
+        })
+        gated_wrong, wrong_bindings, _ = enforce_resume_evidence(wrong, source)
+        assert gated_wrong.experience[0].role == ""
+        assert gated_wrong.experience[0].bullets == [f"负责{duty}并完成日常记录"]
+        assert not any(binding.path.endswith(".role") for binding in wrong_bindings)
+
+        correct = CanonicalResume.model_validate({
+            "experience": [{
+                "organization": organization,
+                "role": valid_role,
+                "period": "2022.01-2024.01",
+                "bullets": [f"负责{duty}并完成日常记录"],
+            }],
+        })
+        gated_correct, correct_bindings, _ = enforce_resume_evidence(correct, source)
+        assert gated_correct.experience[0].role == valid_role
+        assert any(binding.path.endswith(".role") for binding in correct_bindings)
+
+
+def test_compound_tool_list_remains_one_coherent_bullet():
+    source = "负责开发落地工作，熟练运用 TensorFlow、Caffe、Torch 等机器学习框架"
+
+    assert _split_grounded_fact_bullet(source) == [source]
+
+
+def test_internal_raw_sections_are_not_public_resume_sections(tmp_path):
+    canonical = CanonicalResume.model_validate({
+        "meta": {"name": "候选人"},
+        "additional_sections": {
+            "待整理的原始信息": ["内部解析缓存，不应输出"],
+            "专业会员": ["某专业协会会员"],
+        },
+    })
+    payload = _canonical_to_v1_format(canonical)
+
+    assert "待整理的原始信息" not in payload["additional_sections"]
+    assert payload["additional_sections"] == {"专业会员": ["某专业协会会员"]}
+
+    # Renderer also filters defensively for callers that bypass the V2 bridge.
+    payload["additional_sections"]["待整理原始信息"] = ["仍然不应输出"]
+    output = tmp_path / "additional-sections.docx"
+    with patch("resume_renderer.inspect_docx_layout", return_value={"available": False, "issues": []}):
+        render_docx(payload, output, template="minimal")
+    text = _doc_text(output)
+    assert "待整理原始信息" not in text
+    assert "仍然不应输出" not in text
+    assert "专业会员" in text
+    assert "某专业协会会员" in text
 
 
 def test_compact_query_project_survives_full_no_cv_pipeline_as_complete_action():
@@ -430,3 +562,43 @@ def test_minimal_and_custom_docx_keep_cross_industry_sections(tmp_path):
     custom_text = _doc_text(custom)
     for expected in ("某医科大学", "某实验室", "志愿协会", "临床研究", "医学影像研究"):
         assert expected in custom_text
+
+
+def test_static_docx_template_preserves_style_package_and_replaces_sample_body(tmp_path):
+    template = tmp_path / "static-style-template.docx"
+    template_doc = Document()
+    template_doc.styles["Normal"].font.name = "Arial"
+    template_doc.sections[0].top_margin = Inches(1.05)
+    template_doc.sections[0].left_margin = Inches(0.92)
+    template_doc.sections[0].header.paragraphs[0].text = "CUSTOM TEMPLATE HEADER"
+    template_doc.sections[0].footer.paragraphs[0].text = "CUSTOM TEMPLATE FOOTER"
+    template_doc.add_paragraph("示例候选人内容（应替换）")
+    template_doc.save(template)
+
+    payload = {
+        "meta": {"name": "李明", "target_role": "产品经理"},
+        "summary": "具有真实的产品项目经历。",
+        "experience": [{
+            "company": "甲公司",
+            "role": "产品经理",
+            "period": "2022-2024",
+            "bullets": ["负责需求分析并推动版本上线"],
+        }],
+        "education": [],
+        "projects": [],
+        "skills": {},
+    }
+    output = tmp_path / "from-static-style.docx"
+    with patch("resume_renderer.inspect_docx_layout", return_value={"available": False, "issues": []}):
+        render_docx(payload, output, template=str(template))
+
+    rendered = Document(output)
+    text = _doc_text(output)
+    assert "李明" in text
+    assert "甲公司" in text
+    assert "示例候选人内容（应替换）" not in text
+    assert rendered.sections[0].header.paragraphs[0].text == "CUSTOM TEMPLATE HEADER"
+    assert rendered.sections[0].footer.paragraphs[0].text == "CUSTOM TEMPLATE FOOTER"
+    assert abs(rendered.sections[0].top_margin.inches - 1.05) < 0.01
+    assert abs(rendered.sections[0].left_margin.inches - 0.92) < 0.01
+    assert rendered.styles["Normal"].font.name == "Arial"

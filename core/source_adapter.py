@@ -61,7 +61,12 @@ _INLINE_PROJECT_FACT = re.compile(
     re.IGNORECASE,
 )
 _INLINE_EDUCATION_FACT = re.compile(
-    r"(?:大学|学院|学校|本科|硕士|博士|大专|专科|高中)",
+    # ``大学生`` is an identity word in awards such as ``全国大学生创新创业``;
+    # treating its ``大学`` substring as a school silently moves the award into
+    # education.  Institution suffixes and explicit qualifications are strong
+    # enough structural signals without that false positive.
+    r"(?:[一-鿿A-Za-z0-9·.&（）()_-]{1,40}(?:大学(?!生)|学院|学校|研究院)|"
+    r"本科|硕士|博士|大专|专科|高中)(?:在读|毕业)?",
     re.IGNORECASE,
 )
 _INLINE_EXPERIENCE_FACT = re.compile(
@@ -318,7 +323,14 @@ def build_source_bundle(
                 active_record_section = (
                     inferred_section if inferred_section in _RECORD_SECTIONS else ""
                 )
-            elif active_record_section and _looks_like_record_body(block.text):
+            elif active_record_section and (
+                _looks_like_record_body(block.text)
+                or bool(_RECORD_DATE.fullmatch(block.text.strip()))
+            ):
+                # Compact descriptions are often comma-delimited as
+                # ``company/role, period, action/result``.  Keep a standalone
+                # date with the active record so the following action does not
+                # become an orphaned query fact.
                 block.section_hint = active_record_section
             elif block.section_hint not in _RECORD_SECTIONS:
                 active_record_section = ""
