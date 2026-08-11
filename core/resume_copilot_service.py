@@ -66,6 +66,7 @@ from server_runtime import (
     set_request_deadline,
 )
 from prompts import REPLY_GENERATION_SYSTEM_PROMPT
+from diagnostic_trace import trace_event
 
 
 def _dicts(items: list[Any]) -> list[dict[str, Any]]:
@@ -286,18 +287,37 @@ def final_fact_guard(
     identified by the deterministic heuristic and never substitutes JD facts.
     """
     if not source_truth_text.strip():
+        trace_event(
+            "final_fact_guard_skipped",
+            reason="empty_candidate_truth",
+            resume_data=resume_data,
+        )
         return resume_data, FabricationReport(fabrication_found=False, details=[])
 
     data = resume_data
     report = check_fabrication_heuristic(source_truth_text, data)
-    for _ in range(max(1, int(max_iterations))):
+    trace_event(
+        "final_fact_guard_initial",
+        source_truth=source_truth_text,
+        resume_data=data,
+        report=report,
+    )
+    for iteration in range(max(1, int(max_iterations))):
         if not report.fabrication_found:
             break
         cleaned = _remove_fabricated_fields(data, report, source_truth_text)
+        trace_event(
+            "final_fact_guard_cleanup",
+            iteration=iteration + 1,
+            report=report,
+            before=data,
+            after=cleaned,
+        )
         if cleaned == data:
             break
         data = cleaned
         report = check_fabrication_heuristic(source_truth_text, data)
+    trace_event("final_fact_guard_result", resume_data=data, report=report)
     return data, report
 
 
@@ -832,6 +852,13 @@ async def _resume_copilot_service_impl(
     from v2_pipeline import run_v2_pipeline
     v2_result = await asyncio.to_thread(run_v2_pipeline, ctx.cv_text, ctx.query_text, ctx.jd_text)
     ctx.resume_data = v2_result.resume_dict
+    trace_event(
+        "service_v2_result",
+        resume=v2_result.resume,
+        resume_data=v2_result.resume_dict,
+        changes=v2_result.changes,
+        evidence_bindings=v2_result.evidence_bindings,
+    )
     ctx.perf["evidence_bindings"] = float(len(v2_result.evidence_bindings))
     ctx._write_debug(
         "07_evidence_bindings.json",
@@ -849,6 +876,11 @@ async def _resume_copilot_service_impl(
     from source_adapter import build_source_bundle, candidate_blocks
     truth_bundle = build_source_bundle(ctx.cv_text, ctx.query_text, ctx.jd_text)
     candidate_truth = "\n".join(block.text for block in candidate_blocks(truth_bundle))
+    trace_event(
+        "service_candidate_truth",
+        source_bundle=truth_bundle,
+        candidate_truth=candidate_truth,
+    )
     # Classification happens before the resume is parsed.  Reconcile it with
     # grounded structured fields so a degree mention cannot outweigh several
     # years of full-time work (and internships still remain student evidence).
@@ -906,9 +938,25 @@ async def _resume_copilot_service_impl(
     ctx.audit_report = {"overall_score": 0, "issues": [], "summary": ""}
 
     ctx = await stage_prepare_report(ctx)
+    trace_event(
+        "service_report",
+        resume_data=ctx.resume_data,
+        fabrication_report=ctx.fabrication_report,
+        missing_fields=ctx.missing_fields,
+        conflicts=ctx.conflicts,
+        changes=ctx.changes,
+        quality_report=ctx.quality_report,
+        reply_text=ctx.reply_text,
+    )
 
     t_render = time.perf_counter()
     ctx = await stage_render(ctx)
+    trace_event(
+        "service_rendered",
+        resume_data=ctx.resume_data,
+        reply_text=ctx.reply_text,
+        files=ctx.files,
+    )
     logger.info("stage_render done in %.1fs", time.perf_counter() - t_render)
 
     return ResumeCopilotResponse(

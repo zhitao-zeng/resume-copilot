@@ -9,4 +9,4 @@ inferenceVolumeMounts:
 
 inferenceImage:
   repository: "harbor-contest.4pd.io/zengzhitao/resume-copilot"
-  tag: "field-safe-template-20260811-1350"
+  tag: "diagnostic-fulltrace-20260811-165019"

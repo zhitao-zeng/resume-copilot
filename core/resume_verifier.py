@@ -17,6 +17,7 @@ from v2_schemas import (
     SourceBundle, DraftResume, VerifiedResult, CanonicalResume,
     Change, Meta, Education, Experience, Project,
 )
+from diagnostic_trace import trace_event
 
 logger = logging.getLogger(__name__)
 
@@ -223,6 +224,14 @@ def verify_resume(source: SourceBundle, draft: DraftResume) -> VerifiedResult:
         "【DraftResume】\n"
         f"{draft_json}"
     )
+    trace_event(
+        "llm_verifier_request",
+        source=source,
+        draft=draft,
+        system_prompt=RESUME_VERIFIER_SYSTEM_PROMPT,
+        user_prompt=prompt,
+        max_tokens=4096,
+    )
 
     try:
         content = call_llm_text(
@@ -236,6 +245,7 @@ def verify_resume(source: SourceBundle, draft: DraftResume) -> VerifiedResult:
         return conservative_fallback()
 
     parsed = parse_json_content(content)
+    trace_event("llm_verifier_raw_response", content=content, parsed=parsed)
     if not isinstance(parsed, dict) or not parsed:
         logger.warning("ResumeVerifier JSON parse failed, content len=%d", len(content))
         return conservative_fallback()
@@ -467,6 +477,7 @@ def verify_resume(source: SourceBundle, draft: DraftResume) -> VerifiedResult:
     try:
         resume = CanonicalResume(**parsed)
         result = VerifiedResult(resume=resume)
+        trace_event("llm_verifier_final", result=result)
         return result
     except Exception as exc:
         logger.warning("ResumeVerifier output validation failed: %s", exc)

@@ -21,6 +21,7 @@ from llm_gateway import LLMDeadlineExceeded, parse_json_content
 from server_runtime import call_llm_text, llm_enabled
 from semantic_guard import review_entailment_batch
 from v2_schemas import CanonicalResume
+from diagnostic_trace import trace_event
 
 logger = logging.getLogger(__name__)
 
@@ -130,21 +131,22 @@ def _introduces_unsupported_fact(original: str, rewritten: str) -> bool:
     return False
 
 
-def _safe_rewrite(original: str, rewritten: str) -> bool:
+def _safe_rewrite_diagnostics(original: str, rewritten: str) -> tuple[bool, list[str]]:
     original = str(original or "").strip()
     rewritten = str(rewritten or "").strip()
+    reasons: list[str] = []
     if not original or not rewritten or len(rewritten) > max(220, len(original) * 3):
-        return False
+        reasons.append("empty_or_too_long")
     original_action = _action_level(original)
     rewritten_action = _action_level(rewritten)
     # Ownership is a candidate fact: it may neither be inflated nor weakened.
     if original_action and rewritten_action != original_action:
-        return False
+        reasons.append("ownership_level_changed")
     if len(original) >= 20 and len(rewritten) < max(12, int(len(original) * 0.58)):
-        return False
+        reasons.append("source_content_shrunk")
     original_numbers = _numeric_facts(original)
     if any(count > original_numbers[token] for token, count in _numeric_facts(rewritten).items()):
-        return False
+        reasons.append("new_numeric_fact")
     # Product/model/tool names are commonly Latin tokens.  A rewritten bullet
     # may normalize case, but it must not introduce a new named token that was
     # absent from its grounded input bullet.
@@ -152,13 +154,17 @@ def _safe_rewrite(original: str, rewritten: str) -> bool:
     original_latin = {token.casefold() for token in latin_pattern.findall(original)}
     rewritten_latin = {token.casefold() for token in latin_pattern.findall(rewritten)}
     if not rewritten_latin.issubset(original_latin):
-        return False
+        reasons.append("new_latin_token")
     if _introduces_unsupported_fact(original, rewritten):
-        return False
+        reasons.append("new_named_method_or_tool")
     for term in _UNSUPPORTED_RESULT_TERMS:
         if term in rewritten and term not in original:
-            return False
-    return True
+            reasons.append(f"new_result_claim:{term}")
+    return not reasons, reasons
+
+
+def _safe_rewrite(original: str, rewritten: str) -> bool:
+    return _safe_rewrite_diagnostics(original, rewritten)[0]
 
 
 def _rewrite_requires_semantic_review(original: str, rewritten: str) -> bool:
@@ -204,11 +210,28 @@ def _section_patch_proposals(
         proposed = patch.get("bullets")
         original = list(records[record_index].bullets)
         if not isinstance(proposed, list) or len(proposed) != len(original):
+            trace_event(
+                "optimizer_patch_shape_rejected",
+                section=section,
+                record_index=record_index,
+                original=original,
+                proposed=proposed,
+                reason="bullet_count_or_type_mismatch",
+            )
             continue
         for bullet_index, (before, after) in enumerate(zip(original, proposed)):
             before_text = str(before or "").strip()
             after_text = str(after or "").strip()
-            if after_text == before_text or not _safe_rewrite(before_text, after_text):
+            safe, reasons = _safe_rewrite_diagnostics(before_text, after_text)
+            trace_event(
+                "optimizer_proposal_hard_gate",
+                path=f"{section}[{record_index}].bullets[{bullet_index}]",
+                before=before_text,
+                after=after_text,
+                accepted=bool(after_text != before_text and safe),
+                reasons=(reasons if after_text != before_text else ["unchanged"]),
+            )
+            if after_text == before_text or not safe:
                 continue
             proposals.append(_RewriteProposal(
                 section=section,
@@ -308,14 +331,23 @@ def _optimize_batch(
     jd_text: str,
 ) -> dict[str, Any]:
     """Call and parse one independent optimizer batch in a worker thread."""
-
+    user_prompt = _build_optimizer_prompt(payload, jd_text)
+    trace_event(
+        "optimizer_batch_request",
+        payload=payload,
+        jd_text=jd_text,
+        system_prompt=OPTIMIZER_SYSTEM_PROMPT,
+        user_prompt=user_prompt,
+        max_tokens=4096,
+    )
     content = call_llm_text(
         OPTIMIZER_SYSTEM_PROMPT,
-        _build_optimizer_prompt(payload, jd_text),
+        user_prompt,
         temperature=0.0,
         max_tokens=4096,
     )
     parsed = parse_json_content(content)
+    trace_event("optimizer_batch_response", content=content, parsed=parsed)
     if not isinstance(parsed, dict) or not parsed:
         raise ValueError(f"Optimizer batch JSON parse failed, len={len(content)}")
     return parsed
@@ -464,10 +496,28 @@ def optimize_resume_with_provenance(
         # all-mode review is unavailable.
         if verdict is False or (high_risk and verdict is not True):
             semantic_rejected += 1
+            trace_event(
+                "optimizer_semantic_gate",
+                path=proposal.path,
+                before=proposal.before,
+                after=proposal.after,
+                high_risk=high_risk,
+                verdict=verdict,
+                accepted=False,
+            )
             continue
         records = getattr(optimized, proposal.section)
         records[proposal.record_index].bullets[proposal.bullet_index] = proposal.after
         trusted_rewrites[proposal.path] = proposal.before
+        trace_event(
+            "optimizer_semantic_gate",
+            path=proposal.path,
+            before=proposal.before,
+            after=proposal.after,
+            high_risk=high_risk,
+            verdict=verdict,
+            accepted=True,
+        )
 
     accepted = len(trusted_rewrites)
 

@@ -116,8 +116,12 @@ export LLM_TIMEOUT_SECONDS="${LLM_TIMEOUT_SECONDS:-300}"
 export DEFAULT_OUTPUT_FORMAT="${DEFAULT_OUTPUT_FORMAT:-docx}"
 export OUTPUT_DIR="${OUTPUT_DIR:-/root/app/output}"
 export RESUME_PIPELINE_VERSION="${RESUME_PIPELINE_VERSION:-v2}"
+# This immutable diagnostic build records the complete fictional benchmark
+# payload and each factual transformation under one task ID. Credential-like
+# mapping keys remain suppressed by diagnostic_trace.py.
+export RESUME_DIAGNOSTIC_TRACE="${RESUME_DIAGNOSTIC_TRACE:-1}"
 mkdir -p "$OUTPUT_DIR"
 cd /root/app
 
-log "vLLM 就绪, 启动 resume-copilot (port=$PORT)"
+log "vLLM 就绪, 启动 resume-copilot (port=$PORT, diagnostic_trace=$RESUME_DIAGNOSTIC_TRACE)"
 exec python3 main.py

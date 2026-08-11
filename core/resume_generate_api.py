@@ -41,6 +41,7 @@ from server_runtime import (
     set_request_deadline,
 )
 from security_utils import safe_child_path, safe_filename, safe_task_id
+from diagnostic_trace import reset_trace_id, set_trace_id, trace_event
 
 app = Flask(__name__)
 app.config["JSON_AS_ASCII"] = False
@@ -445,72 +446,98 @@ def _wait_vllm_ready(max_wait: float = 15.0, *, deadline_at: float | None = None
 
 def _execute_resume_job(task_id: str, form_data: Any, deadline_at: float) -> dict[str, Any]:
     """Execute one resume job inside an isolated child process."""
-
-    _wait_vllm_ready(deadline_at=deadline_at)
-    query = str(form_data.get("Query") or form_data.get("query") or "")
-    target_jd_text = str(form_data.get("target_jd") or "")
-    keys_summary = [f"{key}=<str:{len(str(form_data[key]))}c>" for key in form_data]
-    _json_logger.info(
-        "[%s] form keys: %d fields, %s",
-        task_id,
-        len(form_data),
-        ", ".join(keys_summary) if keys_summary else "(none)",
-    )
-
-    cv_path, cv_text = _extract_file_field(form_data, "cv", task_id)
-    cv_template_path = _save_upload_file(form_data.get("cv_template"), task_id, "cv_template")
-    jd_path, jd_text = _extract_file_field(form_data, "target_jd", task_id)
-    final_jd = jd_text or target_jd_text or ""
-
-    cv_upload = None
-    if cv_text and len(cv_text.strip()) > 5:
-        _json_logger.info("[%s] cv uses pre-extracted text (%d chars)", task_id, len(cv_text))
-        cv_upload = _MockUpload(None, "cv.txt", content=cv_text)
-    elif cv_path:
-        # Text extraction may legitimately be empty for an unsupported/blank
-        # document. The hard OCR error is propagated instead of retrying here.
-        cv_upload = _MockUpload(cv_path, Path(cv_path).name)
-
-    cv_template_upload = _MockUpload(cv_template_path, "template") if cv_template_path else None
-    jd_upload = _MockUpload(jd_path, Path(jd_path).name) if jd_path else None
-    is_url = bool(re.match(r"^https?://", final_jd.strip(), re.IGNORECASE)) if final_jd else False
-    target_jd_url = final_jd if is_url else None
-    jd_text_value = final_jd if final_jd and not is_url else None
-
-    _json_logger.info(
-        "[%s] calling resume_copilot_service | cv_upload=%s | has_jd=%s | query_chars=%d",
-        task_id,
-        "present" if cv_upload is not None else "NONE",
-        bool(jd_upload is not None or jd_text_value or target_jd_url),
-        len(query),
-    )
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    trace_token = set_trace_id(task_id)
     try:
-        response = loop.run_until_complete(
-            resume_copilot_service(
-                query=query,
-                cv=cv_upload,
-                cv_template=cv_template_upload,
-                target_jd=None,
-                target_jd_file=jd_upload,
-                target_jd_url=target_jd_url,
-                jd_text=jd_text_value,
-                jd_url=None,
-                template=DEFAULT_TEMPLATE,
-                hard_deadline_at=deadline_at,
-            )
+        _wait_vllm_ready(deadline_at=deadline_at)
+        query = str(form_data.get("Query") or form_data.get("query") or "")
+        target_jd_text = str(form_data.get("target_jd") or "")
+        keys_summary = [f"{key}=<str:{len(str(form_data[key]))}c>" for key in form_data]
+        _json_logger.info(
+            "[%s] form keys: %d fields, %s",
+            task_id,
+            len(form_data),
+            ", ".join(keys_summary) if keys_summary else "(none)",
         )
-    finally:
-        loop.close()
 
-    files = getattr(response, "files", {}) or {}
-    return {
-        "status": "done",
-        "summary": getattr(response, "reply_text", "") or "简历生成完成",
-        "generated_docx_path": str(files.get("docx", "") or ""),
-        "score": getattr(response, "score", "?"),
-    }
+        cv_path, cv_text = _extract_file_field(form_data, "cv", task_id)
+        cv_template_path = _save_upload_file(form_data.get("cv_template"), task_id, "cv_template")
+        jd_path, jd_text = _extract_file_field(form_data, "target_jd", task_id)
+        final_jd = jd_text or target_jd_text or ""
+        trace_event(
+            "request_input",
+            query=query,
+            extracted_cv=cv_text,
+            extracted_jd=final_jd,
+            has_cv_file=bool(cv_path),
+            has_template=bool(cv_template_path),
+            has_jd_file=bool(jd_path),
+            form_fields=list(form_data.keys()),
+        )
+
+        cv_upload = None
+        if cv_text and len(cv_text.strip()) > 5:
+            _json_logger.info("[%s] cv uses pre-extracted text (%d chars)", task_id, len(cv_text))
+            cv_upload = _MockUpload(None, "cv.txt", content=cv_text)
+        elif cv_path:
+            # Text extraction may legitimately be empty for an unsupported/blank
+            # document. The hard OCR error is propagated instead of retrying here.
+            cv_upload = _MockUpload(cv_path, Path(cv_path).name)
+
+        cv_template_upload = _MockUpload(cv_template_path, "template") if cv_template_path else None
+        jd_upload = _MockUpload(jd_path, Path(jd_path).name) if jd_path else None
+        is_url = bool(re.match(r"^https?://", final_jd.strip(), re.IGNORECASE)) if final_jd else False
+        target_jd_url = final_jd if is_url else None
+        jd_text_value = final_jd if final_jd and not is_url else None
+
+        _json_logger.info(
+            "[%s] calling resume_copilot_service | cv_upload=%s | has_jd=%s | query_chars=%d",
+            task_id,
+            "present" if cv_upload is not None else "NONE",
+            bool(jd_upload is not None or jd_text_value or target_jd_url),
+            len(query),
+        )
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            response = loop.run_until_complete(
+                resume_copilot_service(
+                    query=query,
+                    cv=cv_upload,
+                    cv_template=cv_template_upload,
+                    target_jd=None,
+                    target_jd_file=jd_upload,
+                    target_jd_url=target_jd_url,
+                    jd_text=jd_text_value,
+                    jd_url=None,
+                    template=DEFAULT_TEMPLATE,
+                    hard_deadline_at=deadline_at,
+                )
+            )
+        finally:
+            loop.close()
+
+        files = getattr(response, "files", {}) or {}
+        result = {
+            "status": "done",
+            "summary": getattr(response, "reply_text", "") or "简历生成完成",
+            "generated_docx_path": str(files.get("docx", "") or ""),
+            "score": getattr(response, "score", "?"),
+        }
+        trace_event(
+            "request_output",
+            resume_data=getattr(response, "resume_data", {}) or {},
+            reply_text=getattr(response, "reply_text", "") or "",
+            missing_fields=getattr(response, "missing_fields", []) or [],
+            conflicts=getattr(response, "conflicts", []) or [],
+            scenario=getattr(response, "scenario", ""),
+            result=result,
+        )
+        return result
+    except Exception as exc:
+        trace_event("request_error", error_type=type(exc).__name__, error=str(exc))
+        raise
+    finally:
+        reset_trace_id(trace_token)
 
 
 def _resume_job_child(connection, task_id: str, run_id: str, form_data: Any, deadline_at: float) -> None:

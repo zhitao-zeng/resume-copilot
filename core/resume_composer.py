@@ -25,6 +25,7 @@ from prompts import RESUME_COMPOSER_SYSTEM_PROMPT, GEN_COMPOSER_SYSTEM_PROMPT
 from server_runtime import call_llm_typed, llm_enabled, remaining_request_seconds
 from source_adapter import build_source_bundle, candidate_blocks
 from v2_schemas import SourceBlock, SourceBundle, DraftResume, CanonicalResume
+from diagnostic_trace import trace_event
 
 logger = logging.getLogger(__name__)
 
@@ -521,17 +522,25 @@ def _draft_has_candidate_content(draft: DraftResume) -> bool:
 
 def _compose_chunk(chunk: SourceBundle) -> DraftResume:
     """Run and validate one independent Composer request."""
-
+    user_prompt = _build_resume_prompt(chunk)
+    trace_event(
+        "composer_request",
+        source_blocks=chunk.blocks,
+        system_prompt=RESUME_COMPOSER_SYSTEM_PROMPT,
+        user_prompt=user_prompt,
+        max_tokens=_COMPOSER_MAX_TOKENS,
+    )
     parsed = call_llm_typed(
         DraftResume,
         RESUME_COMPOSER_SYSTEM_PROMPT,
-        _build_resume_prompt(chunk),
+        user_prompt,
         temperature=0.0,
         max_tokens=_COMPOSER_MAX_TOKENS,
     )
     if not isinstance(parsed, dict) or not parsed:
         raise ValueError("Composer returned an empty or invalid chunk")
     parsed_draft = DraftResume(**parsed)
+    trace_event("composer_response", parsed=parsed_draft)
     if candidate_blocks(chunk) and not _draft_has_candidate_content(parsed_draft):
         raise ValueError("Composer returned no candidate content for a factual chunk")
     return parsed_draft
@@ -709,6 +718,12 @@ def compose_from_query(query_text: str, jd_text: str) -> CanonicalResume:
 
     try:
         prompt, max_tokens = _prepare_generate_request(query_text, jd_text)
+        trace_event(
+            "generate_composer_request",
+            system_prompt=GEN_COMPOSER_SYSTEM_PROMPT,
+            user_prompt=prompt,
+            max_tokens=max_tokens,
+        )
         parsed = call_llm_typed(
             CanonicalResume,
             GEN_COMPOSER_SYSTEM_PROMPT,
@@ -724,7 +739,9 @@ def compose_from_query(query_text: str, jd_text: str) -> CanonicalResume:
         return CanonicalResume()
 
     try:
-        return CanonicalResume(**parsed)
+        result = CanonicalResume(**parsed)
+        trace_event("generate_composer_response", parsed=result)
+        return result
     except Exception as exc:
         logger.warning("GenerateComposer output validation failed: %s", exc)
         return CanonicalResume()

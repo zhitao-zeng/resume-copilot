@@ -32,6 +32,7 @@ from evidence_binding import (
     source_fact_units,
 )
 import resume_product_logic as product_logic
+from diagnostic_trace import trace_event
 
 logger = logging.getLogger(__name__)
 
@@ -196,12 +197,27 @@ def _closest_source_sentence(bullet: str, sentences: list[str]) -> tuple[str, fl
     return best, score, best_recall
 
 
-def _ground_bullet_value(value: str, sentences: list[str]) -> tuple[str, str]:
+def _ground_bullet_value(
+    value: str,
+    sentences: list[str],
+    *,
+    path: str = "",
+) -> tuple[str, str]:
     """Return ``(text, status)`` where status is accepted/restored/dropped."""
 
     source, generated_coverage, source_recall = _closest_source_sentence(value, sentences)
     if not source:
         logger.info("Dropped ungrounded bullet")
+        trace_event(
+            "bullet_grounding",
+            path=path,
+            candidate=value,
+            closest_source="",
+            generated_coverage=generated_coverage,
+            source_recall=source_recall,
+            status="dropped",
+            reasons=["no_source_match"],
+        )
         return "", "dropped"
     # If the model retained a recognizable source clause but added unsupported
     # material, restore the complete source sentence. Very weak matches are
@@ -209,15 +225,65 @@ def _ground_bullet_value(value: str, sentences: list[str]) -> tuple[str, str]:
     if generated_coverage < 0.58:
         if generated_coverage >= 0.18 and source_recall >= 0.45:
             logger.info("Restored source wording for weakly grounded bullet")
+            trace_event(
+                "bullet_grounding",
+                path=path,
+                candidate=value,
+                closest_source=source,
+                generated_coverage=generated_coverage,
+                source_recall=source_recall,
+                output=source,
+                status="restored",
+                reasons=["weak_generated_coverage_with_source_recall"],
+            )
             return source, "restored"
         logger.info("Dropped weakly grounded bullet")
+        trace_event(
+            "bullet_grounding",
+            path=path,
+            candidate=value,
+            closest_source=source,
+            generated_coverage=generated_coverage,
+            source_recall=source_recall,
+            status="dropped",
+            reasons=["weak_generated_coverage"],
+        )
         return "", "dropped"
     upgraded = _action_level(value) > _action_level(source)
     unsupported_result = any(term in value and term not in source for term in _RESULT_CLAIMS)
     unsupported_fact = _introduces_unsupported_fact(source, value)
     if upgraded or unsupported_result or unsupported_fact:
         logger.info("Restored source wording for over-claimed bullet")
+        reasons = []
+        if upgraded:
+            reasons.append("ownership_upgraded")
+        if unsupported_result:
+            reasons.append("unsupported_result_claim")
+        if unsupported_fact:
+            reasons.append("unsupported_named_fact")
+        trace_event(
+            "bullet_grounding",
+            path=path,
+            candidate=value,
+            closest_source=source,
+            generated_coverage=generated_coverage,
+            source_recall=source_recall,
+            output=source,
+            status="restored",
+            reasons=reasons,
+        )
         return source, "restored"
+    trace_event(
+        "bullet_grounding",
+        path=path,
+        candidate=value,
+        closest_source=source,
+        generated_coverage=generated_coverage,
+        source_recall=source_recall,
+        output=value,
+        status="accepted",
+        reasons=[],
+    )
     return value, "accepted"
 
 
@@ -244,7 +310,7 @@ def _ground_bullets(
                 # to its source, but it must never bypass the final truth gate.
                 # The external evaluator caught rewrites that were traceable to
                 # an original bullet while still adding unsupported claims.
-                safe_value, _status = _ground_bullet_value(value, sentences)
+                safe_value, _status = _ground_bullet_value(value, sentences, path=path)
                 if safe_value and safe_value not in safe_bullets:
                     safe_bullets.append(safe_value)
             record.bullets = safe_bullets
@@ -282,7 +348,7 @@ def _ground_optimizer_output(
                 # A semantic-review provenance entry is not evidence that every
                 # word in the rewrite is grounded. Always validate the emitted
                 # wording; keep provenance only after this check succeeds.
-                safe_value, status = _ground_bullet_value(value, sentences)
+                safe_value, status = _ground_bullet_value(value, sentences, path=path)
                 if status != "accepted" and bullet_index < len(before_bullets):
                     safe_value = str(before_bullets[bullet_index] or "").strip()
                     logger.info(
@@ -290,6 +356,13 @@ def _ground_optimizer_output(
                         section_name,
                         record_index,
                         bullet_index,
+                    )
+                    trace_event(
+                        "optimizer_patch_reverted",
+                        path=path,
+                        proposed=value,
+                        restored=safe_value,
+                        grounding_status=status,
                     )
                 if safe_value and safe_value not in safe_bullets:
                     safe_bullets.append(safe_value)
@@ -1931,12 +2004,19 @@ def run_v2_pipeline(
 ) -> VerifiedResult:
     """Run the V2 5-layer pipeline. Returns VerifiedResult or fallback."""
     t_start = time.perf_counter()
+    trace_event(
+        "v2_input",
+        cv_text=cv_text,
+        query_text=query_text,
+        jd_text=jd_text,
+    )
 
     # ── No CV: generate structured framework from query + JD ──
     if not cv_text or not cv_text.strip():
         logger.info("V2 | No CV — generating framework from query+JD")
         t_gen = time.perf_counter()
         resume = compose_from_query(query_text, jd_text)
+        trace_event("generate_composer_assembled", resume=resume)
         used_fallback = False
         if _is_empty_resume(resume) and query_text.strip():
             logger.warning("Generate composer produced an empty resume; using deterministic query fallback")
@@ -1993,6 +2073,7 @@ def run_v2_pipeline(
         resume = validate_resume(resume, source_text=query_text)
 
         evidence_source = build_source_bundle("", query_text, jd_text)
+        trace_event("source_bundle", source=evidence_source)
         resume, evidence_bindings, evidence_removed = enforce_resume_evidence(
             resume,
             evidence_source,
@@ -2014,7 +2095,7 @@ def run_v2_pipeline(
         resume_dict = _canonical_to_v1_format(resume)
         if not has_profile_records:
             resume_dict["framework"] = _empty_profile_framework(resume.meta.target_role)
-        return VerifiedResult(
+        final_result = VerifiedResult(
             resume=resume,
             changes=([Change(
                 path="*",
@@ -2027,14 +2108,23 @@ def run_v2_pipeline(
             resume_dict=resume_dict,
             evidence_bindings=evidence_bindings,
         )
+        trace_event(
+            "v2_final",
+            result=final_result,
+            evidence_removed=evidence_removed,
+            framework_mode=not has_profile_records,
+        )
+        return final_result
 
     # ── Has CV: full Composer → Verifier → Optimizer pipeline ──
     source = build_source_bundle(cv_text, query_text, jd_text)
+    trace_event("source_bundle", source=source)
     logger.info("V2 | SourceBundle: %d blocks (%.1fs)",
                 len(source.blocks), time.perf_counter() - t_start)
 
     t_composer = time.perf_counter()
     draft = compose_resume(source)
+    trace_event("composer_assembled_draft", draft=draft)
     logger.info("V2 | Composer done: %d edu, %d exp, %d res, %d proj (%.1fs)",
                 len(draft.education), len(draft.experience),
                 len(draft.research), len(draft.projects),
@@ -2043,6 +2133,11 @@ def run_v2_pipeline(
     t_verifier = time.perf_counter()
     candidate_evidence = "\n".join(block.text for block in candidate_blocks(source))
     result = _deterministic_verify_draft(source, draft)
+    trace_event(
+        "deterministic_verifier_result",
+        accepted=result is not None,
+        result=result,
+    )
     if result is None:
         fallback_candidate = None
         try:
@@ -2075,6 +2170,7 @@ def run_v2_pipeline(
             result = verify_resume(source, draft)
     else:
         logger.info("V2 | LLM Verifier skipped")
+    trace_event("verifier_selected_result", result=result)
     result.resume = _ground_bullets(result.resume, candidate_evidence)
     if _is_empty_resume(result.resume):
         logger.warning("V2 verifier produced an empty resume; using deterministic source fallback")
@@ -2137,7 +2233,9 @@ def run_v2_pipeline(
     trusted_rewrites: dict[str, str] = dict(atom_provenance)
     if _needs_optimizer(result.resume):
         before_optimizer = result.resume.model_copy(deep=True)
+        trace_event("optimizer_input_resume", resume=before_optimizer, jd_text=jd_text)
         optimization = optimize_resume_with_provenance(result.resume, jd_text)
+        trace_event("optimizer_outcome", outcome=optimization)
         result.resume = optimization.resume
         for path, source_value in optimization.trusted_rewrites.items():
             # A rewritten atom binds through the original compound source
@@ -2167,6 +2265,12 @@ def run_v2_pipeline(
     result.resume, _, evidence_removed = enforce_resume_evidence(
         result.resume,
         source,
+        trusted_rewrites=trusted_rewrites,
+    )
+    trace_event(
+        "post_optimizer_evidence_gate",
+        resume=result.resume,
+        removed_paths=evidence_removed,
         trusted_rewrites=trusted_rewrites,
     )
     result.changes.extend(
@@ -2258,5 +2362,12 @@ def run_v2_pipeline(
 
     logger.info("V2 | Total: %.1fs (Composer+Verifier+Validate+Format)",
                 time.perf_counter() - t_start)
+
+    trace_event(
+        "v2_final",
+        result=result,
+        source_coverage=coverage,
+        missing_source_blocks=missing_blocks,
+    )
 
     return result
