@@ -9,4 +9,4 @@ inferenceVolumeMounts:
 
 inferenceImage:
   repository: "harbor-contest.4pd.io/zengzhitao/resume-copilot"
-  tag: "fe8fdc0-field-completeness-star"
+  tag: "eb48f1c-grounded-richness-reply"
