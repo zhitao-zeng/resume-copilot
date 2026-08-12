@@ -1,4 +1,5 @@
 .git
+.codex
 .venv
 __pycache__
 *.pyc
