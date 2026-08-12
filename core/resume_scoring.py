@@ -141,7 +141,7 @@ def _compute_expression_score(resume_data: dict[str, Any], job_family: Optional[
     summary_score = 0.0
     summary = str(resume_data.get("summary", "")).strip()
     if summary:
-        if 20 <= len(summary) <= 100:
+        if len(summary) >= 20:
             summary_score = 5.0
             if job_family and any(kw in summary for kw in ("技术", "系统", "开发", "产品", "运营", "金融", "临床", "教学", "销售", "设计", "医疗")):
                 summary_score = 10.0

@@ -38,6 +38,9 @@ _SECTION_HEADINGS = {
     "个人简介", "个人总结", "基本信息", "求职信息", "工作经历", "工作/实习经历", "实习经历",
     "科研经历", "校园与志愿经历", "项目经历", "教育经历", "教育背景", "专业技能",
     "论文成果", "论文与专利成果", "荣誉与奖项", "个人技能", "培训与进修", "教学经历",
+    "PERSONAL INFORMATION", "CONTACT", "PROFILE", "PROFESSIONAL SUMMARY", "SUMMARY",
+    "WORK EXPERIENCE", "EMPLOYMENT HISTORY", "PROJECT EXPERIENCE", "RESEARCH EXPERIENCE",
+    "EDUCATION", "SKILLS", "CERTIFICATIONS", "AWARDS", "PUBLICATIONS", "TEACHING EXPERIENCE",
 }
 
 

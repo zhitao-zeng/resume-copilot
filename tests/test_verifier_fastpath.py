@@ -61,7 +61,7 @@ def _product_draft() -> DraftResume:
     })
 
 
-def test_complete_split_fields_skip_llm_verifier_despite_low_raw_coverage():
+def test_complete_split_fields_skip_llm_verifier_despite_imperfect_raw_coverage():
     source = build_source_bundle(
         PRODUCT_CV,
         "请根据目标JD优化我的简历，突出B端产品和数据分析能力。",
@@ -69,16 +69,16 @@ def test_complete_split_fields_skip_llm_verifier_despite_low_raw_coverage():
     )
     draft = _product_draft()
 
-    # This documents the original false negative: names can bind to their
-    # first duplicate occurrence, while education/job header lines are split
-    # into multiple canonical fields. The strict per-claim metric remains
-    # below the fast-path threshold even though every required field exists.
+    # Exact name occurrences now bind to the contact row instead of the
+    # document title.  The strict per-claim metric is still imperfect because
+    # education/job header lines are split into multiple canonical fields, so
+    # the structure-aware fast path remains necessary.
     raw_resume = CanonicalResume.model_validate(draft.model_dump())
     raw_coverage, _ = measure_source_coverage(
         source,
         bind_resume_evidence(raw_resume, source),
     )
-    assert raw_coverage < 0.80
+    assert 0.80 <= raw_coverage < 1.0
 
     result = _deterministic_verify_draft(source, draft)
     assert result is not None

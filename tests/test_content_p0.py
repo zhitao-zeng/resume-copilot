@@ -6,6 +6,7 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 from docx import Document
 from docx.shared import Inches
 
@@ -17,13 +18,16 @@ from resume_renderer import render_docx
 from resume_validator import check_required_fields
 from source_adapter import build_source_bundle, candidate_blocks
 from v2_pipeline import (
+    _build_evidence_summary,
     _compact_canonical,
     _canonical_to_v1_format,
     _deterministic_fallback,
     _expand_optimizer_provenance,
     _ground_bullets,
     _ground_optimizer_output,
+    _recover_grounded_source_structure,
     _recover_missing_record_facts,
+    _record_source_owners,
     _split_grounded_fact_bullet,
     run_v2_pipeline,
 )
@@ -195,6 +199,103 @@ def test_role_evidence_must_come_from_identity_context_across_industries():
         assert any(binding.path.endswith(".role") for binding in correct_bindings)
 
 
+def test_record_ownership_graph_uses_joint_period_and_body_evidence():
+    source = build_source_bundle(
+        "工作经历\n"
+        "甲公司｜产品经理｜2020.01-2022.01\n"
+        "负责旧版需求梳理并输出需求清单\n"
+        "甲公司｜产品经理｜2022.02-2024.01\n"
+        "负责新版用户访谈并输出产品方案",
+        "",
+        "",
+    )
+    resume = CanonicalResume.model_validate({
+        "experience": [
+            {
+                "organization": "甲公司",
+                "role": "产品经理",
+                "period": "2022.02-2024.01",
+                "bullets": ["负责新版用户访谈并输出产品方案"],
+            },
+            {
+                "organization": "甲公司",
+                "role": "产品经理",
+                "period": "2020.01-2022.01",
+                "bullets": ["负责旧版需求梳理并输出需求清单"],
+            },
+        ],
+    })
+
+    owners = _record_source_owners(resume, source)
+
+    assert owners[("experience", 0)].endswith(":1")
+    assert owners[("experience", 1)].endswith(":0")
+
+
+def test_record_ownership_graph_leaves_repeated_weak_identity_ambiguous():
+    source = build_source_bundle(
+        "工作经历\n"
+        "甲公司｜产品经理｜2020.01-2022.01\n负责需求分析\n"
+        "甲公司｜产品经理｜2022.02-2024.01\n负责需求分析",
+        "",
+        "",
+    )
+    ambiguous = CanonicalResume.model_validate({
+        "experience": [{"organization": "甲公司", "role": "产品经理"}],
+    })
+
+    assert _record_source_owners(ambiguous, source) == {}
+
+
+def test_record_ownership_graph_generalizes_across_typed_industry_records():
+    source = build_source_bundle(
+        "教育经历\n同济大学｜本科｜临床医学｜2014.09-2019.06\n"
+        "同济大学｜硕士｜公共卫生｜2019.09-2022.06\n"
+        "科研经历\n某医学中心｜慢病随访课题｜2021.01-2021.12\n完成随访数据复核\n"
+        "某医学中心｜影像分析课题｜2022.01-2022.12\n完成影像标注复核\n"
+        "校园经历\n学生会｜宣传部员｜2018.01-2018.12\n参与活动宣传\n"
+        "学生会｜宣传部长｜2019.01-2019.12\n负责活动统筹\n"
+        "项目经历\n门诊流程项目｜某医院｜项目成员｜2023.01-2023.06\n参与流程梳理\n"
+        "病历质量项目｜某医院｜项目负责人｜2023.07-2023.12\n负责病历抽查",
+        "",
+        "",
+    )
+    resume = CanonicalResume.model_validate({
+        "education": [
+            {"school": "同济大学", "degree": "硕士", "major": "公共卫生", "period": "2019.09-2022.06"},
+            {"school": "同济大学", "degree": "本科", "major": "临床医学", "period": "2014.09-2019.06"},
+        ],
+        "research": [
+            {"institution": "某医学中心", "topic": "影像分析课题", "period": "2022.01-2022.12", "bullets": ["完成影像标注复核"]},
+            {"institution": "某医学中心", "topic": "慢病随访课题", "period": "2021.01-2021.12", "bullets": ["完成随访数据复核"]},
+        ],
+        "activities": [
+            {"organization": "学生会", "role": "宣传部长", "period": "2019.01-2019.12", "bullets": ["负责活动统筹"]},
+            {"organization": "学生会", "role": "宣传部员", "period": "2018.01-2018.12", "bullets": ["参与活动宣传"]},
+        ],
+        "projects": [
+            {"name": "病历质量项目", "organization": "某医院", "role": "项目负责人", "period": "2023.07-2023.12", "bullets": ["负责病历抽查"]},
+            {"name": "门诊流程项目", "organization": "某医院", "role": "项目成员", "period": "2023.01-2023.06", "bullets": ["参与流程梳理"]},
+        ],
+    })
+
+    owners = _record_source_owners(resume, source)
+
+    expected_markers = {
+        "education": ("公共卫生", "临床医学"),
+        "research": ("影像分析课题", "慢病随访课题"),
+        "activities": ("宣传部长", "宣传部员"),
+        "projects": ("病历质量项目", "门诊流程项目"),
+    }
+    for section, markers in expected_markers.items():
+        for index, marker in enumerate(markers):
+            expected_record_id = next(
+                block.record_id for block in candidate_blocks(source)
+                if block.section_hint == section and marker in block.text
+            )
+            assert owners[(section, index)] == expected_record_id
+
+
 def test_leading_body_phrase_cannot_bind_as_role_across_industries():
     examples = (
         ("某科技公司", "测试工程师", "单元测试", "负责覆盖核心模块"),
@@ -350,7 +451,7 @@ def test_fabricated_bullet_with_short_shared_prefix_cannot_survive():
     assert "全国渠道增长" not in rendered
 
 
-def test_cross_company_identity_and_bullet_splice_is_removed_with_or_without_dates():
+def test_cross_company_splice_keeps_the_grounded_anchor_and_removes_foreign_fields():
     for source_text in (
         "工作经历\n甲公司｜产品经理｜2020.01-2022.01\n负责需求分析\n"
         "乙公司｜运营经理｜2022.02-2024.01\n负责活动运营",
@@ -365,8 +466,13 @@ def test_cross_company_identity_and_bullet_splice_is_removed_with_or_without_dat
             }],
         })
         gated, _bindings, removed = enforce_resume_evidence(resume, source)
-        assert gated.experience == []
-        assert "experience[0]" in removed
+        assert len(gated.experience) == 1
+        assert gated.experience[0].organization == "甲公司"
+        assert gated.experience[0].role == ""
+        assert gated.experience[0].bullets == []
+        assert "experience[0]" not in removed
+        assert "experience[0].role" in removed
+        assert "experience[0].bullets[0]" in removed
 
 
 def test_long_ocr_line_coverage_detects_each_omitted_fact():
@@ -731,6 +837,157 @@ def test_fact_ledger_uses_period_to_disambiguate_repeated_employer_and_role():
     assert recovered.experience[1].bullets == ["负责社群运营。"]
 
 
+def test_grounded_structure_recovers_one_complete_missing_record_only():
+    source = build_source_bundle(
+        "工作经历\n"
+        "甲公司｜产品经理｜2020.01-2021.01\n"
+        "负责需求分析并输出PRD。\n"
+        "乙公司｜运营专员｜2021.02-2023.01\n"
+        "负责活动策划并完成执行复盘。",
+        "",
+        "",
+    )
+    current = CanonicalResume.model_validate({
+        "experience": [{
+            "organization": "甲公司",
+            "role": "产品经理",
+            "period": "2020.01-2021.01",
+            "bullets": ["负责需求分析并输出PRD。"],
+        }],
+    })
+    fallback = CanonicalResume.model_validate({
+        "experience": [
+            current.experience[0].model_dump(),
+            {
+                "organization": "乙公司",
+                "role": "运营专员",
+                "period": "2021.02-2023.01",
+                "bullets": ["负责活动策划并完成执行复盘。"],
+            },
+        ],
+    })
+
+    recovered, stats = _recover_grounded_source_structure(
+        current, fallback, source,
+    )
+    gated, _, removed = enforce_resume_evidence(recovered, source)
+
+    assert stats.appended_records == 1
+    assert [item.organization for item in gated.experience] == ["甲公司", "乙公司"]
+    assert gated.experience[1].period == "2021.02-2023.01"
+    assert removed == []
+
+
+@pytest.mark.parametrize(
+    ("organization", "role", "period", "bullet"),
+    [
+        ("甲科技公司", "产品经理", "2021.01-2023.01", "负责用户调研并输出需求优先级清单。"),
+        ("乙中学", "语文教师", "2020.09-2024.06", "负责初中语文授课并跟踪阶段测评结果。"),
+        ("丙医院", "住院医师", "2019.07-2023.07", "负责门诊初步问诊并完成患者随访记录。"),
+        ("丁零售公司", "运营专员", "2022.03-2024.03", "负责会员活动策划并协调门店完成落地。"),
+    ],
+)
+def test_complete_record_recovery_generalizes_across_industries(
+    organization: str,
+    role: str,
+    period: str,
+    bullet: str,
+):
+    source = build_source_bundle(
+        f"工作经历\n{organization}｜{role}｜{period}\n{bullet}",
+        "",
+        "",
+    )
+    fallback = CanonicalResume.model_validate({
+        "experience": [{
+            "organization": organization,
+            "role": role,
+            "period": period,
+            "bullets": [bullet],
+        }],
+    })
+
+    recovered, stats = _recover_grounded_source_structure(
+        CanonicalResume(), fallback, source,
+    )
+    gated, _, removed = enforce_resume_evidence(recovered, source)
+
+    assert stats.appended_records == 1
+    assert len(gated.experience) == 1
+    assert gated.experience[0].organization == organization
+    assert gated.experience[0].role == role
+    assert gated.experience[0].bullets == [bullet]
+    assert removed == []
+
+
+def test_grounded_structure_does_not_create_incomplete_or_ambiguous_record():
+    source = build_source_bundle(
+        "工作经历\n甲公司｜产品经理\n负责需求分析并输出PRD。",
+        "",
+        "",
+    )
+    fallback = CanonicalResume.model_validate({
+        "experience": [{
+            "organization": "甲公司",
+            "role": "产品经理",
+            "bullets": ["负责需求分析并输出PRD。"],
+        }],
+    })
+
+    recovered, stats = _recover_grounded_source_structure(
+        CanonicalResume(), fallback, source,
+    )
+
+    assert recovered.experience == []
+    assert stats.appended_records == 0
+
+
+def test_grounded_structure_recovers_education_skills_certificates_and_awards():
+    source = build_source_bundle(
+        "教育经历\n北京大学｜公共卫生硕士｜2018.09-2021.06\n"
+        "专业技能\n流行病学调查\n统计分析\n"
+        "证书与资质\n医师资格证书\n"
+        "荣誉奖项\n优秀住院医师",
+        "",
+        "",
+    )
+    current = CanonicalResume.model_validate({
+        "education": [{
+            "school": "北京大学",
+            "degree": "硕士",
+            "period": "2018.09-2021.06",
+        }],
+        "skills": {"items": [{"name": "统计分析", "category": "other"}]},
+    })
+    fallback = CanonicalResume.model_validate({
+        "education": [{
+            "school": "北京大学",
+            "degree": "硕士",
+            "major": "公共卫生",
+            "period": "2018.09-2021.06",
+        }],
+        "skills": {"items": [
+            {"name": "流行病学调查", "category": "domain"},
+            {"name": "统计分析", "category": "other"},
+        ]},
+        "certifications": ["医师资格证书"],
+        "awards": ["优秀住院医师"],
+    })
+
+    recovered, stats = _recover_grounded_source_structure(
+        current, fallback, source,
+    )
+    gated, _, removed = enforce_resume_evidence(recovered, source)
+
+    assert gated.education[0].major == "公共卫生"
+    assert {item.name for item in gated.skills.items} == {"流行病学调查", "统计分析"}
+    assert gated.certifications == ["医师资格证书"]
+    assert gated.awards == ["优秀住院医师"]
+    assert stats.filled_fields == 1
+    assert stats.appended_values == 3
+    assert removed == []
+
+
 def test_fact_ledger_does_not_turn_a_short_role_header_into_a_bullet():
     source = build_source_bundle(
         "项目经历\n增长项目\n负责人\n负责活动策划与执行。",
@@ -767,7 +1024,7 @@ def test_grounded_original_summary_keeps_unique_fact_and_stays_complete():
     gated, _bindings, _removed = enforce_resume_evidence(resume, source)
     compacted = _compact_canonical(gated)
     assert "8年三甲医院临床经验" in compacted.summary
-    assert len(compacted.summary) <= 100
+    assert len(compacted.summary) <= 260
     assert compacted.summary.endswith("。")
 
 
@@ -786,6 +1043,38 @@ def test_summary_formats_machine_role_slug_and_bare_seniority_for_people():
     assert "Product PM" in compacted.summary
     assert "4年经验" in compacted.summary
     assert "product_pm" not in compacted.summary
+
+
+def test_summary_keeps_role_achievement_skills_and_education_before_generic_prose():
+    resume = CanonicalResume.model_validate({
+        "meta": {"target_role": "数据分析师", "work_experience": "4年"},
+        "summary": (
+            "具备良好的沟通能力和团队协作意识。"
+            "工作认真负责并保持持续学习。"
+            "能够适应不同业务环境并推进任务。"
+        ),
+        "experience": [{
+            "organization": "甲公司",
+            "role": "数据分析师",
+            "period": "2020.01-2024.01",
+            "bullets": ["分析120万条交易数据并输出经营看板，支持季度复盘。"],
+        }],
+        "education": [{"school": "乙大学", "major": "统计学", "degree": "本科"}],
+        "skills": {"items": [
+            {"name": "SQL", "category": "language"},
+            {"name": "Python", "category": "language"},
+            {"name": "Tableau", "category": "tool"},
+        ]},
+    })
+
+    summary = _build_evidence_summary(resume)
+
+    assert "曾任甲公司数据分析师" in summary
+    assert "120万条交易数据" in summary
+    assert "SQL、Python、Tableau" in summary
+    assert "乙大学" in summary and "统计学" in summary
+    assert len(summary) <= 260
+    assert summary.endswith("。")
 
 
 def test_new_required_rules_do_not_require_seniority_and_count_campus():

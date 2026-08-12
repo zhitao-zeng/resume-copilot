@@ -25,7 +25,7 @@ from v2_schemas import CanonicalResume, EvidenceBinding, SourceBundle
 
 
 _MAX_REQUIREMENTS = 10
-_MAX_UNREPRESENTED_ITEMS = 12
+_MAX_UNREPRESENTED_ITEMS = 24
 _MAX_REMOVED_ITEMS = 12
 _MAX_CLAIM_GAPS = 6
 _MAX_FOLLOW_UP_QUESTIONS = 6
@@ -170,6 +170,24 @@ def _requirement_core(value: str) -> str:
 
 def _looks_like_title_only(value: str) -> bool:
     text = value.strip().casefold()
+    has_obligation = bool(re.search(
+        r"(?:负责|参与|主导|推动|协助|支持|要求|必须|需要|具备|熟悉|掌握|能够|持有|"
+        r"responsible|required|must|proficient|familiar)",
+        text,
+        re.IGNORECASE,
+    ))
+    # Exported files often prepend a short document title such as
+    # "design JD". Because "design" is also a responsibility predicate, the
+    # generic extractor used to report that title as an unmet requirement.
+    document_title = bool(re.fullmatch(
+        r"(?:[\u4e00-\u9fffa-z0-9+.#/_\- ]{1,40}\s+)?"
+        r"(?:jd|job\s+description|职位描述|岗位描述|岗位说明书?)",
+        text,
+        re.IGNORECASE,
+    ))
+    if document_title:
+        return not has_obligation
+
     title_shape = bool(re.fullmatch(
         r"[\u4e00-\u9fffa-z0-9+.#/_\- ]{2,28}(?:岗位|职位|工程师|经理|专员|分析师|"
         r"设计师|顾问|医生|医师|教师|老师|研究员|intern|engineer|manager|analyst)",
@@ -181,12 +199,7 @@ def _looks_like_title_only(value: str) -> bool:
     # Domain words such as "开发/设计/分析" often form part of a role title.
     # Require an explicit obligation/action shell before treating a title-shaped
     # line as a genuine requirement sentence.
-    return not bool(re.search(
-        r"(?:负责|参与|主导|推动|协助|支持|要求|必须|需要|具备|熟悉|掌握|能够|持有|"
-        r"responsible|required|must|proficient|familiar)",
-        text,
-        re.IGNORECASE,
-    ))
+    return not has_obligation
 
 
 def extract_jd_requirements(jd_text: str, *, limit: int = _MAX_REQUIREMENTS) -> list[str]:
@@ -220,6 +233,15 @@ def extract_jd_requirements(jd_text: str, *, limit: int = _MAX_REQUIREMENTS) -> 
             for stop in _JD_STOP_HEADINGS
         ):
             in_relevant_section = False
+            continue
+        # A short machine label before the first real JD section (for example
+        # "design" or "product_pm") is a document title, not a candidate
+        # requirement. Inside an explicit requirements section, a bare skill
+        # such as "Python" remains eligible.
+        if (
+            not in_relevant_section
+            and re.fullmatch(r"[a-z][a-z0-9_-]{1,40}", heading_key)
+        ):
             continue
         if any(noise.casefold() in text.casefold() for noise in _JD_NOISE):
             # A mixed line may still contain a valid requirement after a
@@ -529,6 +551,37 @@ def _requirement_aspects(requirement: str) -> list[list[str]]:
         flags=re.IGNORECASE,
     )
     value = re.sub(r"\s+and\s+", "；", value, flags=re.IGNORECASE)
+    # “以及” is an unambiguous conjunction. Bare 和/与 are split only when an
+    # earlier comma/list delimiter has established an enumeration (A、B和C).
+    # This keeps exact gap reporting for JD lists without corrupting lexical
+    # words used by unrelated industries, such as 和平、中和、参与、与会.
+    value = re.sub(
+        r"(?<=[\u4e00-\u9fffA-Za-z0-9])以及(?=[\u4e00-\u9fffA-Za-z0-9])",
+        "；",
+        value,
+    )
+
+    def split_enumerated_conjunction(match: re.Match[str]) -> str:
+        prefix = value[:match.start()]
+        if not re.search(r"[，,；;、]", prefix):
+            return match.group(0)
+        conjunction = match.group(0)
+        previous = value[match.start() - 1:match.start()]
+        following = value[match.end():match.end() + 1]
+        if conjunction == "和" and (
+            previous in "共调中饱温亲柔缓总"
+            or following in "平谐解声睦蔼善气服"
+        ):
+            return conjunction
+        if conjunction == "与" and (previous in "参赠授" or following == "会"):
+            return conjunction
+        return "；"
+
+    value = re.sub(
+        r"(?<=[\u4e00-\u9fffA-Za-z0-9])(?:和|与)(?=[\u4e00-\u9fffA-Za-z0-9])",
+        split_enumerated_conjunction,
+        value,
+    )
     parts = [item.strip() for item in re.split(r"[，,；;、]+", value) if item.strip()]
     groups: list[list[str]] = []
     for part in parts:
@@ -657,22 +710,24 @@ def assess_jd_requirements(
             )
             question = ""
         elif status == "partial":
+            gap_text = "、".join(missing_aspects) or "直接事实与可核验结果"
             recommendation = (
-                f"JD重点“{_safe_excerpt(requirement, 72)}”目前只有相关证据，"
-                "请补清个人动作、责任边界、交付物和可核验结果。"
+                f"JD重点“{_safe_excerpt(requirement, 72)}”已有部分相关证据，"
+                f"但仍缺少“{gap_text}”；请只补充真实发生的个人动作、交付物或结果。"
             )
             question = (
-                f"你是否能补充与“{_safe_excerpt(requirement, 64)}”直接相关的真实经历，"
-                "包括你本人做了什么、如何做以及最终交付或结果？"
+                f"对于“{_safe_excerpt(requirement, 64)}”，当前已有部分证据，"
+                f"还需确认“{gap_text}”。若真实发生，请补充对应的个人行动和可核验结果。"
             )
         else:
+            gap_text = "、".join(missing_aspects) or "相关场景、个人行动与可核验结果"
             recommendation = (
                 f"JD重点“{_safe_excerpt(requirement, 72)}”在当前材料中未找到直接证据；"
-                "若确有相关经历请补充，未参与则不要写入简历。"
+                f"需优先确认“{gap_text}”。若确有相关经历请补充，未参与则不要写入简历。"
             )
             question = (
                 f"你是否有与“{_safe_excerpt(requirement, 64)}”相关的真实经历？"
-                "如有，请补充具体场景、个人行动、交付物和真实结果。"
+                f"如有，请围绕“{gap_text}”补充真实场景、个人行动、交付物和结果。"
             )
 
         requirement_id = "req_" + hashlib.sha1(
@@ -761,6 +816,31 @@ def _friendly_path(path: str) -> str:
     return path
 
 
+def _claim_record_label(resume: CanonicalResume, path: str) -> str:
+    """Resolve a bullet path to the exact record the user should amend."""
+
+    match = re.match(r"(experience|projects|research|activities)\[(\d+)]", path)
+    if not match:
+        return ""
+    section, raw_index = match.groups()
+    records = getattr(resume, section)
+    index = int(raw_index)
+    if index >= len(records):
+        return ""
+    record = records[index]
+    if section == "experience":
+        values = (record.organization, record.role)
+    elif section == "projects":
+        values = (record.name, record.role)
+    elif section == "research":
+        values = (record.institution, record.topic)
+    else:
+        values = (record.organization, record.role)
+    return "｜".join(dict.fromkeys(
+        str(value or "").strip() for value in values if str(value or "").strip()
+    ))
+
+
 def _claim_improvement_items(
     resume: CanonicalResume,
     source: SourceBundle,
@@ -780,12 +860,21 @@ def _claim_improvement_items(
             missing.append("交付物或结果")
         if not missing:
             continue
+        record_label = _claim_record_label(resume, claim["path"])
+        prompt_by_dimension = {
+            "个人行动": "你本人具体负责哪一步",
+            "方法或过程": "具体通过哪些步骤、工具或协作方式完成",
+            "交付物或结果": "最终产出了什么、如何验收，或产生了什么可核验影响",
+        }
+        exact_questions = "；".join(prompt_by_dimension[value] for value in missing)
+        location = f"{record_label}中的" if record_label else ""
         question = (
-            f"“{_safe_excerpt(text, 54)}”还可以补充{'、'.join(missing)}；"
-            "请只填写真实发生且能够核验的信息。"
+            f"{location}“{_safe_excerpt(text, 54)}”仍缺{'、'.join(missing)}。"
+            f"请补充：{exact_questions}；只填写真实发生且能够核验的信息。"
         )
         items.append({
             "canonical_field_path": claim["path"],
+            "record_label": record_label,
             "excerpt": _safe_excerpt(text, 120),
             "missing_dimensions": missing,
             "question": question,
@@ -841,15 +930,32 @@ def build_quality_report(
         for unit in missing_units[:_MAX_UNREPRESENTED_ITEMS]
     ]
 
-    unsupported = [
-        item for item in normalized_changes
-        if str(item.get("action", "")) in {"remove", "clear"}
-        and (
-            "evidence" in str(item.get("reason", "")).casefold()
-            or "unsupported" in str(item.get("reason", "")).casefold()
-            or "ground" in str(item.get("reason", "")).casefold()
-        )
-    ]
+    final_bound_paths = {binding.path for binding in bindings}
+    unsupported_by_path: dict[str, dict[str, Any]] = {}
+    for item in normalized_changes:
+        path = str(item.get("path", "")).strip()
+        reason = str(item.get("reason", "")).casefold()
+        if (
+            str(item.get("action", "")) not in {"remove", "clear"}
+            or not (
+                "evidence" in reason
+                or "unsupported" in reason
+                or "ground" in reason
+            )
+            or not path
+            or path == "*"
+            # Draft summaries are deliberately discarded and rebuilt from
+            # grounded final fields. Reporting each intermediate sentence as
+            # a removed fabrication produced alarming counts such as 10-15
+            # even when no final resume claim was unsupported.
+            or path.startswith("summary[")
+            # A path recovered later with a valid final binding was corrected,
+            # not omitted from the delivered resume.
+            or path in final_bound_paths
+        ):
+            continue
+        unsupported_by_path.setdefault(path, item)
+    unsupported = list(unsupported_by_path.values())
     removed_items = [
         {
             "canonical_field_path": str(item.get("path", "")),

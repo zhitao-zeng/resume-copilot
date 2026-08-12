@@ -8,6 +8,7 @@ import pytest
 
 from evidence_binding import bind_resume_evidence
 from quality_report import (
+    _requirement_aspects,
     assess_jd_requirements,
     build_quality_report,
     extract_jd_requirements,
@@ -118,6 +119,21 @@ def test_quality_report_lists_generated_items_removed_without_evidence():
                 reason="No candidate evidence binding",
             ),
             Change(
+                path="projects[0].bullets[1]",
+                action="remove",
+                reason="No candidate evidence binding",
+            ),
+            Change(
+                path="summary[0]",
+                action="remove",
+                reason="No candidate evidence binding",
+            ),
+            Change(
+                path="meta.name",
+                action="remove",
+                reason="No candidate evidence binding",
+            ),
+            Change(
                 path="experience[0].bullets[0]",
                 action="replace",
                 reason="Evidence-preserving wording optimization",
@@ -167,7 +183,130 @@ def test_dynamic_jd_requirements_distinguish_supported_partial_and_missing():
     assert _statuses(report) == ["supported", "partial", "missing"]
     partial = report["job_alignment"]["requirements"][1]
     assert partial["evidence"][0]["canonical_field_path"] == "experience[0].bullets[0]"
-    assert "竞品分析和需求优先级管理" in partial["missing_aspects"]
+    assert partial["missing_aspects"] == ["竞品分析", "需求优先级管理"]
+    assert any(
+        "当前已有部分证据" in question
+        and "竞品分析" in question
+        and "需求优先级管理" in question
+        for question in report["follow_up_questions"]
+    )
+
+
+def test_short_jd_document_title_is_not_reported_as_a_requirement():
+    jd_text = (
+        "design JD\n"
+        "岗位职责\n"
+        "1. 负责SaaS后台界面设计与组件规范维护\n"
+        "任职要求\n"
+        "2. 熟悉Figma"
+    )
+
+    assert extract_jd_requirements(jd_text) == [
+        "负责SaaS后台界面设计与组件规范维护",
+        "熟悉Figma",
+    ]
+    assert extract_jd_requirements(
+        "Senior Product Manager JD\n任职要求\n熟悉SQL"
+    ) == ["熟悉SQL"]
+    assert extract_jd_requirements(
+        "design\n岗位职责\n负责组件规范维护"
+    ) == ["负责组件规范维护"]
+
+
+def test_composite_jd_facets_can_be_supported_across_grounded_claims():
+    cv_text = (
+        "工作经历\n甲公司｜销售顾问\n"
+        "负责客户拓展、商机跟进和回款管理。\n"
+        "乙公司｜售前顾问\n负责方案演示与投标支持。"
+    )
+    requirement = "负责客户拓展、商机跟进以及回款管理，负责方案演示与投标支持"
+    source = build_source_bundle(cv_text, "", requirement)
+    resume = CanonicalResume.model_validate({
+        "experience": [
+            {
+                "organization": "甲公司",
+                "role": "销售顾问",
+                "bullets": ["负责客户拓展、商机跟进和回款管理。"],
+            },
+            {
+                "organization": "乙公司",
+                "role": "售前顾问",
+                "bullets": ["负责方案演示与投标支持。"],
+            },
+        ],
+    })
+
+    alignment = assess_jd_requirements(
+        requirement, "销售顾问", resume, bind_resume_evidence(resume, source), source,
+    )
+
+    assert [item["status"] for item in alignment["requirements"]] == ["supported"]
+    assert alignment["requirements"][0]["missing_aspects"] == []
+
+
+@pytest.mark.parametrize("fact", ["参与项目交付", "涉及数据分析", "负责组织与会人员签到"])
+def test_chinese_conjunction_splitting_preserves_lexical_words(fact: str):
+    source = build_source_bundle(f"工作经历\n甲公司｜项目专员\n{fact}", "", fact)
+    resume = CanonicalResume.model_validate({
+        "experience": [{
+            "organization": "甲公司",
+            "role": "项目专员",
+            "bullets": [fact],
+        }],
+    })
+
+    alignment = assess_jd_requirements(
+        fact, "项目专员", resume, bind_resume_evidence(resume, source), source,
+    )
+
+    assert [item["status"] for item in alignment["requirements"]] == ["supported"]
+
+
+@pytest.mark.parametrize(
+    "requirement",
+    [
+        "负责数据分析、维护和平谈判",
+        "负责工艺记录、开展中和反应",
+        "负责材料审核、组织与会人员签到",
+    ],
+)
+def test_enumerated_conjunction_does_not_split_lexical_compounds(requirement: str):
+    aspects = _requirement_aspects(requirement)
+
+    assert len(aspects) == 2
+    assert "；" not in aspects[-1][0]
+
+
+def test_spaced_numeric_unit_is_not_reported_as_missing_source_fact():
+    source = build_source_bundle(
+        "张晨 | 4年经验 | 13800000000\n工作经历\n甲公司｜产品经理｜2022-至今",
+        "",
+        "",
+    )
+    resume = CanonicalResume.model_validate({
+        "meta": {
+            "name": "张晨",
+            "work_experience": "4 年经验",
+            "phone": "13800000000",
+        },
+        "experience": [{
+            "organization": "甲公司",
+            "role": "产品经理",
+            "period": "2022-至今",
+        }],
+    })
+
+    report = build_quality_report(
+        source=source,
+        resume=resume,
+        evidence_bindings=bind_resume_evidence(resume, source),
+    )
+
+    excerpts = [
+        item["excerpt"]
+        for item in report["source_preservation"]["unrepresented_items"]
+    ]
+    assert "4年经验" not in excerpts
 
 
 def test_jd_only_request_returns_framework_report_without_fake_support():
@@ -377,6 +516,35 @@ def test_long_vague_claim_still_requests_method_and_result():
     assert gap["missing_dimensions"] == ["方法或过程", "交付物或结果"]
 
 
+def test_claim_improvement_names_exact_record_and_dimension_questions():
+    fact = "负责客户反馈整理、竞品分析和需求文档维护"
+    source = build_source_bundle(
+        f"工作经历\n星河科技｜产品助理｜2020.07-2022.06\n{fact}",
+        "",
+        "",
+    )
+    resume = CanonicalResume.model_validate({
+        "experience": [{
+            "organization": "星河科技",
+            "role": "产品助理",
+            "period": "2020.07-2022.06",
+            "bullets": [fact],
+        }],
+    })
+
+    report = build_quality_report(
+        source=source,
+        resume=resume,
+        evidence_bindings=bind_resume_evidence(resume, source),
+    )
+
+    gap = report["claim_improvement_opportunities"][0]
+    assert gap["record_label"] == "星河科技｜产品助理"
+    assert "具体通过哪些步骤、工具或协作方式完成" in gap["question"]
+    assert "最终产出了什么、如何验收" in gap["question"]
+    assert "只填写真实发生且能够核验的信息" in gap["question"]
+
+
 def test_custom_section_paths_and_duplicate_bindings_remain_stable():
     fact = "执行标准流程并记录处理结果"
     source = build_source_bundle(f"标准.A[版]\n{fact}", "", fact)
@@ -438,3 +606,65 @@ def test_quality_report_is_exposed_in_user_report_and_reply_details():
     assert "原始材料中未充分写入成稿的信息（1项）" in reply
     assert "建议补充回答" in reply
     assert "使用SQL的真实场景" in reply
+
+
+def test_reply_expands_jd_gaps_star_dimensions_and_all_reported_source_omissions():
+    quality_report = {
+        "job_alignment": {
+            "has_job_description": True,
+            "supported_requirement_count": 1,
+            "partial_requirement_count": 1,
+            "missing_requirement_count": 1,
+            "requirements": [
+                {
+                    "requirement": "负责经营分析并输出看板",
+                    "status": "partial",
+                    "missing_aspects": ["交付物或结果"],
+                },
+                {
+                    "requirement": "熟悉SQL",
+                    "status": "missing",
+                    "missing_aspects": ["SQL使用场景"],
+                },
+            ],
+            "recommendations": ["若确有SQL实践，请补充真实使用场景和交付结果。"],
+        },
+        "source_preservation": {
+            "unrepresented_item_count": 13,
+            "unrepresented_items": [
+                {"excerpt": f"原始事实{index}"} for index in range(1, 14)
+            ],
+        },
+        "claim_improvement_opportunities": [{
+            "record_label": "甲公司｜数据分析师",
+            "excerpt": "负责数据整理",
+            "missing_dimensions": ["方法或过程", "交付物或结果"],
+        }],
+        "fact_grounding": {"unsupported_item_count": 0},
+        "follow_up_questions": [],
+    }
+
+    reply = build_reply_text(
+        scenario="scenario3",
+        industry="互联网",
+        user_stage="职场人士",
+        missing_fields=[],
+        conflicts=[],
+        ocr_warnings=[],
+        direction="突出数据分析相关经历",
+        score_total=0,
+        targeted_suggestions=quality_report["job_alignment"]["recommendations"],
+        quality_report=quality_report,
+        resume_data={
+            "experience": [{"bullets": ["负责数据整理"]}],
+            "skills": {"languages": ["Python"]},
+        },
+    )
+
+    assert "1项有直接证据，1项仅部分匹配，1项尚无直接证据" in reply
+    assert "部分匹配：负责经营分析并输出看板；需补：交付物或结果" in reply
+    assert "未匹配：熟悉SQL；需补：SQL使用场景" in reply
+    assert "原始事实13" in reply
+    assert "经历表达仍可补充" in reply
+    assert "甲公司｜数据分析师" in reply
+    assert "方法或过程、交付物或结果" in reply

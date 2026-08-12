@@ -672,21 +672,55 @@ def _reply_detail_block(
         for item in unique_items:
             label = str(item.get("label") or item.get("field") or "字段").strip()
             field = str(item.get("field", ""))
-            indexed = re.match(r"(education|experience|projects)\[(\d+)]", field)
+            indexed = re.match(
+                r"(education|experience|research|activities|campus_experience|projects)\[(\d+)]",
+                field,
+            )
             if indexed:
-                noun = {"education": "段教育", "experience": "段经历", "projects": "个项目"}[indexed.group(1)]
+                noun = {
+                    "education": "段教育",
+                    "experience": "段工作/实习",
+                    "research": "段科研",
+                    "activities": "段校园/社会",
+                    "campus_experience": "段校园/社会",
+                    "projects": "个项目",
+                }[indexed.group(1)]
                 label += f"（第{int(indexed.group(2)) + 1}{noun}）"
             reason = str(item.get("reason", "")).strip()
             lines.append(f"- {label}：{reason}" if reason else f"- {label}")
     else:
         lines.append("- 未检测到必填信息缺失；仍建议核对联系方式、时间和成果数据。")
     lines.append("岗位匹配与建议：")
+    report = quality_report if isinstance(quality_report, dict) else {}
+    alignment = report.get("job_alignment", {})
+    if isinstance(alignment, dict) and alignment.get("has_job_description"):
+        supported = int(alignment.get("supported_requirement_count", 0) or 0)
+        partial = int(alignment.get("partial_requirement_count", 0) or 0)
+        missing = int(alignment.get("missing_requirement_count", 0) or 0)
+        lines.append(
+            f"- JD逐项核对：{supported}项有直接证据，{partial}项仅部分匹配，{missing}项尚无直接证据。"
+        )
+        gap_items = [
+            item for item in (alignment.get("requirements", []) or [])
+            if isinstance(item, dict) and item.get("status") in {"partial", "missing"}
+        ]
+        for item in gap_items[:5]:
+            requirement = str(item.get("requirement", "")).strip()
+            missing_aspects = [
+                str(value).strip() for value in (item.get("missing_aspects", []) or [])
+                if str(value).strip()
+            ]
+            if requirement:
+                suffix = (
+                    "；需补：" + "、".join(missing_aspects[:3])
+                    if missing_aspects else ""
+                )
+                lines.append(f"- {'部分匹配' if item.get('status') == 'partial' else '未匹配'}：{requirement}{suffix}。")
     if targeted_suggestions:
         lines.append("针对岗位的建议：")
         lines.extend(f"- {item}" for item in targeted_suggestions)
     else:
         lines.append("- 暂无足够岗位信息形成具体匹配结论；提供完整JD后可进一步优化关键词与经历排序。")
-    report = quality_report if isinstance(quality_report, dict) else {}
     preservation = report.get("source_preservation", {})
     unrepresented = (
         preservation.get("unrepresented_items", [])
@@ -695,12 +729,14 @@ def _reply_detail_block(
     if unrepresented:
         total = int(preservation.get("unrepresented_item_count", len(unrepresented)) or 0)
         lines.append(f"原始材料中未充分写入成稿的信息（{total}项）：")
-        for item in unrepresented[:8]:
+        for item in unrepresented:
             if not isinstance(item, dict):
                 continue
             excerpt = str(item.get("excerpt", "")).strip()
             if excerpt:
                 lines.append(f"- {excerpt}")
+        if total > len(unrepresented):
+            lines.append(f"- 另有 {total - len(unrepresented)} 项未在报告中展开，建议对照原始材料复核。")
     grounding = report.get("fact_grounding", {})
     if isinstance(grounding, dict):
         unsupported_count = int(grounding.get("unsupported_item_count", 0) or 0)
@@ -708,6 +744,24 @@ def _reply_detail_block(
             lines.append(
                 f"为避免编造，已移除 {unsupported_count} 处缺少候选人事实依据的生成内容。"
             )
+    improvement_items = report.get("claim_improvement_opportunities", [])
+    if isinstance(improvement_items, list) and improvement_items:
+        lines.append("经历表达仍可补充：")
+        for item in improvement_items[:6]:
+            if not isinstance(item, dict):
+                continue
+            record_label = str(item.get("record_label", "")).strip()
+            excerpt = str(item.get("excerpt", "")).strip()
+            dimensions = [
+                str(value).strip() for value in (item.get("missing_dimensions", []) or [])
+                if str(value).strip()
+            ]
+            if excerpt and dimensions:
+                location = f"{record_label}：" if record_label else ""
+                lines.append(
+                    f"- {location}“{excerpt}”缺少{'、'.join(dimensions)}；"
+                    "仅在有真实信息时补充。"
+                )
     follow_ups = report.get("follow_up_questions", [])
     if isinstance(follow_ups, list) and follow_ups:
         lines.append("建议补充回答：")
@@ -784,6 +838,17 @@ def _reply_result_block(
             for item in (data.get(section, []) or [])
             if isinstance(item, dict)
         )
+        skills = data.get("skills", {})
+        skill_count = (
+            sum(len(value) for value in skills.values() if isinstance(value, list))
+            if isinstance(skills, dict) else 0
+        )
+        structured_count = sum(
+            len(data.get(section, []) or [])
+            for section in (
+                "awards", "certifications", "publications", "patents", "training", "teaching",
+            )
+        )
         counts = []
         for count, label in (
             (education_count, "段教育经历"),
@@ -791,6 +856,8 @@ def _reply_result_block(
             (project_count, "个项目"),
             (campus_count, "段校园/社会经历"),
             (bullet_count, "条职责与成果描述"),
+            (skill_count, "项专业技能"),
+            (structured_count, "项证书/奖项/专业成果"),
         ):
             if count:
                 counts.append(f"{count}{label}")

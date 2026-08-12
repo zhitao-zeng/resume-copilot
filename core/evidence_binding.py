@@ -9,7 +9,7 @@ import re
 import unicodedata
 from collections.abc import Mapping
 
-from source_adapter import _looks_like_record_body, candidate_blocks
+from source_adapter import _is_section_heading, _looks_like_record_body, candidate_blocks
 from v2_schemas import CanonicalResume, EvidenceBinding, SourceBlock, SourceBundle
 
 
@@ -24,6 +24,14 @@ _SOURCE_HEADINGS = {
     "培训经历", "进修经历", "教学经历", "授课经历", "培养经历",
     "学术会议", "会议经历", "专业会员", "专业组织", "专著", "作品集", "作品经历",
 }
+_SOURCE_DOCUMENT_TITLE = re.compile(
+    r"^(?:[\u4e00-\u9fff·]{2,16}|[A-Za-z][A-Za-z .'-]{1,40})?(?:个人)?(?:简历|履历)$",
+    re.IGNORECASE,
+)
+_SOURCE_NON_FACTUAL_COPY = re.compile(
+    r"^(?:候选人)?具备清晰的问题拆解和执行闭环能力$|"
+    r"^过往经历以真实岗位职责和结果为准$"
+)
 
 _NON_RECORD_SECTION_HINTS = {
     "summary", "skills", "awards", "publications", "patents",
@@ -91,7 +99,16 @@ def _best_block(value: str, blocks: list[SourceBlock]) -> tuple[SourceBlock | No
     normalized_value = _normalize(value)
     if not normalized_value:
         return None, 0.0, "rewritten"
+    # Prefer the exact field occurrence over an earlier document title such
+    # as “张晨简历”.  Otherwise the name binds to a layout-only block and the
+    # actual contact-row name is incorrectly reported as unrepresented.
     for block in blocks:
+        if normalized_value == _normalize(block.text):
+            mode = "direct" if str(value).casefold() == block.text.casefold() else "normalized"
+            return block, 1.0, mode
+    for block in blocks:
+        if _SOURCE_DOCUMENT_TITLE.fullmatch(block.text.strip()):
+            continue
         if normalized_value in _normalize(block.text):
             mode = "direct" if str(value).casefold() in block.text.casefold() else "normalized"
             return block, 1.0, mode
@@ -250,8 +267,12 @@ _RECORD_DUTY_START = re.compile(
 )
 _NON_ROLE_CONTEXT = re.compile(r"(?:熟悉|擅长|掌握|具备|负责|参与|协助|完成|开展)\s*$")
 _ROLE_HEADER_CONTEXT = re.compile(
-    r"(?:19|20)\d{2}|(?:大学|学院|学校|医院|公司|企业|集团|研究院|实验室|中心|"
+    r"(?:19|20)\d{2}|(?:大学|学院|学校|中学|小学|幼儿园|医院|公司|企业|集团|研究院|实验室|中心|"
     r"部门|协会|学会|学生会|社团|委员会|事务所|律所|银行|政府|基金会|工作室|团队|基地)"
+)
+_RELATION_ONLY_ROLE = re.compile(
+    r"^(?:指导老师|指导教师|导师|项目导师|论文导师|推荐人|联系人)$",
+    re.IGNORECASE,
 )
 
 
@@ -270,6 +291,8 @@ def _role_block_is_valid(block: SourceBlock, value: str) -> bool:
     text = str(block.text or "").strip()
     role = str(value or "").strip()
     if not text or not role:
+        return False
+    if _RELATION_ONLY_ROLE.fullmatch(role):
         return False
     literal = _flexible_literal(role)
     occurrences = list(re.finditer(literal, text, re.IGNORECASE))
@@ -314,6 +337,13 @@ def _role_block_is_valid(block: SourceBlock, value: str) -> bool:
                 continue
         if duty is not None and occurrence.start() >= duty.start():
             continue
+        if duty is not None and _ROLE_HEADER_CONTEXT.search(text[:occurrence.start()]):
+            # Compact source rows may have inherited a wrong or empty section
+            # hint from OCR/layout parsing.  A value before the first duty clause
+            # with a date/employer in its left context is still strong structural
+            # identity evidence.  Duty nouns such as ``单元测试`` occur after the
+            # clause marker and remain rejected by the check above.
+            return True
         if block.section_hint in {"experience", "activities", "projects"}:
             return True
         if _normalize(text) == _normalize(role):
@@ -548,6 +578,110 @@ def _possible_record_scopes(
     return set.intersection(*options)
 
 
+def _value_record_scopes(
+    value: str,
+    *,
+    section: str,
+    source: SourceBundle,
+    blocks: list[SourceBlock],
+    role: bool = False,
+    minimum: float = 0.65,
+) -> set[str]:
+    matching = _strong_matching_blocks(value, blocks, minimum=minimum)
+    if role:
+        matching = [item for item in matching if _role_block_is_valid(item, value)]
+    return {
+        scope
+        for item in matching
+        if (scope := _record_scope_key(item, source, section))
+    }
+
+
+def _anchored_record_scope(
+    record,
+    *,
+    section: str,
+    source: SourceBundle,
+    blocks: list[SourceBlock],
+) -> str | None:
+    """Choose one source record from identity/period evidence only.
+
+    Bullets are intentionally excluded: one optimizer or Composer sentence can
+    be attached to the wrong row, but that must not outweigh a matching project
+    name, employer or period and cause deletion of the complete grounded record.
+    """
+
+    primary_fields = {
+        "education": ("school",),
+        "experience": ("organization",),
+        "research": ("institution", "topic"),
+        "activities": ("organization",),
+        "projects": ("name",),
+    }[section]
+    secondary_fields = {
+        "education": ("degree", "major"),
+        "experience": ("role",),
+        "research": (),
+        "activities": ("role",),
+        "projects": ("organization", "role"),
+    }[section]
+    scores: dict[str, int] = {}
+    strong_scopes: set[str] = set()
+
+    for field in primary_fields:
+        value = str(getattr(record, field, "") or "").strip()
+        if not value:
+            continue
+        scopes = _value_record_scopes(
+            value,
+            section=section,
+            source=source,
+            blocks=blocks,
+            role=False,
+        )
+        for scope in scopes:
+            scores[scope] = scores.get(scope, 0) + 8
+        if len(scopes) == 1:
+            strong_scopes.update(scopes)
+
+    period = str(getattr(record, "period", "") or "").strip()
+    if period:
+        scopes = _value_record_scopes(
+            period,
+            section=section,
+            source=source,
+            blocks=blocks,
+            minimum=0.65,
+        )
+        for scope in scopes:
+            scores[scope] = scores.get(scope, 0) + 7
+        if len(scopes) == 1:
+            strong_scopes.update(scopes)
+
+    for field in secondary_fields:
+        value = str(getattr(record, field, "") or "").strip()
+        if not value:
+            continue
+        scopes = _value_record_scopes(
+            value,
+            section=section,
+            source=source,
+            blocks=blocks,
+            role=(field == "role"),
+        )
+        for scope in scopes:
+            scores[scope] = scores.get(scope, 0) + 2
+
+    if not scores or not strong_scopes:
+        return None
+    ordered = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    best_scope, best_score = ordered[0]
+    second_score = ordered[1][1] if len(ordered) > 1 else 0
+    if best_scope not in strong_scopes or best_score < 7 or best_score == second_score:
+        return None
+    return best_scope
+
+
 def _merge_identityless_continuations(
     resume: CanonicalResume,
     source: SourceBundle,
@@ -739,13 +873,35 @@ def enforce_resume_evidence(
         "projects": ("name", "organization", "role", "period"),
     }
     for section, fields in section_fields.items():
+        records_to_remove: set[int] = set()
         for index, record in enumerate(getattr(gated, section)):
+            anchored_scope: str | None = None
             if index in incoherent_records[section]:
-                removed.append(f"{section}[{index}]")
-                continue
+                anchored_scope = _anchored_record_scope(
+                    record,
+                    section=section,
+                    source=source,
+                    blocks=eligible_blocks,
+                )
+                if anchored_scope is None:
+                    removed.append(f"{section}[{index}]")
+                    records_to_remove.add(index)
+                    continue
             for field in fields:
                 path = f"{section}[{index}].{field}"
-                if getattr(record, field) and path not in bound_paths:
+                value = str(getattr(record, field, "") or "").strip()
+                wrong_record = bool(
+                    value
+                    and anchored_scope
+                    and anchored_scope not in _value_record_scopes(
+                        value,
+                        section=section,
+                        source=source,
+                        blocks=eligible_blocks,
+                        role=(field == "role"),
+                    )
+                )
+                if value and (path not in bound_paths or wrong_record):
                     setattr(record, field, "")
                     removed.append(path)
             if not hasattr(record, "bullets"):
@@ -760,16 +916,33 @@ def enforce_resume_evidence(
                     minimum=0.30,
                     trusted_rewrites=trusted_rewrites,
                 )
-                if binding is None:
+                provenance_value = str((trusted_rewrites or {}).get(path, "") or "").strip()
+                provenance_parts = [
+                    part.strip()
+                    for part in re.split(r"[\r\n]+", provenance_value)
+                    if part.strip()
+                ] or [str(bullet)]
+                bullet_scopes: set[str] = set()
+                for provenance_part in provenance_parts:
+                    bullet_scopes.update(_value_record_scopes(
+                        provenance_part,
+                        section=section,
+                        source=source,
+                        blocks=eligible_blocks,
+                        minimum=0.30,
+                    ))
+                if binding is None or (
+                    anchored_scope and anchored_scope not in bullet_scopes
+                ):
                     removed.append(path)
                 else:
                     kept_bullets.append(bullet)
             record.bullets = kept_bullets
 
-        if incoherent_records[section]:
+        if records_to_remove:
             setattr(gated, section, [
                 record for index, record in enumerate(getattr(gated, section))
-                if index not in incoherent_records[section]
+                if index not in records_to_remove
             ])
 
     # Before optimization there is no positional rewrite provenance to remap.
@@ -836,7 +1009,7 @@ _COMPACT_SOURCE_FIELD_LABEL = re.compile(
 )
 _FACT_SPLIT = re.compile(r"(?:[。；;]+|[|｜]+|(?<=[^\s])[,，、](?=[^\s]))")
 _STRONG_FACT_ANCHOR = re.compile(
-    r"(?<![A-Za-z0-9])\d+(?:\.\d+)?(?:%|万|亿|w|k|人|次|个|条|元|年|月|日)?|"
+    r"(?<![A-Za-z0-9])\d+(?:\.\d+)?\s*(?:%|万|亿|w|k|人|次|个|条|元|年|月|日)?|"
     r"[A-Za-z][A-Za-z0-9+.#/_-]{1,}",
     re.IGNORECASE,
 )
@@ -882,17 +1055,28 @@ def source_fact_units(source: SourceBundle) -> list[dict[str, str]]:
     result: list[dict[str, str]] = []
     for block in candidate_blocks(source):
         compact = re.sub(r"[\s:：|｜/\\【】\[\]()（）]+", "", block.text)
-        if not compact or compact in _SOURCE_HEADINGS or len(compact) < 2:
+        if (
+            not compact
+            or compact in _SOURCE_HEADINGS
+            or _is_section_heading(block.text)
+            or len(compact) < 2
+        ):
+            continue
+        if _SOURCE_DOCUMENT_TITLE.fullmatch(block.text.strip()):
             continue
         stripped = _SOURCE_FIELD_LABEL.sub("", block.text.strip())
         stripped = _COMPACT_SOURCE_FIELD_LABEL.sub("", stripped)
         raw_parts = [part.strip(" \t-•·▪◦") for part in _FACT_SPLIT.split(stripped)]
-        parts = [part for part in raw_parts if len(_normalize(part)) >= 2]
+        factual_raw_parts = [part for part in raw_parts if len(_normalize(part)) >= 2]
+        parts = [
+            part for part in factual_raw_parts
+            if not _SOURCE_NON_FACTUAL_COPY.fullmatch(part)
+        ]
         if not parts:
             continue
         # Preserve the original punctuation in reports for ordinary one-fact
         # lines. Multi-fact/OCR-compressed lines expose each missing clause.
-        displays = [block.text.strip()] if len(parts) == 1 else parts
+        displays = [block.text.strip()] if len(factual_raw_parts) == 1 else parts
         for index, (part, display) in enumerate(zip(parts, displays)):
             unit_id = block.block_id if len(parts) == 1 else f"{block.block_id}#u{index}"
             result.append({
@@ -918,13 +1102,21 @@ def _unit_is_represented(
     source_value = _normalize(unit.get("match_text", ""))
     if not source_value:
         return True
-    anchors = {item.casefold() for item in _STRONG_FACT_ANCHOR.findall(unit.get("match_text", ""))}
+    anchors = {
+        _normalize(item)
+        for item in _STRONG_FACT_ANCHOR.findall(unit.get("match_text", ""))
+        if _normalize(item)
+    }
     source_bigrams = _bigrams(source_value)
     for claim in claims:
         claim_value = _normalize(claim)
         if not claim_value:
             continue
-        claim_anchors = {item.casefold() for item in _STRONG_FACT_ANCHOR.findall(claim)}
+        claim_anchors = {
+            _normalize(item)
+            for item in _STRONG_FACT_ANCHOR.findall(claim)
+            if _normalize(item)
+        }
         if anchors and not anchors.issubset(claim_anchors):
             continue
         if source_value in claim_value:
@@ -943,7 +1135,9 @@ def _unit_is_represented(
         aggregate = " ".join(claims)
         aggregate_value = _normalize(aggregate)
         aggregate_anchors = {
-            item.casefold() for item in _STRONG_FACT_ANCHOR.findall(aggregate)
+            _normalize(item)
+            for item in _STRONG_FACT_ANCHOR.findall(aggregate)
+            if _normalize(item)
         }
         if not anchors or anchors.issubset(aggregate_anchors):
             aggregate_bigrams = _bigrams(aggregate_value)

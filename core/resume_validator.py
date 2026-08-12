@@ -19,6 +19,89 @@ MISSING_PLACEHOLDER_VALUES: frozenset[str] = frozenset({
     "", "未提供", "未明确", "未知", "暂无",
 })
 
+_CONCURRENT_ENGAGEMENT_MARKERS = (
+    "实习", "intern", "兼职", "part-time", "顾问", "志愿", "见习", "助理",
+    "科研", "项目", "校园", "campus", "支教", "轮转", "实训",
+    "规培", "规范化培训", "住院医师培训", "residency", "resident trainee",
+)
+_TENURE_EXCLUDED_MARKERS = (
+    "实习", "intern", "兼职", "part-time", "志愿", "见习", "校园", "campus",
+    "支教", "轮转", "实训", "规培", "规范化培训", "住院医师培训",
+    "residency", "resident trainee", "研究助理", "科研实习",
+)
+
+
+def _engagement_text(record: dict[str, Any]) -> str:
+    return " ".join(
+        str(record.get(key) or "").strip().casefold()
+        for key in ("company", "organization", "role")
+    )
+
+
+def _is_concurrent_engagement(record: dict[str, Any]) -> bool:
+    value = _engagement_text(record)
+    return any(marker.casefold() in value for marker in _CONCURRENT_ENGAGEMENT_MARKERS)
+
+
+def _substantive_experience_months(experience: list[Any]) -> int:
+    """Return unioned months for dated non-internship/training employment."""
+
+    from datetime import datetime, timezone
+
+    intervals: list[tuple[int, int]] = []
+    now = datetime.now(timezone.utc)
+    for record in experience:
+        if not isinstance(record, dict):
+            continue
+        identity = _engagement_text(record)
+        if (
+            not str(record.get("role") or "").strip()
+            or not str(record.get("company") or record.get("organization") or "").strip()
+            or any(marker.casefold() in identity for marker in _TENURE_EXCLUDED_MARKERS)
+        ):
+            continue
+        period = str(record.get("period") or "").strip()
+        start, end = _parse_period(period)
+        if start is None:
+            continue
+        if end is None:
+            if not re.search(r"(?:至今|目前|现在|present|current|now)", period, re.IGNORECASE):
+                continue
+            end = (now.year, now.month)
+        start_month = start[0] * 12 + start[1]
+        end_month = end[0] * 12 + end[1]
+        if start_month > end_month:
+            start_month, end_month = end_month, start_month
+        intervals.append((start_month, end_month))
+
+    if not intervals:
+        return 0
+    intervals.sort()
+    merged = [intervals[0]]
+    for start_month, end_month in intervals[1:]:
+        if start_month <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end_month))
+        else:
+            merged.append((start_month, end_month))
+    return sum(end_month - start_month + 1 for start_month, end_month in merged)
+
+
+def _explicit_tenure_months(value: object) -> int | None:
+    text = str(value or "").strip()
+    if (
+        not text
+        or re.search(r"\d+(?:\.\d+)?\s*[-~—至到]\s*\d+(?:\.\d+)?\s*年", text)
+        or re.search(r"(?:至少|不少于|超过|约|近)\s*\d|(?:以上|左右|余年|年余|\+)", text)
+    ):
+        return None
+    matches = re.findall(r"(\d+(?:\.\d+)?)\s*(年|个月|月)", text)
+    if len(matches) != 1:
+        return None
+    amount, unit = matches[0]
+    months = float(amount) * (12 if unit == "年" else 1)
+    return max(0, round(months))
+
+
 def is_missing_placeholder(value: object) -> bool:
     """Check if a field value is effectively empty (placeholder/non-informative).
 
@@ -377,19 +460,15 @@ def check_required_fields(
                 ))
 
     # Summary is required.  Allow several complete factual sentences; the
-    # renderer handles pagination and must not force a mid-sentence cut.
+    # renderer handles pagination and must not force a mid-sentence cut or
+    # misreport a complete summary as missing merely because it exceeds an
+    # arbitrary one-page-era character limit.
     summary = str(resume_data.get("summary", "")).strip()
     if not summary:
         missing.append(MissingField(
             field="summary",
             label="个人总结",
             reason="个人总结为必填项，请补充真实职业背景、核心优势和求职方向",
-        ))
-    elif len(summary) > 100:
-        missing.append(MissingField(
-            field="summary",
-            label="个人总结",
-            reason=f"个人总结过长（{len(summary)}字），建议控制在100字以内",
         ))
 
     # At least one substantive experience type is required. Work seniority is
@@ -537,8 +616,6 @@ def check_required_fields(
 
 def check_time_conflicts(resume_data: dict[str, Any]) -> list[FieldConflict]:
     """Check for time conflicts in education and experience periods."""
-    from datetime import datetime
-
     conflicts: list[FieldConflict] = []
 
     if not isinstance(resume_data, dict):
@@ -606,11 +683,20 @@ def check_time_conflicts(resume_data: dict[str, Any]) -> list[FieldConflict]:
                         company_j = str(exp_j.get("company", "")).strip() or f"工作经历{j+1}"
                         role_i = str(exp_i.get("role", "")).strip()
                         role_j = str(exp_j.get("role", "")).strip()
-                        part_time_hint = "兼职" in role_i or "兼职" in role_j or "顾问" in role_i or "顾问" in role_j
-                        if not part_time_hint:
+                        flexible_hint = (
+                            _is_concurrent_engagement(exp_i)
+                            or _is_concurrent_engagement(exp_j)
+                        )
+                        company_value_i = str(
+                            exp_i.get("company") or exp_i.get("organization") or ""
+                        ).strip()
+                        company_value_j = str(
+                            exp_j.get("company") or exp_j.get("organization") or ""
+                        ).strip()
+                        if not flexible_hint:
                             _add_conflict(
                                 "experience",
-                                f"工作经历时间可能冲突：{company_i}（{role_i}）({period_i}) 与 {company_j}（{role_j}）({period_j}) 时间段有重叠，请确认是否为并行兼职/实习或时间填写有误",
+                                f"工作经历时间可能冲突：{company_value_i or company_i}（{role_i}）({period_i}) 与 {company_value_j or company_j}（{role_j}）({period_j}) 时间段有重叠，请确认是否为并行任职或时间填写有误",
                             )
 
     # Cross-check: experience overlaps with education
@@ -626,11 +712,18 @@ def check_time_conflicts(resume_data: dict[str, Any]) -> list[FieldConflict]:
             if not exp_start:
                 continue
 
-            # Skip cross-check for internships, campus jobs, part-time — overlap with study is normal
+            # Skip cross-check for internships, campus jobs, part-time work and
+            # explicit professional training (for example medical residency).
+            # Their overlap with formal education is normally expected.
             role = str(exp.get("role", "") or "").lower()
-            company = str(exp.get("company", "") or "").lower()
-            internship_keywords = ("实习", "intern", "暑期", "兼职", "part-time", "校园", "campus", "实训", "支教")
-            if any(kw in role for kw in internship_keywords) or any(kw in company for kw in internship_keywords):
+            company = str(
+                exp.get("company") or exp.get("organization") or ""
+            ).lower()
+            if _is_concurrent_engagement(exp):
+                continue
+            # Without an explicit organization and title there is not enough
+            # evidence to classify the record as incompatible full-time work.
+            if not role or not company:
                 continue
 
             for edu in education:
@@ -651,6 +744,32 @@ def check_time_conflicts(resume_data: dict[str, Any]) -> list[FieldConflict]:
                         "cross_check",
                         f"工作经历与教育经历时间可能重叠：{company}（{exp_period}）与 {school}（{edu_period}）",
                     )
+
+    # An explicit seniority label and the dated employment ledger are two
+    # independent user facts. Surface a material mismatch for confirmation
+    # instead of silently choosing one. Internships and formal training do not
+    # inflate the full-time ledger used for this comparison.
+    meta = resume_data.get("meta", {})
+    seniority = str(meta.get("work_experience") or "").strip() if isinstance(meta, dict) else ""
+    stated_months = _explicit_tenure_months(seniority)
+    dated_months = _substantive_experience_months(experience) if isinstance(experience, list) else 0
+    if (
+        stated_months is not None
+        and dated_months
+        and abs(stated_months - dated_months) >= 18
+    ):
+        dated_years = dated_months / 12
+        dated_label = (
+            str(int(dated_years))
+            if dated_years.is_integer()
+            else f"{dated_years:.1f}".rstrip("0").rstrip(".")
+        )
+        _add_conflict(
+            "meta.work_experience",
+            f"工作年限口径可能不一致：基本信息填写“{seniority}”，"
+            f"非实习/培训类经历日期合计约{dated_label}年，请确认是否按相关经验计算，"
+            "或更新工作年限。",
+        )
 
     return conflicts
 

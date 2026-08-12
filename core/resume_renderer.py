@@ -82,7 +82,33 @@ _DOCX_CJK_FONT_CANDIDATES = (
 _RESUME_SECTION_TITLES = {
     "个人简介", "个人总结", "基本信息", "求职信息", "工作经历", "工作/实习经历", "实习经历",
     "科研经历", "校园与志愿经历", "项目经历", "教育经历", "专业技能",
-    "论文成果", "荣誉与奖项", "个人技能",
+    "论文成果", "荣誉与奖项", "个人技能", "教育背景", "培训与进修", "教学经历",
+    "PERSONAL INFORMATION", "CONTACT", "PROFILE", "PROFESSIONAL SUMMARY", "SUMMARY",
+    "WORK EXPERIENCE", "EMPLOYMENT HISTORY", "PROJECT EXPERIENCE", "RESEARCH EXPERIENCE",
+    "EDUCATION", "SKILLS", "CERTIFICATIONS", "AWARDS", "PUBLICATIONS", "TEACHING EXPERIENCE",
+}
+_TEMPLATE_SECTION_ALIASES = {
+    "基本信息": {"个人信息", "基础信息", "联系方式", "personal information", "contact", "contact information"},
+    "个人总结": {"个人简介", "自我评价", "职业总结", "profile", "professional summary", "summary", "about me"},
+    "教育背景": {"教育经历", "学历背景", "education", "education background"},
+    "专业技能": {"技能", "技能清单", "个人技能", "skills", "professional skills", "core skills"},
+    "工作/实习经历": {
+        "工作经历", "实习经历", "职业经历", "任职经历", "work experience",
+        "employment history", "professional experience", "internship experience",
+    },
+    "项目经历": {"项目经验", "个人项目", "课程项目", "project experience", "projects", "selected projects"},
+    "科研经历": {"研究经历", "实验室经历", "research experience", "research"},
+    "校园与志愿经历": {
+        "校园经历", "社团经历", "志愿经历", "社会实践", "campus experience",
+        "volunteer experience", "activities", "leadership & activities",
+    },
+    "论文与专利成果": {
+        "论文成果", "论文", "专利成果", "学术成果", "publications", "patents",
+        "publications & patents",
+    },
+    "荣誉与奖项": {"荣誉奖项", "奖项", "honors", "awards", "honors & awards"},
+    "培训与进修": {"培训经历", "进修经历", "training", "professional development"},
+    "教学经历": {"授课经历", "teaching experience", "teaching"},
 }
 _INTERNAL_ADDITIONAL_SECTION = re.compile(
     r"^(?:待整理(?:的)?原始(?:信息|经历)|教育经历补充)$"
@@ -283,13 +309,23 @@ def _ensure_run_east_asia_font(run: Any, font_family: str) -> None:
     if r_fonts is None:
         r_fonts = etree.Element(f"{{{_OOXML_WORD_NS}}}rFonts")
         r_pr.insert(0, r_fonts)
-    # A user template may intentionally declare a different CJK typeface.
-    # Keep that declaration and only fill missing mappings; generated runs
-    # without an East Asia font still receive the portable fallback.
-    if r_fonts.get(f"{{{_OOXML_WORD_NS}}}eastAsia"):
-        return
-    r_fonts.set(f"{{{_OOXML_WORD_NS}}}eastAsia", font_family)
-    r_fonts.attrib.pop(f"{{{_OOXML_WORD_NS}}}eastAsiaTheme", None)
+    # A user template may intentionally declare different Latin/CJK faces.
+    # Preserve every explicit mapping.  Generated runs, however, frequently
+    # contain no direct ascii/hAnsi declaration; mapping only eastAsia makes
+    # LibreOffice ignore the embedded subset for mixed Chinese/Latin runs and
+    # render square glyphs on hosts without CJK fonts.  Fill only the missing
+    # direct mappings with the selected East Asia family.
+    east_asia_key = f"{{{_OOXML_WORD_NS}}}eastAsia"
+    selected_family = r_fonts.get(east_asia_key) or font_family
+    if not r_fonts.get(east_asia_key):
+        r_fonts.set(east_asia_key, selected_family)
+        r_fonts.attrib.pop(f"{{{_OOXML_WORD_NS}}}eastAsiaTheme", None)
+    for attribute in ("ascii", "hAnsi"):
+        key = f"{{{_OOXML_WORD_NS}}}{attribute}"
+        if r_fonts.get(key):
+            continue
+        r_fonts.set(key, selected_family)
+        r_fonts.attrib.pop(f"{{{_OOXML_WORD_NS}}}{attribute}Theme", None)
 
 
 def _patch_docx_cjk_xml(
@@ -761,14 +797,15 @@ def _append_docx_header_block(
         name_size = Pt(22)
         name_color = RGBColor(0x00, 0x5A, 0x64)
 
-    p_name = doc.add_paragraph()
-    p_name.alignment = name_align
-    run = p_name.add_run(name)
-    run.bold = True
-    run.font.size = name_size
-    run.font.name = DEFAULT_DOC_FONT
-    run.font.color.rgb = name_color
-    p_name.space_after = Pt(2)
+    if str(name or "").strip():
+        p_name = doc.add_paragraph()
+        p_name.alignment = name_align
+        run = p_name.add_run(name)
+        run.bold = True
+        run.font.size = name_size
+        run.font.name = DEFAULT_DOC_FONT
+        run.font.color.rgb = name_color
+        p_name.space_after = Pt(2)
 
     # --- Contact line (horizontal) ---
     contacts = [
@@ -1742,6 +1779,120 @@ def _clear_docx_body_for_style_template(doc: DocxDocument) -> None:
         body.remove(child)
 
 
+def _capture_unanchored_table_shell(doc: DocxDocument) -> Any:
+    """Keep one bounded table shell while removing all sample-person content."""
+
+    candidates = [
+        table for table in doc.tables
+        if table.rows and 1 <= len(table.columns) <= 4
+    ]
+    if not candidates:
+        return None
+    table = candidates[0]
+    shell = copy.deepcopy(table._tbl)
+    rows = shell.findall(qn("w:tr"))
+    for extra in rows[1:]:
+        shell.remove(extra)
+    for node in shell.iter(qn("w:t")):
+        node.text = ""
+    # A portrait in an example template belongs to the sample person.  Keep the
+    # cell geometry and drawing-compatible package, but never copy that image.
+    for tag in ("w:drawing", "w:pict", "w:object"):
+        for node in list(shell.iter(qn(tag))):
+            parent = node.getparent()
+            if parent is not None:
+                parent.remove(node)
+    return shell
+
+
+def _set_paragraph_text_preserving_style(paragraph: Any, value: str, *, bold: bool = False) -> None:
+    text = str(value or "")
+    if paragraph.runs:
+        paragraph.runs[0].text = text
+        for run in paragraph.runs[1:]:
+            run.text = ""
+        run = paragraph.runs[0]
+    else:
+        run = paragraph.add_run(text)
+    if bold:
+        run.bold = True
+
+
+def _install_table_header_shell(
+    doc: DocxDocument,
+    shell: Any,
+    resume_data: dict[str, Any],
+) -> bool:
+    """Reuse an unanchored DOCX table as a sanitized candidate header."""
+
+    if shell is None:
+        return False
+    body = doc._element.body
+    section_properties = body.find(qn("w:sectPr"))
+    if section_properties is None:
+        body.append(shell)
+    else:
+        section_properties.addprevious(shell)
+    table = doc.tables[-1]
+    unique_cells: list[Any] = []
+    seen: set[int] = set()
+    for cell in table.rows[0].cells:
+        marker = id(cell._tc)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        unique_cells.append(cell)
+    if not unique_cells:
+        return False
+
+    meta = resume_data.get("meta", {}) if isinstance(resume_data, dict) else {}
+    if not isinstance(meta, dict):
+        meta = {}
+    name = str(meta.get("name", "") or "").strip()
+    contacts = [
+        str(meta.get(key, "") or "").strip()
+        for key in ("phone", "email", "wechat", "github", "linkedin", "website")
+        if str(meta.get(key, "") or "").strip()
+    ]
+    profile = [
+        f"{label}: {value}"
+        for label, key in (
+            ("目标岗位", "target_role"), ("工作经验", "work_experience"),
+            ("学历", "education_level"), ("期望城市", "expected_city"),
+        )
+        if (value := str(meta.get(key, "") or "").strip())
+    ]
+    values = [name]
+    if len(unique_cells) == 1:
+        values = ["\n".join(item for item in (name, " | ".join(contacts), " | ".join(profile)) if item)]
+    elif len(unique_cells) == 2:
+        values = [name, "\n".join(item for item in (" | ".join(contacts), " | ".join(profile)) if item)]
+    else:
+        values = [name, " | ".join(profile), " | ".join(contacts)]
+    values.extend([""] * (len(unique_cells) - len(values)))
+    for index, cell in enumerate(unique_cells):
+        paragraphs = cell.paragraphs or [cell.add_paragraph()]
+        _set_paragraph_text_preserving_style(
+            paragraphs[0], values[index], bold=(index == 0 and bool(name)),
+        )
+        for paragraph in paragraphs[1:]:
+            _set_paragraph_text_preserving_style(paragraph, "")
+    return True
+
+
+def _resume_data_without_header_fields(resume_data: dict[str, Any]) -> dict[str, Any]:
+    data = copy.deepcopy(resume_data)
+    meta = data.get("meta")
+    if isinstance(meta, dict):
+        for key in (
+            "name", "phone", "email", "wechat", "github", "linkedin", "website",
+            "target_role", "work_experience", "education_level", "expected_city",
+            "age", "gender", "political_status", "job_intention",
+        ):
+            meta[key] = ""
+    return data
+
+
 def _template_supports_structured_injection(doc: DocxDocument) -> bool:
     """Return whether a DOCX exposes anchors that can be filled safely.
 
@@ -1763,8 +1914,10 @@ def _template_supports_structured_injection(doc: DocxDocument) -> bool:
             text,
         ):
             return True
-        normalized = re.sub(r"[\s:：]+", "", text)
-        if any(re.sub(r"[\s:：]+", "", title) == normalized for title in _RESUME_SECTION_TITLES):
+        if any(
+            _template_section_matches(text, title)
+            for title in _TEMPLATE_SECTION_ALIASES
+        ):
             return True
     return False
 
@@ -2358,6 +2511,7 @@ def render_docx(
     profile = extract_template_style_profile(tpl)
     template_path = Path(tpl) if Path(tpl).is_file() else None
     source_docx: Optional[DocxDocument] = None
+    table_header_shell = None
 
     if template_path is not None and template_path.suffix.lower() == ".docx":
         source_docx = DocxDocument(str(template_path))
@@ -2385,6 +2539,8 @@ def render_docx(
                     _layout_retry=True,
                 )
             return
+        if not framework_mode:
+            table_header_shell = _capture_unanchored_table_shell(source_docx)
 
     # A static DOCX remains the package source so headers, footers, theme,
     # numbering and page settings survive.  PDF/image templates contribute a
@@ -2397,7 +2553,12 @@ def render_docx(
         doc = DocxDocument()
         _initialize_docx_defaults(doc, reset_geometry=True)
 
-    _render_docx_with_preset(doc, resume_data, profile.preset, framework_mode)
+    render_data = resume_data
+    if table_header_shell is not None and _install_table_header_shell(
+        doc, table_header_shell, resume_data,
+    ):
+        render_data = _resume_data_without_header_fields(resume_data)
+    _render_docx_with_preset(doc, render_data, profile.preset, framework_mode)
     apply_template_style_profile(doc, resume_data, profile)
 
     _apply_docx_pagination_guards(doc)
@@ -2493,7 +2654,92 @@ def _apply_resume_data_to_template(doc: "DocxDocument", resume_data: dict[str, A
         anchor.addnext(paragraph)
         return paragraph
 
+    def insert_before(
+        anchor: Any,
+        text: str,
+        *,
+        template_element: Any = None,
+        bold: bool = False,
+    ) -> Any:
+        placeholder = OxmlElement("w:p")
+        anchor.addprevious(placeholder)
+        paragraph = insert_after(
+            placeholder,
+            text,
+            template_element=template_element,
+            bold=bold,
+        )
+        placeholder.getparent().remove(placeholder)
+        return paragraph
+
+    def insert_items_after(
+        anchor: Any,
+        values: list,
+        *,
+        template_element: Any = None,
+    ) -> Any:
+        for item in values:
+            if isinstance(item, tuple) and len(item) == 2:
+                sub_heading, sub_items = item
+                anchor = insert_after(
+                    anchor,
+                    str(sub_heading),
+                    template_element=template_element,
+                    bold=True,
+                )
+                for sub_item in sub_items:
+                    anchor = insert_after(
+                        anchor,
+                        str(sub_item),
+                        template_element=template_element,
+                    )
+            else:
+                anchor = insert_after(
+                    anchor,
+                    str(item),
+                    template_element=template_element,
+                )
+        return anchor
+
     original_paragraphs = all_paragraphs()
+    # A real-world template often contains a sample person's name/contact text
+    # rather than explicit {{placeholders}}.  Replace only the bounded identity
+    # block before the first top-level section heading; section bodies are
+    # handled separately below. Decorative RESUME/CV labels remain intact.
+    top_level = list(doc.paragraphs)
+    first_heading_index = next((
+        index for index, paragraph in enumerate(top_level)
+        if is_section_heading(paragraph.text.strip())
+    ), len(top_level))
+    header_candidates = [
+        paragraph for paragraph in top_level[:first_heading_index]
+        if paragraph.text.strip()
+        and re.sub(r"\W+", "", paragraph.text).casefold()
+        not in {"个人简历", "resume", "curriculumvitae", "cv"}
+    ]
+    meta = resume_data.get("meta", {}) if isinstance(resume_data, dict) else {}
+    if not isinstance(meta, dict):
+        meta = {}
+    candidate_name = str(meta.get("name", "") or "").strip()
+    contact_line = " | ".join(
+        str(meta.get(key, "") or "").strip()
+        for key in ("phone", "email", "wechat", "github", "linkedin")
+        if str(meta.get(key, "") or "").strip()
+    )
+    if candidate_name and not any(
+        paragraph.text.strip() == candidate_name for paragraph in original_paragraphs
+    ) and header_candidates:
+        _set_paragraph_text_preserving_style(
+            header_candidates[0], candidate_name, bold=True,
+        )
+        if contact_line and len(header_candidates) > 1:
+            _set_paragraph_text_preserving_style(header_candidates[1], contact_line)
+        for paragraph in header_candidates[2 if contact_line else 1:]:
+            if re.search(
+                r"(?:1[3-9]\d(?:[\s-]?\d){8}|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})",
+                paragraph.text,
+            ):
+                _set_paragraph_text_preserving_style(paragraph, "")
     heading_prototype = next(
         (
             paragraph._element
@@ -2518,6 +2764,25 @@ def _apply_resume_data_to_template(doc: "DocxDocument", resume_data: dict[str, A
         ),
         None,
     )
+    body = doc._element.body
+    def contains_section_anchor(element: Any) -> bool:
+        paragraphs = (
+            [element] if element.tag == qn("w:p")
+            else list(element.iter(qn("w:p")))
+        )
+        return any(
+            _template_section_matches(element_text(paragraph), heading)
+            for paragraph in paragraphs
+            for heading in section_headings
+        )
+
+    first_section_anchor = next(
+        (
+            child for child in body
+            if contains_section_anchor(child)
+        ),
+        None,
+    )
 
     for section_heading, items in sections:
         matched = False
@@ -2528,6 +2793,39 @@ def _apply_resume_data_to_template(doc: "DocxDocument", resume_data: dict[str, A
                 # cells), clear only stale body paragraphs, then inject the new
                 # section immediately below it using the template body style.
                 anchor = para._element
+                parent = anchor.getparent()
+                if parent is not None and parent.tag == qn("w:tc"):
+                    row = parent.getparent()
+                    row_cells = list(row.findall(qn("w:tc"))) if row is not None else []
+                    current_index = row_cells.index(parent) if parent in row_cells else -1
+                    companion_cells = [
+                        cell for index, cell in enumerate(row_cells)
+                        if index != current_index
+                        and not is_section_heading(element_text(cell))
+                    ]
+                    companion_cells.sort(
+                        key=lambda cell: row_cells.index(cell) < current_index,
+                    )
+                    if companion_cells:
+                        target_cell = companion_cells[0]
+                        target_paragraphs = list(target_cell.findall(qn("w:p")))
+                        content_template = next(
+                            (element for element in target_paragraphs if element_text(element)),
+                            target_paragraphs[0] if target_paragraphs else None,
+                        )
+                        for child in list(target_cell):
+                            if child.tag != qn("w:tcPr"):
+                                target_cell.remove(child)
+                        placeholder = OxmlElement("w:p")
+                        target_cell.append(placeholder)
+                        insert_items_after(
+                            placeholder,
+                            items,
+                            template_element=content_template,
+                        )
+                        target_cell.remove(placeholder)
+                        matched = True
+                        break
                 sibling = anchor.getnext()
                 content_template = None
                 stale: list[Any] = []
@@ -2544,30 +2842,62 @@ def _apply_resume_data_to_template(doc: "DocxDocument", resume_data: dict[str, A
                 for element in stale:
                     element.getparent().remove(element)
 
-                for item in items:
-                    if isinstance(item, tuple) and len(item) == 2:
-                        sub_heading, sub_items = item
-                        anchor = insert_after(
-                            anchor,
-                            str(sub_heading),
-                            template_element=content_template,
-                            bold=True,
-                        )
-                        for sub_item in sub_items:
-                            anchor = insert_after(
-                                anchor,
-                                str(sub_item),
-                                template_element=content_template,
-                            )
-                    else:
-                        anchor = insert_after(
-                            anchor,
-                            str(item),
-                            template_element=content_template,
-                        )
+                insert_items_after(
+                    anchor,
+                    items,
+                    template_element=content_template,
+                )
                 matched = True
                 break
         if matched:
+            continue
+        current_document_text = "\n".join(
+            paragraph.text for paragraph in all_paragraphs()
+        )
+        if section_heading == "基本信息":
+            required_identity_values = [
+                str(meta.get(key, "") or "").strip()
+                for key in ("name", "phone", "email")
+                if str(meta.get(key, "") or "").strip()
+            ]
+            if required_identity_values and all(
+                value in current_document_text for value in required_identity_values
+            ):
+                continue
+        if section_heading == "个人总结":
+            summary_value = str(resume_data.get("summary", "") or "").strip()
+            if summary_value and summary_value in current_document_text:
+                continue
+        if section_heading in {"基本信息", "个人总结"} and first_section_anchor is not None:
+            insert_before(
+                first_section_anchor,
+                section_heading,
+                template_element=heading_prototype,
+                bold=True,
+            )
+            for item in items:
+                # Each new paragraph is inserted immediately before the anchor,
+                # after prior inserted siblings, so source order is preserved.
+                if isinstance(item, tuple) and len(item) == 2:
+                    sub_heading, sub_items = item
+                    insert_before(
+                        first_section_anchor,
+                        str(sub_heading),
+                        template_element=body_prototype,
+                        bold=True,
+                    )
+                    for sub_item in sub_items:
+                        insert_before(
+                            first_section_anchor,
+                            str(sub_item),
+                            template_element=body_prototype,
+                        )
+                else:
+                    insert_before(
+                        first_section_anchor,
+                        str(item),
+                        template_element=body_prototype,
+                    )
             continue
         # A user template rarely contains every profession-specific heading.
         # Append every non-empty unmatched section using the template's first
@@ -2581,45 +2911,25 @@ def _apply_resume_data_to_template(doc: "DocxDocument", resume_data: dict[str, A
             template_element=heading_prototype,
             bold=True,
         )
-        for item in items:
-            if isinstance(item, tuple) and len(item) == 2:
-                sub_heading, sub_items = item
-                anchor = insert_after(
-                    anchor,
-                    str(sub_heading),
-                    template_element=body_prototype,
-                    bold=True,
-                )
-                for sub_item in sub_items:
-                    anchor = insert_after(
-                        anchor,
-                        str(sub_item),
-                        template_element=body_prototype,
-                    )
-            else:
-                anchor = insert_after(
-                    anchor,
-                    str(item),
-                    template_element=body_prototype,
-                )
+        insert_items_after(
+            anchor,
+            items,
+            template_element=body_prototype,
+        )
 
 
 def _template_section_matches(text: str, section_heading: str) -> bool:
-    normalized = re.sub(r"[\s：:]+", "", str(text or ""))
-    target = re.sub(r"[\s：:]+", "", str(section_heading or ""))
-    aliases = {
-        "基本信息": {"个人信息", "基础信息", "联系方式"},
-        "个人总结": {"个人简介", "自我评价", "职业总结"},
-        "教育背景": {"教育经历", "学历背景"},
-        "专业技能": {"技能", "技能清单", "个人技能"},
-        "工作/实习经历": {"工作经历", "实习经历", "职业经历", "任职经历"},
-        "项目经历": {"项目经验", "个人项目", "课程项目"},
-        "科研经历": {"研究经历", "实验室经历"},
-        "校园与志愿经历": {"校园经历", "社团经历", "志愿经历", "社会实践"},
-        "论文与专利成果": {"论文成果", "论文", "专利成果", "学术成果"},
-    }
-    candidates = {target, *aliases.get(target, set())}
-    return any(candidate and (normalized == candidate or candidate in normalized) for candidate in candidates)
+    def normalize(value: str) -> str:
+        compact = re.sub(
+            r"[\s：:|｜/\\【】\[\]()（）·•—_-]+", "", str(value or "").casefold(),
+        )
+        return re.sub(r"^(?:\d{1,2}|[一二三四五六七八九十])[.、)]*", "", compact)
+
+    normalized = normalize(text)
+    target = normalize(section_heading)
+    aliases = _TEMPLATE_SECTION_ALIASES.get(section_heading, set())
+    candidates = {target, *(normalize(value) for value in aliases)}
+    return any(candidate and normalized == candidate for candidate in candidates)
 
 
 def _replace_template_placeholders(doc: "DocxDocument", resume_data: dict[str, Any]) -> None:

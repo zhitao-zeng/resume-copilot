@@ -70,6 +70,8 @@ def test_chinese_docx_declares_and_embeds_portable_font(tmp_path, monkeypatch):
                 fonts = run.xpath("./w:rPr/w:rFonts", namespaces={"w": W})
                 assert len(fonts) == 1
                 assert fonts[0].get(f"{{{W}}}eastAsia") == "Noto Sans CJK SC"
+                assert fonts[0].get(f"{{{W}}}ascii") == "Noto Sans CJK SC"
+                assert fonts[0].get(f"{{{W}}}hAnsi") == "Noto Sans CJK SC"
 
         numbering = etree.fromstring(archive.read("word/numbering.xml"))
         bullet_values = numbering.xpath(
@@ -145,3 +147,28 @@ def test_latin_only_docx_does_not_embed_cjk_font(tmp_path, monkeypatch):
 
     with zipfile.ZipFile(output) as archive:
         assert not any(name.startswith("word/fonts/") for name in archive.namelist())
+
+
+def test_cjk_portability_preserves_explicit_template_latin_font(tmp_path, monkeypatch):
+    _disable_layout_qa(monkeypatch)
+    monkeypatch.setattr(resume_renderer, "DEFAULT_DOC_EMBED_CJK_FONT", False)
+    template = tmp_path / "template.docx"
+    source = Document()
+    paragraph = source.add_paragraph("个人总结")
+    paragraph.runs[0].font.name = "Arial"
+    source.add_paragraph("示例内容").runs[0].font.name = "Arial"
+    source.save(template)
+
+    output = tmp_path / "preserved.docx"
+    resume_renderer.render_docx(_resume(), output, template=str(template))
+
+    with zipfile.ZipFile(output) as archive:
+        document = etree.fromstring(archive.read("word/document.xml"))
+        fonts = document.xpath(
+            "//w:r[.//w:t[contains(., '需求分析')]]/w:rPr/w:rFonts",
+            namespaces={"w": W},
+        )
+        assert fonts
+        assert all(node.get(f"{{{W}}}ascii") == "Arial" for node in fonts)
+        assert all(node.get(f"{{{W}}}hAnsi") == "Arial" for node in fonts)
+        assert all(node.get(f"{{{W}}}eastAsia") for node in fonts)

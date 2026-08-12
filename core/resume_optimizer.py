@@ -97,13 +97,14 @@ OPTIMIZER_SYSTEM_PROMPT = """你是一位保守的简历编辑，只输出经历
 7. 不得新增数字、工具、技术、业务领域或项目事实。
 8. 保留每条原文的关键动作、对象、过程、方法、交付物和结果，不得压成空泛短句。
 9. 目标岗位只影响已有事实的排序和措辞，不是候选人事实来源。
+10. 输入中的 evidence_plan 是只读结构提示。先按同一事项分组，再按“情境（若原文有）→责任动作→方法/过程（若原文有）→交付物（若原文有）→结果（仅原文明确提供）”组织；缺少的维度保持缺失，不得补齐。
 只输出 JSON，不要解释。"""
 
 
 def _numeric_facts(value: Any) -> Counter:
     text = value if isinstance(value, str) else str(value)
     return Counter(re.findall(
-        r"(?<![A-Za-z])\d+(?:\.\d+)?(?:%|万|w|k|人|次|个|条|元|年|月|日)?",
+        r"(?<![A-Za-z])\d+(?:\.\d+)?(?:%|万|w|k|人|名|次|个|条|元|年|月|日)?",
         text,
         re.IGNORECASE,
     ))
@@ -117,6 +118,54 @@ def _action_level(text: str) -> int:
     if any(token in text for token in _WEAK_ACTIONS):
         return 1
     return 0
+
+
+_STAR_CONTEXT = re.compile(r"(?:在[^，。；;]{1,40}(?:期间|背景下|场景下)|面向|针对|围绕)")
+_STAR_METHOD = re.compile(
+    r"(?:通过|使用|采用|基于|借助|运用|利用|结合|按照|依据|协同|协调)"
+)
+_STAR_DELIVERABLE = re.compile(
+    r"(?:输出|形成|产出|撰写|编制|制定|设计|开发|构建|搭建|建立|交付|上线|发布|完成)"
+)
+_STAR_RESULT = re.compile(
+    r"(?:提升|提高|增长|降低|减少|缩短|节省|达到|达成|获得|获奖|录用|覆盖|支持)"
+    r"[^，。；;]{0,30}(?:\d+(?:\.\d+)?\s*(?:%|万|人|名|次|项|个|条|篇|例|台|套|元|万元)|目标|要求|标准)|"
+    r"\d+(?:\.\d+)?\s*(?:%|万|人|名|次|项|个|条|篇|例|台|套|元|万元)"
+)
+
+
+def _bullet_evidence_plan(bullets: list[str]) -> list[dict[str, Any]]:
+    """Expose source-present STAR dimensions without asking the model to infer.
+
+    The plan is advisory input only.  Exact source strings and ``source_indices``
+    remain the enforceable provenance contract, while these labels discourage
+    the common failure mode of inventing a result merely to fill a STAR slot.
+    """
+
+    ownership_labels = {0: "unspecified", 1: "support", 2: "responsible", 3: "lead"}
+    result: list[dict[str, Any]] = []
+    for index, raw in enumerate(bullets):
+        text = str(raw or "").strip()
+        dimensions: list[str] = []
+        if _STAR_CONTEXT.search(text):
+            dimensions.append("context")
+        if _action_level(text) or re.search(
+            r"(?:开展|执行|处理|分析|研究|维护|跟进|诊疗|授课|复核|运营)", text,
+        ):
+            dimensions.append("action")
+        if _STAR_METHOD.search(text):
+            dimensions.append("method")
+        if _STAR_DELIVERABLE.search(text):
+            dimensions.append("deliverable")
+        if _STAR_RESULT.search(text):
+            dimensions.append("result")
+        result.append({
+            "index": index,
+            "text": text,
+            "ownership": ownership_labels[_action_level(text)],
+            "source_dimensions": dimensions,
+        })
+    return result
 
 
 def _introduces_unsupported_fact(original: str, rewritten: str) -> bool:
@@ -426,7 +475,11 @@ def _section_patch_proposals(
             continue
         for bullet_index, (before, after) in enumerate(zip(original, proposed)):
             before_text = str(before or "").strip()
-            after_text = str(after or "").strip()
+            after_text = _normalize_grouped_surface(str(after or "").strip())
+            source_action = _action_level(before_text)
+            if source_action and not _action_level(after_text):
+                marker = _action_marker_for_level([before_text], source_action)
+                after_text = f"{marker}{after_text}" if marker else after_text
             safe, reasons = _safe_rewrite_diagnostics(before_text, after_text)
             trace_event(
                 "optimizer_proposal_hard_gate",
@@ -471,6 +524,9 @@ def _build_optimizer_batches(resume: CanonicalResume) -> list[dict[str, list[dic
         for index, record in enumerate(getattr(resume, section)):
             dumped = record.model_dump()
             dumped["index"] = index
+            dumped["evidence_plan"] = _bullet_evidence_plan([
+                str(value or "") for value in record.bullets
+            ])
             bullet_count = len(record.bullets)
             char_count = sum(len(str(value)) for value in record.bullets)
             if current_bullets and (
@@ -679,7 +735,10 @@ def optimize_resume_with_provenance(
         proposal for proposal in proposals
         if mode == "all" or (
             mode == "high_risk"
-            and _rewrite_requires_semantic_review(proposal.before, proposal.after)
+            and (
+                _rewrite_requires_semantic_review(proposal.before, proposal.after)
+                or (proposal.grouped and len(proposal.source_indices) > 1)
+            )
         )
     ]
     reviewed = review_entailment_batch([
@@ -694,7 +753,10 @@ def optimize_resume_with_provenance(
     semantic_rejected = 0
     accepted_proposal_ids: set[int] = set()
     for proposal in proposals:
-        high_risk = _rewrite_requires_semantic_review(proposal.before, proposal.after)
+        high_risk = (
+            _rewrite_requires_semantic_review(proposal.before, proposal.after)
+            or (proposal.grouped and len(proposal.source_indices) > 1)
+        )
         needs_review = mode == "all" or (mode == "high_risk" and high_risk)
         verdict = review_by_path.get(proposal.path) if needs_review else True
         # A high-risk rewrite must receive an affirmative review.  Low-risk
@@ -737,21 +799,46 @@ def optimize_resume_with_provenance(
         trusted_rewrites[proposal.path] = proposal.before
 
     for (section, record_index), record_proposals in grouped_records.items():
-        # Regrouping changes positional meaning, so partial application would
-        # be unsafe. One failed claim rolls back the entire record.
-        if not all(id(proposal) in accepted_proposal_ids for proposal in record_proposals):
+        accepted_in_record = [
+            proposal for proposal in record_proposals
+            if id(proposal) in accepted_proposal_ids
+        ]
+        if not accepted_in_record:
             trace_event(
                 "optimizer_grouped_record_reverted",
                 section=section,
                 record_index=record_index,
-                reason="semantic_review_rejected_or_unavailable",
+                reason="all_semantic_reviews_rejected_or_unavailable",
             )
             continue
         ordered = sorted(record_proposals, key=lambda item: item.bullet_index)
         records = getattr(optimized, section)
-        records[record_index].bullets = [proposal.after for proposal in ordered]
+        original_bullets = list(records[record_index].bullets)
+        rebuilt: list[str] = []
         for proposal in ordered:
-            trusted_rewrites[proposal.path] = proposal.before
+            if id(proposal) in accepted_proposal_ids:
+                new_index = len(rebuilt)
+                rebuilt.append(proposal.after)
+                trusted_rewrites[
+                    f"{section}[{record_index}].bullets[{new_index}]"
+                ] = proposal.before
+                continue
+            # A rejected group falls back to its exact source clauses. Other
+            # independently reviewed groups in the same record may still keep
+            # their safe rewrite, so one risky sentence no longer erases every
+            # useful edit in a long experience.
+            rebuilt.extend(
+                original_bullets[index] for index in proposal.source_indices
+            )
+        records[record_index].bullets = rebuilt
+        if len(accepted_in_record) != len(record_proposals):
+            trace_event(
+                "optimizer_grouped_record_partial_fallback",
+                section=section,
+                record_index=record_index,
+                accepted_groups=len(accepted_in_record),
+                rejected_groups=len(record_proposals) - len(accepted_in_record),
+            )
 
     accepted = len(trusted_rewrites)
 

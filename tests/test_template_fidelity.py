@@ -182,9 +182,83 @@ def test_unanchored_table_template_does_not_leak_sample_content(tmp_path):
 
     output = tmp_path / "from-table.docx"
     rendered = _render(_payload(), output, template)
-    text = "\n".join(paragraph.text for paragraph in rendered.paragraphs)
+    table_text = "\n".join(
+        cell.text for table in rendered.tables for row in table.rows for cell in row.cells
+    )
+    text = "\n".join(paragraph.text for paragraph in rendered.paragraphs) + "\n" + table_text
     assert "示例姓名" not in text and "示例电话" not in text
     assert "李明" in text and "星河科技有限公司" in text
+    assert len(rendered.tables) == 1
+    assert len(rendered.tables[0].columns) == 2
+    assert "李明" in rendered.tables[0].cell(0, 0).text
+    assert "13800000000" in rendered.tables[0].cell(0, 1).text
+
+
+def test_english_section_anchors_keep_order_styles_and_remove_sample_resume(tmp_path):
+    template = tmp_path / "english-sections.docx"
+    source = Document()
+    expected_headings = [
+        "PERSONAL INFORMATION",
+        "PROFESSIONAL SUMMARY",
+        "WORK EXPERIENCE",
+        "EDUCATION",
+        "SKILLS",
+    ]
+    for heading_text in expected_headings:
+        heading = source.add_paragraph(heading_text)
+        heading.runs[0].font.color.rgb = RGBColor(0x21, 0x4E, 0x72)
+        sample = source.add_paragraph(f"Sample content under {heading_text}")
+        sample.runs[0].font.name = "Arial"
+        sample.runs[0].font.size = Pt(9)
+    source.save(template)
+
+    output = tmp_path / "english-output.docx"
+    rendered = _render(_payload(), output, template)
+    paragraphs = [paragraph.text for paragraph in rendered.paragraphs]
+    text = "\n".join(paragraphs)
+
+    assert "Sample content" not in text
+    for expected in ("李明", "星河科技有限公司", "江南大学", "Axure"):
+        assert expected in text
+    positions = [paragraphs.index(heading) for heading in expected_headings]
+    assert positions == sorted(positions)
+    injected = next(
+        paragraph for paragraph in rendered.paragraphs
+        if paragraph.text == "访谈业务用户并梳理核心流程，输出需求文档与产品方案。"
+    )
+    assert injected.runs[0].font.name == "Arial"
+
+
+def test_table_section_anchor_injects_into_companion_cell_without_sample_leak(tmp_path):
+    template = tmp_path / "table-section.docx"
+    source = Document()
+    table = source.add_table(rows=1, cols=2)
+    table.cell(0, 0).text = "工作经历"
+    sample = table.cell(0, 1).paragraphs[0]
+    sample.text = "示例公司｜示例岗位｜示例职责"
+    sample.runs[0].font.name = "Arial"
+    sample.runs[0].font.size = Pt(8.5)
+    source.save(template)
+
+    output = tmp_path / "table-section-output.docx"
+    rendered = _render(_payload(), output, template)
+    assert len(rendered.tables) == 1
+    left = rendered.tables[0].cell(0, 0).text
+    right = rendered.tables[0].cell(0, 1).text
+    assert left == "工作经历"
+    assert "示例" not in right
+    assert "星河科技有限公司" in right
+    assert "访谈业务用户" in right
+    document_text = "\n".join(paragraph.text for paragraph in rendered.paragraphs)
+    assert "李明" in document_text
+    assert "具备五年B端产品经验" in document_text
+    assert document_text.index("李明") < document_text.index("具备五年B端产品经验")
+    content_run = next(
+        paragraph.runs[0]
+        for paragraph in rendered.tables[0].cell(0, 1).paragraphs
+        if "访谈业务用户" in paragraph.text
+    )
+    assert content_run.font.name == "Arial"
 
 
 def test_template_upload_keeps_pdf_and_image_for_layout_analysis(tmp_path, monkeypatch):

@@ -10,17 +10,23 @@ from v2_schemas import SourceBlock, SourceBundle
 
 
 _SECTION_ALIASES = {
+    "meta": ("个人信息", "基本信息", "联系方式"),
     "summary": ("个人总结", "个人简介", "职业概述", "自我评价"),
     "education": ("教育经历", "教育背景", "学历信息"),
-    "experience": ("工作经历", "实习经历", "任职经历", "职业经历"),
+    "experience": (
+        "工作经历", "实习经历", "工作/实习经历", "工作与实习经历",
+        "任职经历", "职业经历",
+    ),
     "research": ("科研经历", "研究经历", "实验室经历"),
-    "projects": ("项目经历", "项目经验", "课程项目", "个人项目", "开源项目"),
+    "projects": (
+        "项目经历", "项目经验", "研究项目", "课程项目", "个人项目", "开源项目",
+    ),
     "activities": (
         "校园经历", "在校经历", "社团经历", "志愿经历", "社会实践", "学生工作",
         "组织经历", "社团和组织经历", "社团和",
     ),
     "skills": (
-        "专业技能", "职业技能", "技能清单", "技术栈", "工具", "语言能力",
+        "技能", "专业技能", "职业技能", "技能清单", "技术栈", "工具", "语言能力",
         "编程语言", "开发工具", "机器学习", "深度学习",
     ),
     "awards": ("荣誉奖项", "荣誉与奖项", "获奖经历", "奖项", "奖学金"),
@@ -36,6 +42,40 @@ _SECTION_ALIASES = {
 }
 
 _LAYOUT_RESET_HEADINGS = {"其他", "其它", "其他信息", "其它信息"}
+_GENERIC_SECTION_HEADINGS = {"经历"}
+_HEADING_SUFFIX = re.compile(
+    r"(?:经历|经验|背景|技能|能力|证书|资质|奖项|荣誉|成果|信息|简介|评价|"
+    r"课程|兴趣|爱好|专利|论文|实践|培训|教育)$",
+    re.IGNORECASE,
+)
+_COMPACT_RECORD_DUTY = re.compile(
+    r"(?:^|[，,。；;|｜])\s*(?:负责|参与|主导|协助|支持|配合|完成|推动|推进|"
+    r"组织|设计|开发|构建|实现|制定|管理|运营|分析|研究|撰写|输出|交付|"
+    r"维护|优化|搭建|建立|开展|承担|提供|跟进|协调|带领|执行)"
+)
+_SOURCE_RELATION_LABEL = re.compile(
+    r"^(?:指导老师|指导教师|导师|项目导师|论文导师|推荐人|联系人)\s*[:：]",
+    re.IGNORECASE,
+)
+_PROJECT_TITLE_SIGNAL = re.compile(
+    r"(?:项目|系统|平台|课题|作品|游戏|模型|算法)(?:\s*[-–—:]\s*[^。；;!?！？]{2,60})?$",
+    re.IGNORECASE,
+)
+_PROJECT_ACTION_START = re.compile(
+    r"^(?:负责|参与|主导|协助|支持|完成|推动|设计|开发|构建|实现|优化|"
+    r"研究|分析|测试|搭建|维护|撰写|输出|交付|采用|使用|通过|基于)",
+    re.IGNORECASE,
+)
+_INLINE_AWARD_FACT = re.compile(
+    r"(?:奖学金|一等奖|二等奖|三等奖|特等奖|金奖|银奖|铜奖|优秀学生干部|"
+    r"优秀志愿者|优秀毕业生|荣誉称号|大赛获奖|竞赛获奖)$"
+)
+
+
+def _normalize_section_heading(value: str) -> str:
+    return re.sub(
+        r"[\s:：|｜/\\【】\[\]()（）]+", "", str(value or "").strip()
+    ).casefold()
 
 
 _QUERY_DIRECTION_ONLY = re.compile(
@@ -154,12 +194,85 @@ def _query_inline_section_hint(value: str) -> str:
 
 def _is_section_heading(value: str) -> bool:
     value = re.sub(r"^[^\w\u4e00-\u9fff]+|[^\w\u4e00-\u9fff]+$", "", value.strip())
-    normalized = re.sub(r"[\s:：|｜/\\【】\[\]()（）]+", "", value).casefold()
-    return any(
-        normalized == re.sub(r"\s+", "", alias).casefold()
+    normalized = _normalize_section_heading(value)
+    return normalized in _GENERIC_SECTION_HEADINGS or any(
+        normalized == _normalize_section_heading(alias)
         for aliases in _SECTION_ALIASES.values()
         for alias in aliases
     )
+
+
+def _looks_like_layout_heading(value: str) -> bool:
+    """Detect a short visual heading so the previous section cannot leak.
+
+    Unknown headings are deliberately left untyped.  Treating them as a layout
+    boundary is safer than assigning every following line to the last known
+    section, which can turn an entire employment history into education.
+    """
+
+    text = str(value or "").strip().strip(":：|｜/\\【】[]()（）")
+    normalized = re.sub(r"\s+", "", text).casefold()
+    if not normalized or len(normalized) > 18:
+        return False
+    if _RECORD_DATE.search(text) or _QUERY_CONTACT_FACT.search(text):
+        return False
+    if re.search(r"[，,。；;!?！？]", text):
+        return False
+    return normalized in _GENERIC_SECTION_HEADINGS or bool(_HEADING_SUFFIX.search(normalized))
+
+
+def _resolve_generic_section_heading(lines: list[str], index: int) -> str:
+    """Resolve an ambiguous ``经历`` heading from nearby field grammar.
+
+    The resolver uses dates, entities and action clauses rather than job-title
+    vocabulary, so it applies equally to medicine, teaching and operations.
+    An ambiguous heading with no structural evidence remains unscoped.
+    """
+
+    value = re.sub(r"[\s:：|｜/\\【】\[\]()（）]+", "", lines[index]).casefold()
+    if value not in _GENERIC_SECTION_HEADINGS:
+        return ""
+    following: list[str] = []
+    for candidate in lines[index + 1:index + 5]:
+        if _section_hint(candidate) or _looks_like_layout_heading(candidate):
+            break
+        following.append(candidate.strip())
+    if not following:
+        return ""
+
+    joined = "\n".join(following)
+    dated_duty_rows = [
+        item for item in following
+        if _RECORD_DATE.match(item) and _COMPACT_RECORD_DUTY.search(item)
+    ]
+    dated_role_rows = [
+        item for item in dated_duty_rows
+        if _RECORD_ROLE.search(
+            re.split(r"[，,。；;]", item, maxsplit=1)[0].strip()
+        )
+    ]
+    # A generic “经历” followed by one explicitly titled dated row, or by
+    # multiple dated responsibility rows, is employment/internship history.
+    # This structural signal must win before words such as “平台/系统” inside a
+    # product-manager duty are mistaken for a project heading.
+    if dated_role_rows or len(dated_duty_rows) >= 2:
+        return "experience"
+    if re.search(r"(?:项目|系统|平台|课题|作品)(?:名称)?\s*[:：]", joined):
+        return "projects"
+    if any(_INLINE_PROJECT_FACT.search(item) for item in following):
+        return "projects"
+    if any(
+        _RECORD_DATE.search(item)
+        and (_RECORD_ENTITY_TOKEN.search(item) or _RECORD_ENTITY.search(item))
+        and (_COMPACT_RECORD_DUTY.search(item) or len(re.split(r"[|｜\t]", item)) >= 2)
+        for item in following
+    ):
+        return "experience"
+    if any(_INLINE_EXPERIENCE_FACT.search(item) for item in following):
+        return "experience"
+    if any(_INLINE_EDUCATION_FACT.search(item) for item in following):
+        return "education"
+    return ""
 
 
 def _query_line_is_fact(
@@ -203,16 +316,16 @@ def _query_line_is_fact(
 
 def _section_hint(line: str) -> str:
     line = re.sub(r"^[^\w\u4e00-\u9fff]+|[^\w\u4e00-\u9fff]+$", "", line.strip())
-    normalized = re.sub(r"[\s:：|｜/\\【】\[\]()（）]+", "", line).casefold()
+    normalized = _normalize_section_heading(line)
     for section, aliases in _SECTION_ALIASES.items():
-        if any(normalized == re.sub(r"\s+", "", alias).casefold() for alias in aliases):
+        if any(normalized == _normalize_section_heading(alias) for alias in aliases):
             return section
     # Inline labels such as "专业技能：Python、SQL" should also carry a
     # structural hint while preserving the complete source line.
     prefix = re.split(r"[:：]", line, maxsplit=1)[0]
-    normalized_prefix = re.sub(r"\s+", "", prefix).casefold()
+    normalized_prefix = _normalize_section_heading(prefix)
     for section, aliases in _SECTION_ALIASES.items():
-        if any(normalized_prefix == re.sub(r"\s+", "", alias).casefold() for alias in aliases):
+        if any(normalized_prefix == _normalize_section_heading(alias) for alias in aliases):
             return section
     return ""
 
@@ -237,25 +350,29 @@ _RECORD_CONTEXT_ACTION = re.compile(
 _RECORD_RESULT_SIGNAL = re.compile(
     r"(?:提升|降低|增长|减少|缩短|节省|达到|达成|上线|交付|完成|获奖|录用|复核|验证)"
 )
+_RECORD_DATE_ATOM = (
+    r"(?:(?:19|20)\d{2}(?:[./年-]\d{1,2}月?)?"
+    r"|(?:0?[1-9]|1[0-2])[./-](?:19|20)\d{2})"
+)
 _RECORD_DATE = re.compile(
-    r"(?:19|20)\d{2}(?:[./年-]\d{1,2}月?)?(?:\s*[-—~至到]\s*"
-    r"(?:(?:19|20)\d{2}(?:[./年-]\d{1,2}月?)?|今|至今|现在))?"
+    rf"{_RECORD_DATE_ATOM}(?:\s*[-–—~至到]\s*"
+    rf"(?:{_RECORD_DATE_ATOM}|今|至今|现在))?"
 )
 _RECORD_OPEN_START = re.compile(
     r"^(?:19|20)\d{2}(?:[./年-]\d{1,2}月?)?\s*至\s*$"
 )
 _RECORD_ENTITY = re.compile(
-    r"(?:大学|学院|学校|医院|公司|企业|集团|研究院|实验室|中心|部门|协会|学会|"
+    r"(?:大学|学院|学校|中学|小学|幼儿园|医院|公司|企业|集团|研究院|实验室|中心|部门|协会|学会|"
     r"学生会|社团|委员会|事务所|律所|银行|政府|基金会|工作室|团队|基地|项目)$"
 )
 _RECORD_ENTITY_TOKEN = re.compile(
-    r"(?:大学|学院|学校|医院|公司|企业|集团|研究院|实验室|中心|部门|协会|学会|"
+    r"(?:大学|学院|学校|中学|小学|幼儿园|医院|公司|企业|集团|研究院|实验室|中心|部门|协会|学会|"
     r"学生会|社团|委员会|事务所|律所|银行|政府|基金会|工作室|团队|基地)"
 )
 _RECORD_ROLE = re.compile(
     r"(?:工程师|设计师|教师|老师|医生|医师|护士|经理|主管|总监|主任|顾问|"
     r"研究员|专员|助理|负责人|组长|队长|主席|部长|实习生|实习|分析师|架构师|"
-    r"运营|产品|开发|测试|销售|讲师)$"
+    r"运营|产品|开发|测试|销售|讲师|管理岗|岗位|岗)$"
 )
 
 
@@ -285,6 +402,8 @@ def _looks_like_record_header(value: str, section: str) -> bool:
         return False
     text = raw.strip(" \t-•")
     if not text:
+        return False
+    if re.search(r"[。；;!?！？]$", text):
         return False
     # Compact OCR commonly joins organization, role and department without a
     # delimiter (for example ``某公司 用户增长运营专员运营部``).  Treat the
@@ -318,6 +437,8 @@ def _assign_record_ids(blocks: list[SourceBlock]) -> None:
     record_index = -1
     saw_body = False
     saw_entity_header = False
+    saw_dated_header = False
+    previous_was_project_title = False
     last_number: int | None = None
     for index, block in enumerate(blocks):
         section = block.section_hint or ""
@@ -331,6 +452,8 @@ def _assign_record_ids(blocks: list[SourceBlock]) -> None:
             current_id = None
             saw_body = False
             saw_entity_header = False
+            saw_dated_header = False
+            previous_was_project_title = False
             last_number = None
             continue
         if section != current_section:
@@ -338,6 +461,8 @@ def _assign_record_ids(blocks: list[SourceBlock]) -> None:
             current_id = None
             saw_body = False
             saw_entity_header = False
+            saw_dated_header = False
+            previous_was_project_title = False
             last_number = None
 
         value = block.text.strip()
@@ -346,6 +471,21 @@ def _assign_record_ids(blocks: list[SourceBlock]) -> None:
         is_body = _looks_like_record_body(value)
         is_header = _looks_like_record_header(value, section)
         is_entity = bool(_RECORD_ENTITY.search(value.strip(" \t-•")))
+        is_relation_label = bool(_SOURCE_RELATION_LABEL.match(value))
+        project_named_header = bool(
+            section == "projects"
+            and len(value) <= 100
+            and not re.search(r"[。；;!?！？]$", value)
+            and re.search(r"(?:项目|系统|平台|课题|作品|游戏|模型|算法)$", value)
+        )
+        if project_named_header:
+            is_body = False
+            is_header = True
+        if is_relation_label:
+            is_header = False
+            is_entity = False
+        has_date = bool(_RECORD_DATE.search(value))
+        has_entity_token = bool(_RECORD_ENTITY_TOKEN.search(value))
         previous_value = blocks[index - 1].text.strip() if index > 0 else ""
         previous_same_section = (
             index > 0 and (blocks[index - 1].section_hint or "") == section
@@ -354,10 +494,21 @@ def _assign_record_ids(blocks: list[SourceBlock]) -> None:
             previous_same_section
             and previous_value
             and not re.search(r"[。；;!?！？]$", previous_value)
-            and _looks_like_record_body(previous_value)
+            and (
+                _looks_like_record_body(previous_value)
+                or (
+                    saw_body
+                    and not _looks_like_record_header(previous_value, section)
+                    and not _RECORD_DATE.fullmatch(previous_value)
+                )
+            )
             and item_number is None
             and not _RECORD_DATE.fullmatch(value)
-            and not _RECORD_ENTITY_TOKEN.search(value)
+            and not (
+                _RECORD_ENTITY_TOKEN.search(value)
+                and not re.search(r"[。；;!?！？]$", value)
+            )
+            and len(re.split(r"[|｜\t]", value)) < 2
             and len(value) <= 160
         )
         if continuation_from_previous:
@@ -377,10 +528,28 @@ def _assign_record_ids(blocks: list[SourceBlock]) -> None:
             and not is_body
             and _RECORD_ROLE.search(next_value.strip(" \t-•"))
         )
+        project_title_text = re.sub(r"^[-*•·▪◦]\s*", "", value).strip()
+        is_project_title = bool(
+            section == "projects"
+            and re.match(r"^[-*•·▪◦]\s*\S", value)
+            and next_same_section
+            and (
+                len(re.split(r"[|｜\t]", next_value)) >= 2
+                or bool(_RECORD_ENTITY_TOKEN.search(next_value))
+                or bool(_RECORD_DATE.fullmatch(next_value))
+                or (
+                    len(project_title_text) <= 140
+                    and not _PROJECT_ACTION_START.match(project_title_text)
+                    and bool(_PROJECT_TITLE_SIGNAL.search(project_title_text))
+                )
+            )
+        )
 
         starts_record = current_id is None
         if current_id is not None:
-            if (
+            if is_project_title:
+                starts_record = True
+            elif (
                 item_number is not None
                 and last_number is not None
                 and item_number <= last_number
@@ -392,23 +561,54 @@ def _assign_record_ids(blocks: list[SourceBlock]) -> None:
                 starts_record = True
             elif _RECORD_OPEN_START.fullmatch(value) and saw_entity_header:
                 starts_record = True
-            elif saw_body and (is_header or short_header_before_role):
+            elif (
+                saw_dated_header
+                and has_date
+                and (
+                    has_entity_token
+                    or (
+                        _RECORD_DATE.match(value)
+                        and _COMPACT_RECORD_DUTY.search(value)
+                    )
+                )
+            ):
+                # Compact rows commonly contain date, organization, title and
+                # duty in one physical line.  A later date-leading duty row is
+                # an explicit new record even when the organization is a brand
+                # name without a legal suffix such as “公司/医院”.
+                starts_record = True
+            elif (
+                saw_body
+                and not previous_was_project_title
+                and not is_relation_label
+                and (is_header or short_header_before_role)
+            ):
                 starts_record = True
             elif (
                 saw_body
                 and not is_body
+                and not is_relation_label
                 and len(value) <= 64
                 and not re.search(r"[。；;!?！？]$", value)
+                and (
+                    section != "projects"
+                    or (
+                        next_same_section
+                        and _looks_like_record_body(next_value)
+                        and not value.endswith((":", "："))
+                    )
+                )
             ):
                 # In undated project/campus sections, a short plain line after
                 # bullets is normally the next record header. Requiring a
                 # profession dictionary here caused later projects and clubs
                 # to collapse into the first record.
                 starts_record = True
-            elif is_entity and saw_entity_header:
+            elif is_entity and not is_relation_label and saw_entity_header:
                 starts_record = True
             elif (
                 is_header
+                and not is_relation_label
                 and saw_entity_header
                 and len(re.split(r"[|｜\t]", value)) >= 2
                 and (
@@ -423,14 +623,29 @@ def _assign_record_ids(blocks: list[SourceBlock]) -> None:
             current_id = f"{block.source_type}:{section}:{record_index}"
             saw_body = False
             saw_entity_header = False
+            saw_dated_header = False
             last_number = None
         block.record_id = current_id
-        saw_body = saw_body or is_body
+        # A bullet marker is also commonly used for a project title.  It starts
+        # a record but must not make the immediately following organization/date
+        # header look like a new record body transition.
+        saw_body = saw_body or (is_body and not is_project_title)
         if item_number is not None:
             last_number = item_number
         saw_entity_header = saw_entity_header or is_entity or (
             is_header and len(re.split(r"[|｜\t]", value)) >= 2
         )
+        saw_dated_header = saw_dated_header or bool(
+            has_date
+            and (
+                has_entity_token
+                or (
+                    _RECORD_DATE.match(value)
+                    and _COMPACT_RECORD_DUTY.search(value)
+                )
+            )
+        )
+        previous_was_project_title = is_project_title
 
 
 def _coalesce_wrapped_blocks(blocks: list[SourceBlock]) -> list[SourceBlock]:
@@ -459,6 +674,7 @@ def _coalesce_wrapped_blocks(blocks: list[SourceBlock]) -> list[SourceBlock]:
             and not re.match(r"^(?:[-*•·▪◦]|\d{1,3}(?:[、)]|\.(?!\d)))\s*", value)
             and not _RECORD_DATE.fullmatch(value)
             and not _RECORD_ENTITY_TOKEN.search(value)
+            and len(re.split(r"[|｜\t]", value)) < 2
             and not _is_section_heading(value)
             and not _QUERY_CONTACT_FACT.search(value)
             and not re.search(
@@ -557,11 +773,11 @@ def _split_into_blocks(text: str, source_type: str) -> list[SourceBlock]:
     """Split text into ordered blocks and retain deterministic section hints."""
     blocks: list[SourceBlock] = []
     current_section = ""
-    for line in text.strip().split("\n"):
-        line = line.strip()
-        if not line:
+    lines = [line.strip() for line in text.strip().split("\n") if line.strip()]
+    for line_index, line in enumerate(lines):
+        normalized_line = _normalize_section_heading(line)
+        if re.fullmatch(r"[-*•·▪◦—–_]+", line):
             continue
-        normalized_line = re.sub(r"[\s:：|｜/\\【】\[\]()（）]+", "", line).casefold()
         if normalized_line in _LAYOUT_RESET_HEADINGS:
             current_section = ""
             blocks.append(SourceBlock(
@@ -573,21 +789,34 @@ def _split_into_blocks(text: str, source_type: str) -> list[SourceBlock]:
             ))
             continue
         detected = _section_hint(line)
+        if not detected and normalized_line in _GENERIC_SECTION_HEADINGS:
+            detected = _resolve_generic_section_heading(lines, line_index)
+        heading_boundary = _looks_like_layout_heading(line)
         layout_boundary = bool(
             re.search(r"(?:^|[。；;，,])\s*(?:求职意向|目标岗位|应聘岗位)\s*[:：]", line)
             or _QUERY_CONTACT_FACT.search(line)
         )
-        if layout_boundary and not detected:
+        if (layout_boundary or heading_boundary) and not detected:
             current_section = ""
         if detected:
             current_section = detected
         assigned_section = None if layout_boundary else (detected or current_section or None)
+        if not detected and _INLINE_AWARD_FACT.search(line.strip(" 	-•·，,。；;")):
+            # Strong award morphology overrides a stale visual skills column.
+            # This is a per-line correction so following unrelated content
+            # does not silently inherit an inferred section.
+            assigned_section = "awards"
         skill_dense = len(re.findall(r"(?:熟练|精通|掌握|熟悉|了解)", line)) >= 2
         standalone_skill = bool(re.fullmatch(
             r"[-•·]?\s*[^，,。；;]{2,48}?(?:熟练|精通|掌握|熟悉|了解)",
             line,
         ))
-        if not detected and assigned_section != "skills" and (skill_dense or standalone_skill):
+        if (
+            not detected
+            and assigned_section not in _RECORD_SECTIONS
+            and assigned_section != "skills"
+            and (skill_dense or standalone_skill)
+        ):
             assigned_section = "skills"
         if not detected and assigned_section in {"skills", "hobbies", "coursework"}:
             compact = line.strip(" \t-•·")

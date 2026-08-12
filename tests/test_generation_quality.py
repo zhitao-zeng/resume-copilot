@@ -429,7 +429,8 @@ def test_summary_is_deterministic_and_contains_no_subjective_filler():
     assert "某医院检验科实习生" in summary
     assert "病理切片制备" in summary
     assert "求职方向为病理科技师" in summary
-    assert len(summary) <= 100
+    assert len(summary) <= 260
+    assert summary.endswith("。")
     assert not any(word in summary for word in ("扎实", "敏锐", "致力于", "优秀"))
 
 
@@ -476,6 +477,49 @@ def test_summary_prioritizes_grounded_quantified_achievement():
     assert len(compacted.summary) <= 220
     assert compacted.summary.endswith("。")
     assert "4.8%降至3.1%" in compacted.projects[0].bullets[0]
+
+
+def test_summary_contextualizes_two_grounded_roles_without_inventing_star_facts():
+    resume = CanonicalResume.model_validate({
+        "meta": {"target_role": "产品经理", "work_experience": "4年经验"},
+        "experience": [
+            {
+                "organization": "第四范式",
+                "role": "产品经理",
+                "period": "2022.07-2026.05",
+                "bullets": [
+                    "负责企业数据平台需求调研、版本规划与跨团队推进，推动报表配置效率提升30%"
+                ],
+            },
+            {
+                "organization": "星河科技",
+                "role": "产品助理",
+                "period": "2020.07-2022.06",
+                "bullets": ["负责客户反馈整理、竞品分析和需求文档维护"],
+            },
+        ],
+        "education": [{"school": "复旦大学", "major": "计算机科学", "degree": "本科"}],
+        "skills": {"items": [
+            {"name": "SQL", "category": "tool"},
+            {"name": "Axure", "category": "tool"},
+            {"name": "Figma", "category": "tool"},
+            {"name": "数据分析", "category": "domain"},
+            {"name": "项目管理", "category": "methodology"},
+        ]},
+    })
+
+    summary = _build_evidence_summary(resume)
+
+    assert "拥有4年经验，曾任第四范式产品经理、星河科技产品助理，求职方向为产品经理" in summary
+    assert "在第四范式担任产品经理期间" in summary
+    assert "报表配置效率提升30%" in summary
+    assert "在星河科技担任产品助理期间" in summary
+    assert "客户反馈整理、竞品分析和需求文档维护" in summary
+    assert "核心技能包括SQL、Axure、Figma、数据分析、项目管理" in summary
+    assert "教育背景为复旦大学，计算机科学、本科" in summary
+    assert not any(token in summary for token in ("用户访谈", "PRD", "缩短周期"))
+    assert len(summary) <= 260
+    assert summary.endswith("。")
 
 
 def test_compound_grounded_bullet_preserves_action_result_chain():
@@ -1066,8 +1110,14 @@ def test_evidence_gate_rejects_cross_record_identity_splice():
         }],
     })
     gated, _, removed = enforce_resume_evidence(resume, source)
-    assert gated.experience == []
-    assert "experience[0]" in removed
+    # Preserve the company/period/bullet anchored to the first source record and
+    # remove only the role copied from the second record.
+    assert len(gated.experience) == 1
+    assert gated.experience[0].organization == "甲公司"
+    assert gated.experience[0].period == "2020.01-2022.01"
+    assert gated.experience[0].role == ""
+    assert gated.experience[0].bullets == ["负责需求分析并输出PRD。"]
+    assert removed == ["experience[0].role"]
 
 
 def test_source_coverage_detects_composer_omissions():
@@ -1153,6 +1203,30 @@ def test_optimizer_preserves_ownership_level_and_rejects_overcompression():
 
     detailed = "负责收集用户反馈、开展竞品分析并维护需求文档，协同研发跟进交付"
     assert _safe_rewrite(detailed, "负责产品工作") is False
+
+
+def test_optimizer_reinserts_source_ownership_when_method_leads_sentence():
+    from resume_optimizer import optimize_resume_with_provenance
+
+    original = "负责通过半结构化访谈梳理客户需求并输出需求清单"
+    resume = CanonicalResume.model_validate({
+        "experience": [{"bullets": [original]}],
+    })
+    response = json.dumps({
+        "experience": [{
+            "index": 0,
+            "bullets": ["通过半结构化访谈梳理客户需求，输出需求清单"],
+        }],
+    }, ensure_ascii=False)
+    with patch("resume_optimizer.llm_enabled", return_value=True), patch(
+        "resume_optimizer.call_llm_text", return_value=response,
+    ):
+        outcome = optimize_resume_with_provenance(resume, "产品经理")
+
+    assert outcome.resume.experience[0].bullets == [
+        "负责通过半结构化访谈梳理客户需求，输出需求清单"
+    ]
+    assert outcome.trusted_rewrites["experience[0].bullets[0]"] == original
 
 
 def test_optimizer_provenance_preserves_reviewed_low_overlap_rewrite():
@@ -1310,11 +1384,89 @@ def test_optimizer_keeps_unchanged_sibling_inside_an_atomic_grouped_record():
     }, ensure_ascii=False)
     with patch("resume_optimizer.llm_enabled", return_value=True), patch(
         "resume_optimizer.call_llm_text", return_value=response,
+    ), patch(
+        "resume_optimizer.review_entailment_batch", return_value=[True],
     ):
         outcome = optimize_resume_with_provenance(resume, "产品经理")
 
     assert outcome.resume.experience[0].bullets == [combined, original_bullets[1]]
     assert len(outcome.trusted_rewrites) == 2
+
+
+def test_optimizer_keeps_safe_group_when_sibling_semantic_review_fails():
+    from resume_optimizer import optimize_resume_with_provenance
+
+    original = [
+        "负责梳理客户需求",
+        "通过10次用户访谈收集反馈并输出需求清单",
+        "参与活动现场执行并记录问题",
+        "整理活动问题记录",
+    ]
+    resume = CanonicalResume.model_validate({
+        "experience": [{
+            "organization": "甲公司",
+            "role": "产品经理",
+            "period": "2022.01-2024.01",
+            "bullets": original,
+        }],
+    })
+    combined = "负责通过10次用户访谈收集反馈，梳理客户需求并输出需求清单"
+    weak_combined = "参与活动现场执行，记录并整理活动问题"
+    response = json.dumps({
+        "experience": [{
+            "index": 0,
+            "bullets": [
+                {"text": combined, "source_indices": [0, 1]},
+                {"text": weak_combined, "source_indices": [2, 3]},
+            ],
+        }],
+    }, ensure_ascii=False)
+    with patch("resume_optimizer.llm_enabled", return_value=True), patch(
+        "resume_optimizer.call_llm_text", return_value=response,
+    ), patch(
+        "resume_optimizer.review_entailment_batch", return_value=[True, False],
+    ):
+        outcome = optimize_resume_with_provenance(resume, "产品经理")
+
+    assert outcome.resume.experience[0].bullets == [combined, original[2], original[3]]
+    assert outcome.trusted_rewrites == {
+        "experience[0].bullets[0]": "\n".join(original[:2]),
+    }
+
+    source = build_source_bundle(
+        "工作经历\n甲公司｜产品经理｜2022.01-2024.01\n" + "\n".join(original),
+        "",
+        "",
+    )
+    gated, bindings, removed = enforce_resume_evidence(
+        outcome.resume,
+        source,
+        trusted_rewrites=outcome.trusted_rewrites,
+    )
+    assert removed == []
+    assert gated.experience[0].bullets == outcome.resume.experience[0].bullets
+    coverage, missing = measure_source_coverage(source, bindings)
+    assert coverage == 1.0
+    assert missing == []
+
+
+def test_optimizer_payload_exposes_source_present_star_dimensions_only():
+    from resume_optimizer import _build_optimizer_batches
+
+    resume = CanonicalResume.model_validate({
+        "experience": [{
+            "bullets": [
+                "负责客户访谈并输出需求清单",
+                "通过问卷覆盖200名用户",
+            ],
+        }],
+    })
+
+    record = _build_optimizer_batches(resume)[0]["experience"][0]
+
+    assert record["evidence_plan"][0]["ownership"] == "responsible"
+    assert "deliverable" in record["evidence_plan"][0]["source_dimensions"]
+    assert record["evidence_plan"][1]["source_dimensions"] == ["method", "result"]
 
 
 def test_optimizer_reverts_high_risk_rewrite_when_semantic_review_rejects():
