@@ -23,6 +23,8 @@ from docx.oxml.ns import qn
 from docx.shared import Inches, Mm, Pt, RGBColor
 from lxml import etree
 
+from template_layout import apply_template_style_profile, extract_template_style_profile
+
 try:
     from fontTools import subset as font_subset
     from fontTools.ttLib import TTCollection, TTFont
@@ -101,10 +103,11 @@ def _normalize_template(template: str) -> str:
     tpl = (template or "classic").strip()
     if not tpl:
         return "classic"
-    # If it looks like a file path, check if file exists and return as-is
+    # Accept both absolute paths and relative filenames.  The old separator
+    # check silently downgraded a valid ``template.docx`` in the CWD.
+    if Path(tpl).is_file():
+        return tpl
     if "/" in tpl or "\\" in tpl:
-        if Path(tpl).is_file():
-            return tpl
         return "classic"
     if tpl not in SUPPORTED_TEMPLATES:
         return "classic"
@@ -280,6 +283,11 @@ def _ensure_run_east_asia_font(run: Any, font_family: str) -> None:
     if r_fonts is None:
         r_fonts = etree.Element(f"{{{_OOXML_WORD_NS}}}rFonts")
         r_pr.insert(0, r_fonts)
+    # A user template may intentionally declare a different CJK typeface.
+    # Keep that declaration and only fill missing mappings; generated runs
+    # without an East Asia font still receive the portable fallback.
+    if r_fonts.get(f"{{{_OOXML_WORD_NS}}}eastAsia"):
+        return
     r_fonts.set(f"{{{_OOXML_WORD_NS}}}eastAsia", font_family)
     r_fonts.attrib.pop(f"{{{_OOXML_WORD_NS}}}eastAsiaTheme", None)
 
@@ -1734,6 +1742,71 @@ def _clear_docx_body_for_style_template(doc: DocxDocument) -> None:
         body.remove(child)
 
 
+def _template_supports_structured_injection(doc: DocxDocument) -> bool:
+    """Return whether a DOCX exposes anchors that can be filled safely.
+
+    A table by itself is not an anchor.  Treating every table-based document
+    as injectable retained example names and stale rows, while appending the
+    generated resume underneath.  Require an explicit placeholder or a known
+    section heading in either normal paragraphs or table cells.
+    """
+
+    paragraphs: list[Any] = list(doc.paragraphs)
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                paragraphs.extend(cell.paragraphs)
+    for paragraph in paragraphs:
+        text = paragraph.text.strip()
+        if re.search(
+            r"(?:\{\{[^{}]+\}\}|\$\{[^{}]+\}|\[\[[^\[\]]+\]\])",
+            text,
+        ):
+            return True
+        normalized = re.sub(r"[\s:：]+", "", text)
+        if any(re.sub(r"[\s:：]+", "", title) == normalized for title in _RESUME_SECTION_TITLES):
+            return True
+    return False
+
+
+def _initialize_docx_defaults(doc: DocxDocument, *, reset_geometry: bool) -> None:
+    normal_style = doc.styles["Normal"]
+    if not normal_style.font.name:
+        normal_style.font.name = DEFAULT_DOC_FONT
+    if normal_style.font.size is None:
+        normal_style.font.size = Pt(10.5)
+    if normal_style.paragraph_format.space_after is None:
+        normal_style.paragraph_format.space_after = Pt(2)
+    if normal_style.paragraph_format.line_spacing is None:
+        normal_style.paragraph_format.line_spacing = 1.2
+
+    if reset_geometry:
+        section = doc.sections[0]
+        section.page_width = Mm(210)
+        section.page_height = Mm(297)
+        section.top_margin = Inches(0.6)
+        section.bottom_margin = Inches(0.6)
+        section.left_margin = Inches(0.75)
+        section.right_margin = Inches(0.75)
+
+
+def _render_docx_with_preset(
+    doc: DocxDocument,
+    resume_data: dict[str, Any],
+    preset: str,
+    framework_mode: bool,
+) -> None:
+    selected = preset if preset in SUPPORTED_TEMPLATES else "classic"
+    if framework_mode:
+        _render_docx_empty_profile_framework(doc, resume_data, selected)
+    elif selected == "minimal":
+        _render_docx_minimal(doc, resume_data)
+    elif selected == "modern":
+        _render_docx_modern(doc, resume_data)
+    else:
+        _render_docx_classic(doc, resume_data)
+
+
 def _render_docx_empty_profile_framework(
     doc: DocxDocument,
     resume_data: dict[str, Any],
@@ -2282,64 +2355,27 @@ def render_docx(
     tpl = _normalize_template(template)
     resume_data = _compress_resume_data_for_docx(resume_data)
     framework_mode = _is_empty_profile_framework(resume_data)
+    profile = extract_template_style_profile(tpl)
+    template_path = Path(tpl) if Path(tpl).is_file() else None
+    source_docx: Optional[DocxDocument] = None
 
-    # Custom template: load as source doc and merge resume data
-    if not framework_mode and ("/" in tpl or "\\" in tpl):
-        template_path = Path(tpl)
-        if template_path.is_file() and template_path.suffix.lower() == ".docx":
-            doc = DocxDocument(str(template_path))
-            # Only treat as an injection template if it has actual content
-            # (tables or placeholders). Style-guide documents with only static
-            # text would produce empty output since nothing can be injected.
-            _has_tables = len(doc.tables) > 0
-            _has_placeholders = False
-            _has_section_headings = False
-            for p in doc.paragraphs:
-                if re.search(r"[{【].*[}】]|name|phone|email|experience|education|skills", p.text, re.IGNORECASE):
-                    _has_placeholders = True
-                normalized = re.sub(r"[\s:：]+", "", p.text)
-                if any(
-                    re.sub(r"[\s:：]+", "", title) == normalized
-                    for title in _RESUME_SECTION_TITLES
-                ):
-                    _has_section_headings = True
-            if _has_tables or _has_placeholders or _has_section_headings:
-                _apply_resume_data_to_template(doc, resume_data)
-                if _layout_retry:
-                    _apply_docx_compact_typography(doc)
-                _apply_docx_pagination_guards(doc)
-                doc.save(str(output_path))
-                _make_docx_cjk_portable(output_path)
-                actual_report = inspect_docx_layout(output_path)
-                logger.info("DOCX Visual QA: renderer=%s pages=%s issues=%s",
-                            actual_report.get("renderer"), actual_report.get("page_count"), actual_report.get("issues"))
-                if _layout_needs_tightening(actual_report) and not _layout_retry:
-                    render_docx(
-                        _layout_retry_data(resume_data, actual_report), output_path,
-                        template=template, _layout_retry=True,
-                    )
-                return
-            # A static DOCX still carries valuable page geometry, headers,
-            # footers, styles, theme and numbering.  Use it as the output
-            # package after removing example body copy instead of discarding it
-            # and silently switching to a brand-new built-in document.
-            logger.info(
-                "Template %s has no tables/placeholders; rendering into preserved style package",
-                template_path.name,
-            )
-            _clear_docx_body_for_style_template(doc)
-            _render_docx_classic(doc, resume_data)
+    if template_path is not None and template_path.suffix.lower() == ".docx":
+        source_docx = DocxDocument(str(template_path))
+        if not framework_mode and _template_supports_structured_injection(source_docx):
+            _apply_resume_data_to_template(source_docx, resume_data)
+            apply_template_style_profile(source_docx, resume_data, profile)
             if _layout_retry:
-                _apply_docx_compact_typography(doc)
-            _apply_docx_pagination_guards(doc)
-            doc.save(str(output_path))
+                _apply_docx_compact_typography(source_docx)
+            _apply_docx_pagination_guards(source_docx)
+            source_docx.save(str(output_path))
             _make_docx_cjk_portable(output_path)
             actual_report = inspect_docx_layout(output_path)
             logger.info(
-                "DOCX Visual QA: renderer=%s pages=%s issues=%s",
+                "DOCX Visual QA: renderer=%s pages=%s issues=%s template_source=%s",
                 actual_report.get("renderer"),
                 actual_report.get("page_count"),
                 actual_report.get("issues"),
+                profile.source_kind,
             )
             if _layout_needs_tightening(actual_report) and not _layout_retry:
                 render_docx(
@@ -2350,46 +2386,19 @@ def render_docx(
                 )
             return
 
-    visual_report = (
-        {"available": False, "issues": ["actual_docx_check_pending"]}
-        if shutil.which("libreoffice")
-        else _preview_visual_layout(resume_data, tpl if tpl in SUPPORTED_TEMPLATES else "classic")
-    )
-    if visual_report.get("available"):
-        logger.info(
-            "Visual QA: pages=%s chars=%s issues=%s",
-            visual_report.get("page_count"),
-            visual_report.get("page_char_counts"),
-            visual_report.get("issues"),
-        )
-
-    # Built-in templates
-    doc = DocxDocument()
-
-    normal_style = doc.styles["Normal"]
-    normal_style.font.name = DEFAULT_DOC_FONT
-    normal_style.font.size = Pt(10.5)
-    normal_style.paragraph_format.space_after = Pt(2)
-    normal_style.paragraph_format.line_spacing = 1.2
-
-    section = doc.sections[0]
-    section.page_width = Mm(210)
-    section.page_height = Mm(297)
-    section.top_margin = Inches(0.6)
-    section.bottom_margin = Inches(0.6)
-    section.left_margin = Inches(0.75)
-    section.right_margin = Inches(0.75)
-
-    if framework_mode:
-        _render_docx_empty_profile_framework(
-            doc, resume_data, tpl if tpl in SUPPORTED_TEMPLATES else "classic"
-        )
-    elif tpl == "minimal":
-        _render_docx_minimal(doc, resume_data)
-    elif tpl == "modern":
-        _render_docx_modern(doc, resume_data)
+    # A static DOCX remains the package source so headers, footers, theme,
+    # numbering and page settings survive.  PDF/image templates contribute a
+    # bounded visual profile to a new editable DOCX.
+    if source_docx is not None:
+        doc = source_docx
+        _clear_docx_body_for_style_template(doc)
+        _initialize_docx_defaults(doc, reset_geometry=False)
     else:
-        _render_docx_classic(doc, resume_data)
+        doc = DocxDocument()
+        _initialize_docx_defaults(doc, reset_geometry=True)
+
+    _render_docx_with_preset(doc, resume_data, profile.preset, framework_mode)
+    apply_template_style_profile(doc, resume_data, profile)
 
     _apply_docx_pagination_guards(doc)
     if _layout_retry:
@@ -2400,9 +2409,9 @@ def render_docx(
     actual_report = inspect_docx_layout(output_path)
     if actual_report.get("available"):
         logger.info(
-            "DOCX Visual QA: renderer=%s pages=%s chars=%s issues=%s",
+            "DOCX Visual QA: renderer=%s pages=%s chars=%s issues=%s template_source=%s",
             actual_report.get("renderer"), actual_report.get("page_count"),
-            actual_report.get("page_char_counts"), actual_report.get("issues"),
+            actual_report.get("page_char_counts"), actual_report.get("issues"), profile.source_kind,
         )
         if _layout_needs_tightening(actual_report) and not _layout_retry:
             render_docx(
@@ -2460,10 +2469,21 @@ def _apply_resume_data_to_template(doc: "DocxDocument", resume_data: dict[str, A
             if paragraph_properties is not None:
                 paragraph.append(copy.deepcopy(paragraph_properties))
         run = OxmlElement("w:r")
+        if template_element is not None:
+            prototype_run = template_element.find(qn("w:r"))
+            prototype_run_properties = (
+                prototype_run.find(qn("w:rPr"))
+                if prototype_run is not None else None
+            )
+            if prototype_run_properties is not None:
+                run.append(copy.deepcopy(prototype_run_properties))
         if bold:
-            run_properties = OxmlElement("w:rPr")
-            run_properties.append(OxmlElement("w:b"))
-            run.append(run_properties)
+            run_properties = run.find(qn("w:rPr"))
+            if run_properties is None:
+                run_properties = OxmlElement("w:rPr")
+                run.insert(0, run_properties)
+            if run_properties.find(qn("w:b")) is None:
+                run_properties.append(OxmlElement("w:b"))
         text_element = OxmlElement("w:t")
         if text.startswith(" ") or text.endswith(" "):
             text_element.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
@@ -2472,6 +2492,32 @@ def _apply_resume_data_to_template(doc: "DocxDocument", resume_data: dict[str, A
         paragraph.append(run)
         anchor.addnext(paragraph)
         return paragraph
+
+    original_paragraphs = all_paragraphs()
+    heading_prototype = next(
+        (
+            paragraph._element
+            for paragraph in original_paragraphs
+            if any(
+                _template_section_matches(paragraph.text.strip(), heading)
+                for heading in section_headings
+            )
+        ),
+        None,
+    )
+    body_prototype = next(
+        (
+            paragraph._element
+            for paragraph in original_paragraphs
+            if paragraph.text.strip()
+            and not any(
+                _template_section_matches(paragraph.text.strip(), heading)
+                for heading in section_headings
+            )
+            and not re.search(r"(?:\{\{|\$\{|\[\[)", paragraph.text)
+        ),
+        None,
+    )
 
     for section_heading, items in sections:
         matched = False
@@ -2524,25 +2570,38 @@ def _apply_resume_data_to_template(doc: "DocxDocument", resume_data: dict[str, A
         if matched:
             continue
         # A user template rarely contains every profession-specific heading.
-        # Append every non-empty unmatched section so custom styling cannot
-        # silently discard research, campus, education, skills or publications.
-        section_para = doc.add_paragraph()
-        run = section_para.add_run(section_heading)
-        run.bold = True
-        run.font.size = Pt(12)
-        section_para.paragraph_format.space_before = Pt(8)
-        section_para.paragraph_format.space_after = Pt(4)
+        # Append every non-empty unmatched section using the template's first
+        # heading/body prototypes so font, color, border and indentation are
+        # not silently replaced with hard-coded defaults.
+        body = doc._element.body
+        anchor = body[-2] if len(body) >= 2 and body[-1].tag == qn("w:sectPr") else body[-1]
+        anchor = insert_after(
+            anchor,
+            section_heading,
+            template_element=heading_prototype,
+            bold=True,
+        )
         for item in items:
             if isinstance(item, tuple) and len(item) == 2:
                 sub_heading, sub_items = item
-                sub_para = doc.add_paragraph()
-                sub_run = sub_para.add_run(str(sub_heading))
-                sub_run.bold = True
+                anchor = insert_after(
+                    anchor,
+                    str(sub_heading),
+                    template_element=body_prototype,
+                    bold=True,
+                )
                 for sub_item in sub_items:
-                    bullet = doc.add_paragraph(style="List Bullet")
-                    bullet.add_run(str(sub_item))
+                    anchor = insert_after(
+                        anchor,
+                        str(sub_item),
+                        template_element=body_prototype,
+                    )
             else:
-                doc.add_paragraph(str(item))
+                anchor = insert_after(
+                    anchor,
+                    str(item),
+                    template_element=body_prototype,
+                )
 
 
 def _template_section_matches(text: str, section_heading: str) -> bool:

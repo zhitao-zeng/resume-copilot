@@ -1,7 +1,9 @@
 import io
+import json
 import multiprocessing as mp
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 from PIL import Image
@@ -190,6 +192,27 @@ def test_primary_handles_grayscale_upload(monkeypatch):
     assert text == "hello"
 
 
+def test_ppocrv6_primary_preserves_rgb_channels(monkeypatch):
+    captured = {}
+
+    class Result:
+        boxes = np.array([[[0, 0], [100, 0], [100, 20], [0, 20]]])
+        txts = ("彩色标题",)
+
+    def engine(image):
+        captured["image"] = image.copy()
+        return Result()
+
+    source = Image.new("RGB", (200, 100), (25, 120, 230))
+    monkeypatch.setattr(resume_io, "_RAPID_OCR", engine)
+    monkeypatch.setattr(resume_io, "_RAPID_OCR_VERSION", "v6")
+
+    text = resume_io._ocr_image_with_rapid(_png_bytes(source))
+
+    assert text == "彩色标题"
+    assert tuple(captured["image"][0, 0]) == (25, 120, 230)
+
+
 def test_isolated_process_termination_is_real():
     context = mp.get_context("spawn")
     process = context.Process(target=_sleep_forever, args=(30.0,))
@@ -227,3 +250,60 @@ def test_v5_bundle_carries_classifier_shape_for_rapidocr_391(tmp_path):
 
     assert selected is not None
     assert selected["cls_image_shape"] == [3, 80, 160]
+
+
+def test_multicolumn_layout_fixture_preserves_text_and_reading_order():
+    fixture_path = Path(__file__).parent / "fixtures" / "multicolumn_layout_cases.json"
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+
+    for case in fixture["cases"]:
+        boxes = []
+        for block in case["blocks"]:
+            x_min, y_min, x_max, y_max = block["bbox"]
+            boxes.append([
+                [x_min, y_min],
+                [x_max, y_min],
+                [x_max, y_max],
+                [x_min, y_max],
+            ])
+        actual = resume_io._reconstruct_ocr_reading_order(
+            boxes,
+            [block["text"] for block in case["blocks"]],
+            img_width=case["width"],
+            img_height=case["height"],
+        )
+        assert actual == case["expected"], case["id"]
+        assert sorted(actual) == sorted(block["text"] for block in case["blocks"]), case["id"]
+
+
+def test_native_pdf_text_layer_uses_coordinate_aware_column_order():
+    def line(text, bbox):
+        return {"bbox": bbox, "spans": [{"text": text}]}
+
+    # Deliberately interleave the PDF object order: right, left, right, left.
+    # Visual reading order should still consume the left sidebar before body.
+    page_dict = {
+        "blocks": [
+            {"type": 0, "lines": [line("工作经历", [300, 120, 410, 145])]},
+            {"type": 0, "lines": [line("个人技能", [40, 120, 150, 145])]},
+            {"type": 0, "lines": [line("星河科技｜产品经理", [300, 165, 540, 190])]},
+            {"type": 0, "lines": [line("SQL与数据分析", [40, 165, 180, 190])]},
+            {"type": 0, "lines": [line("张晨简历", [40, 35, 300, 70])]},
+        ]
+    }
+
+    class FakePage:
+        rect = SimpleNamespace(width=600, height=840)
+
+        def get_text(self, mode=None, **kwargs):
+            if mode == "dict":
+                return page_dict
+            return "对象流中的错误顺序"
+
+    assert resume_io._extract_native_pdf_page_text(FakePage()).splitlines() == [
+        "张晨简历",
+        "个人技能",
+        "SQL与数据分析",
+        "工作经历",
+        "星河科技｜产品经理",
+    ]

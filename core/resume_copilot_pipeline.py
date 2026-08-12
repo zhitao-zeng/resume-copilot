@@ -14,7 +14,7 @@ import re
 import time
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -75,6 +75,7 @@ from security_utils import (
     is_forbidden_ip,
     private_file_mode,
     read_upload_limited,
+    safe_filename,
     validate_public_http_url,
 )
 
@@ -520,18 +521,15 @@ async def _resolve_template_path(upload: Optional[UploadFile], warnings: list[di
         raise HTTPException(status_code=400, detail="cv_template file too large")
     filename = upload.filename or "template"
     ext = _file_ext(filename)
-    if ext == ".docx":
+    if ext == ".docx" or ext == ".pdf" or ext in IMAGE_EXTENSIONS:
         AVATAR_DIR.mkdir(parents=True, exist_ok=True)
-        path = AVATAR_DIR / f"template_{datetime.utcnow().strftime('%Y%m%d_%H%M%S_%f')}.docx"
+        original_name = safe_filename(filename, f"template{ext}")
+        path = AVATAR_DIR / (
+            f"template_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}_{original_name}"
+        )
         path.write_bytes(raw)
         private_file_mode(path)
         return str(path)
-    if ext in {".pdf", *IMAGE_EXTENSIONS}:
-        warnings.append({
-            "source": "cv_template", "filename": filename,
-            "message": "PDF/图片模板当前仅参考版式偏好，已使用标准可编辑 DOCX 模板输出。",
-        })
-        return template
     warnings.append({"source": "cv_template", "filename": filename, "message": "不支持的模板格式，已使用标准模板。"})
     return template
 
@@ -975,6 +973,7 @@ def build_reply_text(
     quality_report: dict[str, Any] | None = None,
     resume_data: dict[str, Any] | None = None,
     framework_mode: bool = False,
+    template_notes: list[str] | None = None,
 ) -> str:
     scenario_label = {
         "scenario1": "原始简历与目标 JD 优化",
@@ -990,6 +989,8 @@ def build_reply_text(
         resume_data=resume_data,
         framework_mode=framework_mode,
     )]
+    if template_notes:
+        parts.append("模板处理: " + "；".join(str(note) for note in template_notes[:2] if str(note).strip()))
     rewrite_count = _rewrite_change_count(changes)
     if rewrite_count:
         parts.append(f"已在不新增事实的前提下优化 {rewrite_count} 条经历/项目表述。")
@@ -1337,6 +1338,12 @@ async def stage_ingest(
         effective_template = template or DEFAULT_TEMPLATE
     if cv_template is not None and effective_template == (template or DEFAULT_TEMPLATE):
         ctx.template_notes.append("用户模板未能完整复刻，已使用标准 DOCX 模板输出。")
+    elif cv_template is not None and Path(effective_template).is_file():
+        suffix = Path(effective_template).suffix.lower()
+        if suffix == ".docx":
+            ctx.template_notes.append("已优先复用用户 DOCX 模板的结构、页边距与视觉样式。")
+        else:
+            ctx.template_notes.append("已从用户模板提取配色、对齐、间距与标题装饰，并生成可编辑 DOCX。")
     ctx.template_path = effective_template
 
     return ctx
@@ -1925,6 +1932,7 @@ async def stage_render(ctx: PipelineContext) -> PipelineContext:
         quality_report=ctx.quality_report,
         resume_data=ctx.resume_data,
         framework_mode=bool(ctx.user_report.get("framework_mode")),
+        template_notes=ctx.template_notes,
     )
     ctx.reply_text = reply_text
 

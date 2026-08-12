@@ -457,10 +457,10 @@ def _run_rapid_ocr(np_img):
 def _ocr_image_with_rapid(content: bytes, *, prepared_image=None) -> str:
     """Extract text from image using global RapidOCR (single engine call).
 
-    For two-column resume templates with a colored left banner (red/blue)
-    and white right body, extracts the green channel which maximizes
-    contrast for white-on-red text while preserving dark-on-white body text.
-    Calls the global engine ONCE.
+    PP-OCRv6 was trained for RGB document input; collapsing it to one channel
+    can erase colored section headings even when body text remains readable.
+    Legacy bundles retain the established green-channel transform for colored
+    sidebars.  The shared engine is called exactly once in either case.
     """
     import numpy as np  # noqa: F811
     from PIL import ImageOps
@@ -468,13 +468,15 @@ def _ocr_image_with_rapid(content: bytes, *, prepared_image=None) -> str:
     pil_img = prepared_image if prepared_image is not None else _prepare_ocr_image(content)[0]
 
     arr = np.array(pil_img)
-    # Extract green channel — ideal for white-on-red (red bg is dark in G,
-    # white text is bright) and adequate for dark-on-white body text.
-    green = arr[:, :, 1]  # shape (H, W), values 0-255
-    green_img = Image.fromarray(green).convert("L")
-    # Stretch contrast to full range
-    enhanced = ImageOps.autocontrast(green_img, cutoff=3)
-    np_img = np.array(enhanced.convert("RGB"))
+    if _RAPID_OCR_VERSION == "v6":
+        np_img = arr
+    else:
+        # Legacy recognition bundles benefited from this transform on white
+        # text over a red/blue sidebar.
+        green = arr[:, :, 1]
+        green_img = Image.fromarray(green).convert("L")
+        enhanced = ImageOps.autocontrast(green_img, cutoff=3)
+        np_img = np.array(enhanced.convert("RGB"))
 
     try:
         result = _run_rapid_ocr(np_img)
@@ -508,15 +510,14 @@ def _reconstruct_ocr_reading_order(
     img_width: int,
     img_height: int,
 ) -> list[str]:
-    """Reconstruct reading order from OCR blocks using layout analysis.
+    """Reconstruct deterministic reading order from OCR line polygons.
 
-    The raw OCR output orders blocks by detector confidence, not by reading
-    order.  This function:
-    1.  Extracts each block's bbox into structured fields
-    2.  Detects narrow side-column blocks (e.g. red banner with contact info)
-    3.  Identifies full-width blocks (e.g. paragraph text spanning the page)
-    4.  Clusters blocks into visual rows by y-overlap
-    5.  Orders: side column → full-width → main column, each sorted by y
+    Resume pages mix several layout grammars: a persistent sidebar, balanced
+    columns, right-aligned date annotations and ordinary key/value rows.  A
+    single x-coordinate threshold cannot distinguish them.  Use adaptive
+    recursive XY cuts instead: large persistent gutters form columns, smaller
+    horizontal gaps form bands, and ambiguous annotation gutters fall back to
+    row-major order.  Every source block is returned exactly once.
     """
     import numpy as np  # noqa: F811
 
@@ -527,8 +528,14 @@ def _reconstruct_ocr_reading_order(
     raw_blocks: list[dict] = []
     for i in range(len(boxes)):
         box = boxes[i]
+        confidence = 1.0
         if texts and i < len(texts) and texts[i]:
             raw_val = str(texts[i][0]) if isinstance(texts[i], (tuple, list)) else str(texts[i])
+            if isinstance(texts[i], (tuple, list)) and len(texts[i]) > 1:
+                try:
+                    confidence = float(texts[i][1])
+                except (TypeError, ValueError):
+                    confidence = 1.0
         else:
             raw_val = str(texts[i]) if texts and i < len(texts) and texts[i] is not None else ""
         text = raw_val.strip()
@@ -549,139 +556,212 @@ def _reconstruct_ocr_reading_order(
             "y_center": (y_min + y_max) / 2.0,
             "width": x_max - x_min,
             "height": y_max - y_min,
+            "confidence": confidence,
+            "source_index": i,
         })
 
     if not raw_blocks:
         return []
 
-    # ── 2. Detect side column (banner) blocks ──
-    # Chinese resume templates often have a narrow colored banner on the left
-    # with contact info (name, phone, email, job target).  These blocks have
-    # small x_max values compared to the main content blocks.
-    #
-    # Approach: cluster all blocks by x_max.  If there's a distinct cluster
-    # with small x_max and the gap to the next cluster is large enough,
-    # treat that cluster as a side column.
-    sorted_by_xmax = sorted(raw_blocks, key=lambda b: b["x_max"])
-    n = len(sorted_by_xmax)
+    median_height = float(np.median([block["height"] for block in raw_blocks]))
 
-    # Find the first large gap in x_max values that splits blocks into
-    # two meaningful groups (both sides must have >= 2 blocks).
-    gap_idx = -1
-    gap_threshold = img_width * 0.08  # 8% page width
-    for i in range(n - 1):
-        gap = sorted_by_xmax[i + 1]["x_max"] - sorted_by_xmax[i]["x_max"]
-        if gap >= gap_threshold:
-            left_count = i + 1
-            right_count = n - left_count
-            if left_count >= 2 and right_count >= 2:
-                gap_idx = i
-                break
+    def _row_overlap(left: dict, right: dict) -> float:
+        overlap = max(
+            0.0,
+            min(left["y_max"], right["y_max"])
+            - max(left["y_min"], right["y_min"]),
+        )
+        return overlap / max(1.0, min(left["height"], right["height"]))
 
-    side_col_x_max = 0
-    if gap_idx >= 0:
-        side_col_x_max = sorted_by_xmax[gap_idx]["x_max"]
-
-    # ── 3. Classify blocks into regions ──
-    SIDE = "side"
-    FULL = "full"
-    MAIN = "main"
-
-    def _classify(b: dict) -> str:
-        if side_col_x_max > 0 and b["x_max"] <= side_col_x_max and b["width"] < img_width * 0.4:
-            return SIDE
-        if b["width"] >= img_width * 0.6:
-            return FULL
-        return MAIN
-
-    # ── 4. Row clustering within each region ──
-    def _cluster_rows(region_blocks: list[dict]) -> list[list[dict]]:
-        if not region_blocks:
-            return []
-        region_blocks.sort(key=lambda b: b["y_center"])
+    def _row_major(blocks: list[dict]) -> list[dict]:
+        ordered = sorted(
+            blocks,
+            key=lambda block: (
+                block["y_center"], block["x_min"], block["source_index"]
+            ),
+        )
         rows: list[list[dict]] = []
-        current = [region_blocks[0]]
-        cur_y_min = region_blocks[0]["y_min"]
-        cur_y_max = region_blocks[0]["y_max"]
-
-        for b in region_blocks[1:]:
-            overlap = min(b["y_max"], cur_y_max) - max(b["y_min"], cur_y_min)
-            if overlap >= 0 or (b["y_min"] - cur_y_max) < 3:
-                current.append(b)
-                cur_y_min = min(cur_y_min, b["y_min"])
-                cur_y_max = max(cur_y_max, b["y_max"])
+        for block in ordered:
+            if not rows:
+                rows.append([block])
+                continue
+            current = rows[-1]
+            row_center = sum(item["y_center"] for item in current) / len(current)
+            row_height = max(item["height"] for item in current)
+            same_row = any(_row_overlap(block, item) >= 0.35 for item in current)
+            same_row = same_row or abs(block["y_center"] - row_center) <= max(
+                2.0, 0.32 * max(row_height, block["height"])
+            )
+            if same_row:
+                current.append(block)
             else:
-                rows.append(current)
-                current = [b]
-                cur_y_min = b["y_min"]
-                cur_y_max = b["y_max"]
-        if current:
-            rows.append(current)
-        return rows
-
-    # ── 5. Sort and flatten ──
-    side_blocks = [b for b in raw_blocks if _classify(b) == SIDE]
-    full_blocks = [b for b in raw_blocks if _classify(b) == FULL]
-    main_blocks = [b for b in raw_blocks if _classify(b) == MAIN]
-
-    # Within each row, sort blocks left-to-right
-    def _flatten_rows(rows: list[list[dict]]) -> list[str]:
-        result: list[str] = []
+                rows.append([block])
+        result: list[dict] = []
         for row in rows:
-            row.sort(key=lambda b: b["x_center"])
-            for b in row:
-                result.append(b["text"])
+            result.extend(sorted(
+                row,
+                key=lambda block: (block["x_min"], block["source_index"]),
+            ))
         return result
 
-    side_lines = _flatten_rows(_cluster_rows(side_blocks)) if side_blocks else []
-    main_lines = _flatten_rows(_cluster_rows(main_blocks)) if main_blocks else []
-    full_lines = _flatten_rows(_cluster_rows(full_blocks)) if full_blocks else []
+    def _projection_gaps(
+        blocks: list[dict],
+        *,
+        start_key: str,
+        end_key: str,
+    ) -> list[tuple[float, float, float]]:
+        intervals = sorted(
+            (float(block[start_key]), float(block[end_key]))
+            for block in blocks
+        )
+        if len(intervals) < 2:
+            return []
+        merged: list[list[float]] = [[intervals[0][0], intervals[0][1]]]
+        for start, end in intervals[1:]:
+            if start <= merged[-1][1] + 1.0:
+                merged[-1][1] = max(merged[-1][1], end)
+            else:
+                merged.append([start, end])
+        return [
+            (right[0] - left[1], left[1], right[0])
+            for left, right in zip(merged, merged[1:])
+            if right[0] > left[1]
+        ]
 
-    # Order: region groups, sorted internally by y.
-    #
-    # Full-width blocks (summary text) emit first — they are at the top
-    # of the page and span both columns.
-    #
-    # Side-column blocks (name/contact/target in the left colored banner)
-    # emit second — they form a visually distinct region that should be
-    # read before entering the main content area.
-    #
-    # Main-content blocks (work/skills/projects) emit last.
-    #
-    # Within each region, blocks are clustered into rows and sorted by y.
-    # Order: assign each block a sort key based on its region and position.
-    # Only rank blocks within the same region by y to avoid merging
-    # unrelated blocks from side column and main content.
-    SIDE_PRIORITY = 0
-    FULL_PRIORITY = 1
-    MAIN_PRIORITY = 2
+    def _median_width(blocks: list[dict]) -> float:
+        return float(np.median([block["width"] for block in blocks])) if blocks else 0.0
 
-    # Sort each region's blocks by y, then interleave by vertical position.
-    #
-    # For side-column vs main content: side column blocks are emitted first
-    # at each y-band, since the banner is logically read before the main
-    # content area at the same vertical level.
-    #
-    # For full-width blocks: they are placed before side column content if
-    # they sit above the side column (page header), or after main content
-    # if they sit below it (page footer).
-    side_ordered = sorted([b for b in raw_blocks if _classify(b) == SIDE], key=lambda b: b["y_center"])
-    full_ordered = sorted([b for b in raw_blocks if _classify(b) == FULL], key=lambda b: b["y_center"])
-    main_ordered = sorted([b for b in raw_blocks if _classify(b) == MAIN], key=lambda b: b["y_center"])
+    def _vertical_cut_is_annotation(
+        left: list[dict],
+        right: list[dict],
+        *,
+        normalized_gap: float,
+    ) -> bool:
+        smaller, larger = (left, right) if len(left) <= len(right) else (right, left)
+        if not smaller or not larger:
+            return True
+        paired = sum(
+            any(_row_overlap(block, other) >= 0.50 for other in larger)
+            for block in smaller
+        ) / len(smaller)
+        count_ratio = len(smaller) / max(1, len(larger))
+        width_ratio = _median_width(smaller) / max(1.0, _median_width(larger))
+        # A shallow gap between equally populated row fragments is normally a
+        # key/value form, not two independent reading columns.
+        # Detector boxes tightly wrap glyphs, so an ordinary form can expose a
+        # whitespace gap close to 10% of the page even when the visual label
+        # and value cells are adjacent.
+        if normalized_gap < 0.11 and paired >= 0.75:
+            return True
+        # A narrow, smaller group aligned one-to-one with wider record headers
+        # is normally a date/location annotation column. Read it in-row.
+        return count_ratio < 0.67 and paired >= 0.75 and width_ratio < 0.65
 
-    # Find the y range of side column content to position full-width blocks
-    if side_ordered:
-        side_min_y = min(b["y_min"] for b in side_ordered)
-        side_max_y = max(b["y_max"] for b in side_ordered)
-    else:
-        side_min_y, side_max_y = 0, 0
+    def _best_vertical_gap(
+        blocks: list[dict],
+        *,
+        force_aligned_gutter: bool = False,
+    ) -> Optional[tuple[float, float, bool, bool]]:
+        minimum = max(8.0, img_width * 0.055, median_height * 1.35)
+        gap_splits: list[tuple[float, float, list[dict], list[dict]]] = []
+        for gap, start, end in _projection_gaps(
+            blocks, start_key="x_min", end_key="x_max"
+        ):
+            if gap < minimum:
+                continue
+            cut = (start + end) / 2.0
+            left = [block for block in blocks if block["x_center"] < cut]
+            right = [block for block in blocks if block["x_center"] >= cut]
+            if len(left) < 2 or len(right) < 2:
+                continue
+            normalized_gap = gap / max(1.0, float(img_width))
+            gap_splits.append((normalized_gap, cut, left, right))
 
-    full_headers = [b for b in full_ordered if b["y_max"] < side_min_y or not side_ordered]
-    full_footers = [b for b in full_ordered if b["y_min"] >= side_max_y]
-    full_mid = [b for b in full_ordered if b not in full_headers and b not in full_footers]
+        # Multiple parallel gutters are strong evidence for an actual
+        # three-column grid, even when every row happens to align.
+        multi_gutter = len(gap_splits) >= 2
+        candidates: list[tuple[float, float, bool, bool]] = []
+        for normalized_gap, cut, left, right in gap_splits:
+            if not (multi_gutter or force_aligned_gutter) and _vertical_cut_is_annotation(
+                left, right, normalized_gap=normalized_gap
+            ):
+                continue
+            candidates.append((
+                normalized_gap,
+                cut,
+                multi_gutter and any(other[1] < cut for other in gap_splits),
+                multi_gutter and any(other[1] > cut for other in gap_splits),
+            ))
+        return max(candidates, default=None)
 
-    result = [b["text"] for b in full_headers] + [b["text"] for b in side_ordered] + [b["text"] for b in full_mid] + [b["text"] for b in main_ordered] + [b["text"] for b in full_footers]
-    return result
+    def _best_horizontal_gap(blocks: list[dict]) -> Optional[tuple[float, float]]:
+        minimum = max(4.0, img_height * 0.006, median_height * 0.35)
+        candidates: list[tuple[float, float]] = []
+        for gap, start, end in _projection_gaps(
+            blocks, start_key="y_min", end_key="y_max"
+        ):
+            if gap < minimum:
+                continue
+            cut = (start + end) / 2.0
+            top = [block for block in blocks if block["y_center"] < cut]
+            bottom = [block for block in blocks if block["y_center"] >= cut]
+            if not top or not bottom:
+                continue
+            candidates.append((gap / max(1.0, float(img_height)), cut))
+        return max(candidates, default=None)
+
+    def _recursive_order(
+        blocks: list[dict],
+        depth: int = 0,
+        *,
+        force_aligned_gutter: bool = False,
+    ) -> list[dict]:
+        if len(blocks) <= 1:
+            return list(blocks)
+        if depth >= 16:
+            return _row_major(blocks)
+
+        vertical = _best_vertical_gap(
+            blocks,
+            force_aligned_gutter=force_aligned_gutter,
+        )
+        horizontal = _best_horizontal_gap(blocks)
+        vertical_score = vertical[0] if vertical else -1.0
+        horizontal_score = horizontal[0] if horizontal else -1.0
+
+        # Prefer a persistent column gutter only when it is materially stronger
+        # than the whitespace between ordinary text rows.
+        if vertical and (
+            not horizontal or vertical_score >= horizontal_score * 1.20
+        ):
+            cut = vertical[1]
+            left = [block for block in blocks if block["x_center"] < cut]
+            right = [block for block in blocks if block["x_center"] >= cut]
+            return _recursive_order(
+                left,
+                depth + 1,
+                force_aligned_gutter=vertical[2],
+            ) + _recursive_order(
+                right,
+                depth + 1,
+                force_aligned_gutter=vertical[3],
+            )
+        if horizontal:
+            cut = horizontal[1]
+            top = [block for block in blocks if block["y_center"] < cut]
+            bottom = [block for block in blocks if block["y_center"] >= cut]
+            return _recursive_order(
+                top,
+                depth + 1,
+                force_aligned_gutter=force_aligned_gutter,
+            ) + _recursive_order(
+                bottom,
+                depth + 1,
+                force_aligned_gutter=force_aligned_gutter,
+            )
+        return _row_major(blocks)
+
+    return [block["text"] for block in _recursive_order(raw_blocks)]
 
 
 def _ocr_image_multicandidate(content: bytes, *, prepared_image=None) -> str:
@@ -1246,6 +1326,63 @@ def _extract_avatar_from_file_path(file_path: str) -> Optional[str]:
     return _extract_avatar_from_upload_bytes(payload, path.name)
 
 
+def _extract_native_pdf_page_text(page: Any) -> str:
+    """Extract a PDF text layer using the same layout ordering as OCR.
+
+    ``page.get_text()`` follows the PDF object's internal insertion order,
+    which is often column-interleaved in resume templates.  PyMuPDF's dict
+    representation retains line coordinates, so feed those coordinates into
+    the common, text-preserving layout sorter.  Fall back to plain extraction
+    for malformed or unusually shaped text dictionaries.
+    """
+    try:
+        page_dict = page.get_text("dict", sort=False) or {}
+        boxes: list[list[list[float]]] = []
+        texts: list[str] = []
+        for block in page_dict.get("blocks", []) or []:
+            if block.get("type", 0) != 0:
+                continue
+            for line in block.get("lines", []) or []:
+                line_text = "".join(
+                    str(span.get("text", ""))
+                    for span in (line.get("spans", []) or [])
+                ).strip()
+                bbox = line.get("bbox")
+                if not line_text or not bbox or len(bbox) != 4:
+                    continue
+                x_min, y_min, x_max, y_max = map(float, bbox)
+                if x_max <= x_min or y_max <= y_min:
+                    continue
+                boxes.append([
+                    [x_min, y_min],
+                    [x_max, y_min],
+                    [x_max, y_max],
+                    [x_min, y_max],
+                ])
+                texts.append(line_text)
+
+        if boxes:
+            rect = getattr(page, "rect", None)
+            width = max(1, int(round(float(getattr(rect, "width", 0) or 0))))
+            height = max(1, int(round(float(getattr(rect, "height", 0) or 0))))
+            if width <= 1:
+                width = max(1, int(math.ceil(max(point[0] for box in boxes for point in box))))
+            if height <= 1:
+                height = max(1, int(math.ceil(max(point[1] for box in boxes for point in box))))
+            ordered = _reconstruct_ocr_reading_order(
+                boxes,
+                texts,
+                img_width=width,
+                img_height=height,
+            )
+            if ordered:
+                return "\n".join(ordered).strip()
+    except Exception as exc:
+        logger.debug("Coordinate-aware PDF text extraction failed: %s", exc)
+
+    return (page.get_text() or "").strip()
+
+
 def _extract_text_from_pdf_bytes(content: bytes) -> str:
     if fitz is None:
         raise HTTPException(status_code=500, detail="pymupdf is required for PDF parsing")
@@ -1267,7 +1404,7 @@ def _extract_text_from_pdf_bytes(content: bytes) -> str:
             render_scale = max(1.0, min(3.0, _positive_float_env("OCR_PDF_RENDER_SCALE", 1.7)))
             ocr_pages = 0
             for page_index, page in enumerate(doc):
-                native_text = (page.get_text() or "").strip()
+                native_text = _extract_native_pdf_page_text(page)
                 native_chars = len(re.sub(r"\s+", "", native_text))
                 if native_chars >= sparse_threshold or ocr_pages >= max_ocr_pages:
                     page_texts.append(native_text)
