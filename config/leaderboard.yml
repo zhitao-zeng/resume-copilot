@@ -8,4 +8,4 @@ inferenceVolumeMounts:
 
 inferenceImage:
   repository: "harbor-contest.4pd.io/zengzhitao/resume-copilot"
-  tag: "9191171-template-fidelity-ocrbbox"
+  tag: "fe8fdc0-field-completeness-star"
