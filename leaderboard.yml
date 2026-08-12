@@ -9,4 +9,4 @@ inferenceVolumeMounts:
 
 inferenceImage:
   repository: "harbor-contest.4pd.io/zengzhitao/resume-copilot"
-  tag: "diagnostic-fulltrace-20260811-165019"
+  tag: "c4b7e0e-grounded-record-matching"
