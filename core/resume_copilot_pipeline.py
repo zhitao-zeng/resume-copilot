@@ -774,6 +774,30 @@ def _reply_result_block(
     overview = _resume_section_overview(resume_data)
     if overview:
         lines.append(f"- 已生成模块：{overview}。")
+    data = resume_data if isinstance(resume_data, dict) else {}
+    if not framework_mode and data:
+        education_count = len(data.get("education", []) or [])
+        experience_count = len(data.get("experience", []) or [])
+        project_count = len(data.get("projects", []) or [])
+        campus_count = len(data.get("campus_experience", []) or [])
+        bullet_count = sum(
+            len(item.get("bullets", []) or [])
+            for section in ("experience", "projects", "research", "campus_experience")
+            for item in (data.get(section, []) or [])
+            if isinstance(item, dict)
+        )
+        counts = []
+        for count, label in (
+            (education_count, "段教育经历"),
+            (experience_count, "段工作/实习经历"),
+            (project_count, "个项目"),
+            (campus_count, "段校园/社会经历"),
+            (bullet_count, "条职责与成果描述"),
+        ):
+            if count:
+                counts.append(f"{count}{label}")
+        if counts:
+            lines.append("- 本次成稿整理了" + "、".join(counts) + "；未补写材料中不存在的经历或数据。")
     return "\n".join(lines)
 
 

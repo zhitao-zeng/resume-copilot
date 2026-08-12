@@ -12,6 +12,7 @@ from dataclasses import dataclass
 
 from v2_schemas import VerifiedResult, CanonicalResume, DraftResume, Meta, Change
 from source_adapter import (
+    _LAYOUT_RESET_HEADINGS,
     _is_section_heading,
     _looks_like_record_body,
     build_source_bundle,
@@ -91,10 +92,10 @@ _RESULT_CLAIMS = (
     "确保", "保障", "关键依据", "高质量交付", "打通", "性能达标", "降低成本",
     "提高准确率", "提升准确率", "提升效率", "提升用户体验",
 )
-_SUMMARY_MAX_CHARS = 100
-_SUMMARY_MAX_SENTENCES = 4
+_SUMMARY_MAX_CHARS = 220
+_SUMMARY_MAX_SENTENCES = 5
 _INTERNAL_ADDITIONAL_SECTION = re.compile(
-    r"^(?:待整理(?:的)?原始(?:信息|经历)|教育经历补充)$"
+    r"^(?:待整理(?:的)?原始(?:信息|经历)|教育经历补充|补充信息)$"
 )
 
 _SKILL_CATEGORY_ALIASES = {
@@ -157,6 +158,10 @@ _SUMMARY_SUBJECTIVE = re.compile(
     r"(?:扎实|敏锐|优秀|热爱|致力于|较强|出色|卓越|丰富的|良好(?:的)?(?:能力|素养)|"
     r"责任心|学习能力|抗压能力|团队精神|积极主动|自驱力|"
     r"清晰的问题拆解|执行闭环|以真实岗位职责和结果为准)"
+)
+_INCOMPLETE_TEXT_TAIL = re.compile(
+    r"(?:累计(?:粉丝|用户|曝光|销量|销售额|阅读量)|达|达到|提升|降低|增长|"
+    r"减少|累计|实现|完成|负责|具备|熟悉|掌握|按计划|包括|例如|如)$"
 )
 
 
@@ -475,7 +480,10 @@ def _atomize_resume_bullets(
                 expanded.extend((atom, source_value) for atom in atoms)
             record.bullets = []
             seen: set[str] = set()
-            for atom, source_value in expanded[:6]:
+            # Multi-page resumes are valid. A former ``[:6]`` presentation
+            # limit silently discarded every later source-grounded bullet and
+            # was a primary cause of sparse output on dense OCR cases.
+            for atom, source_value in expanded:
                 normalized = re.sub(r"\W+", "", atom).casefold()
                 if not normalized or normalized in seen:
                     continue
@@ -545,6 +553,40 @@ def _change_path_exists(resume: CanonicalResume, path: str) -> bool:
         record_position < len(records)
         and bullet_position < len(records[record_position].bullets)
     )
+
+
+def _bullet_path_value(resume: CanonicalResume, path: str) -> str | None:
+    match = re.fullmatch(
+        r"(experience|research|activities|projects)\[(\d+)]\.bullets\[(\d+)]",
+        str(path or ""),
+    )
+    if not match:
+        return None
+    section, record_index, bullet_index = match.groups()
+    records = getattr(resume, section)
+    record_position = int(record_index)
+    bullet_position = int(bullet_index)
+    if record_position >= len(records):
+        return None
+    bullets = records[record_position].bullets
+    if bullet_position >= len(bullets):
+        return None
+    return str(bullets[bullet_position]).strip()
+
+
+def _filter_trusted_rewrites(
+    resume: CanonicalResume,
+    trusted_rewrites: dict[str, str],
+    expected_outputs: dict[str, str],
+) -> dict[str, str]:
+    """Discard positional provenance after a bullet moves or is replaced."""
+
+    return {
+        path: source_value
+        for path, source_value in trusted_rewrites.items()
+        if path in expected_outputs
+        and _bullet_path_value(resume, path) == str(expected_outputs[path]).strip()
+    }
 
 
 _COVERAGE_LAYOUT_LABEL = re.compile(
@@ -758,7 +800,7 @@ def _best_achievement(resume: CanonicalResume) -> str:
         for section in (resume.projects, resume.experience, resume.research, resume.activities)
         for record in section
         for bullet in record.bullets
-        if str(bullet).strip()
+        if str(bullet).strip() and not _INCOMPLETE_TEXT_TAIL.search(str(bullet).strip("。；; "))
     ]
     if not candidates:
         return ""
@@ -813,20 +855,32 @@ def _build_evidence_summary(resume: CanonicalResume) -> str:
     for sentence in (
         item.strip() for item in re.split(r"[。！？!?；;]+", resume.summary) if item.strip()
     ):
-        if not _SUMMARY_SUBJECTIVE.search(sentence):
+        if (
+            len(sentence) >= 12
+            and not _SUMMARY_SUBJECTIVE.search(sentence)
+            and not _INCOMPLETE_TEXT_TAIL.search(sentence)
+        ):
             candidates.append(sentence)
 
     experience_bits: list[str] = []
+    role_only_bits: list[str] = []
     for item in resume.experience[:2]:
-        identity = "".join(part.strip() for part in (item.organization, item.role) if part.strip())
-        if identity and identity not in experience_bits:
-            experience_bits.append(identity)
+        organization = item.organization.strip()
+        role = item.role.strip()
+        if organization:
+            identity = "".join(part for part in (organization, role) if part)
+            if identity and identity not in experience_bits:
+                experience_bits.append(identity)
+        elif role and role not in role_only_bits:
+            role_only_bits.append(role)
     if experience_bits:
         seniority = resume.meta.work_experience.strip()
         if seniority and re.fullmatch(r"\d+(?:\.\d+)?\s*(?:年|个月|月)", seniority):
             seniority += "经验"
         prefix = f"有{seniority}，" if seniority else ""
         candidates.append(prefix + "曾任" + "、".join(experience_bits))
+    if role_only_bits:
+        candidates.append("工作或实习经历包括" + "、".join(role_only_bits))
 
     research_bits: list[str] = []
     for item in resume.research[:2]:
@@ -862,7 +916,7 @@ def _build_evidence_summary(resume: CanonicalResume) -> str:
     if resume.certifications:
         candidates.append("持有" + "、".join(resume.certifications[:2]))
 
-    if not experience_bits and not research_bits:
+    if not experience_bits and not role_only_bits and not research_bits:
         activity_bits = list(dict.fromkeys(
             " ".join(part.strip() for part in (item.organization, item.role) if part.strip())
             for item in resume.activities
@@ -894,8 +948,8 @@ def _build_evidence_summary(resume: CanonicalResume) -> str:
 
 
 _STRUCTURED_ORG_SUFFIX = re.compile(
-    r"(?:大学|学院|学校|医院|公司|集团|研究院|实验室|中心|部门|协会|学会|"
-    r"学生会|社团|委员会|事务所|银行|基金会|工作室|团队)(?:\d+)?$"
+    r"(?:大学|学院|学校|医院|公司|企业|集团|研究院|实验室|中心|部门|协会|学会|"
+    r"学生会|社团|委员会|事务所|律所|银行|基金会|工作室|团队|基地)(?:\d+)?$"
 )
 _SCHOOL_SUFFIX = re.compile(r"(?:大学|学院|学校|研究院)(?:\d+)?")
 _NON_SCHOOL_SENTENCE = re.compile(
@@ -904,7 +958,7 @@ _NON_SCHOOL_SENTENCE = re.compile(
 )
 _NON_MAJOR_SENTENCE = re.compile(
     r"(?:准备找|求职|岗位|工作|简历|马上要毕业|已经毕业|毕业了|开始准备|"
-    r"最近开始)"
+    r"最近开始|具备|熟悉|掌握|负责|参与|经验|能力|环境|定位|营销)"
 )
 
 
@@ -918,7 +972,12 @@ def _clean_structured_organization(value: str) -> str:
         text,
     ).strip()
     if candidate != text and _STRUCTURED_ORG_SUFFIX.search(candidate):
-        return candidate
+        text = candidate
+    if text in {
+        "公司", "企业", "学校", "学院", "医院", "事务所", "律所", "部门", "协会",
+        "社团", "组织", "团队", "基地", "学生职务",
+    }:
+        return ""
     return text
 
 
@@ -1014,7 +1073,10 @@ def _coalesce_compatible_education(records: list[dict]) -> list[dict]:
     merged: list[dict] = []
     for record in records:
         school = re.sub(r"\s+", "", str(record.get("school", "") or "")).casefold()
-        degree = re.sub(r"\s+", "", str(record.get("degree", "") or "")).casefold()
+        degree = re.sub(
+            r"(?:在读|毕业)$", "",
+            re.sub(r"\s+", "", str(record.get("degree", "") or "")).casefold(),
+        )
         destination: dict | None = None
         if school and degree:
             for existing in merged:
@@ -1022,8 +1084,9 @@ def _coalesce_compatible_education(records: list[dict]) -> list[dict]:
                     r"\s+", "", str(existing.get("school", "") or "")
                 ).casefold()
                 existing_degree = re.sub(
-                    r"\s+", "", str(existing.get("degree", "") or "")
-                ).casefold()
+                    r"(?:在读|毕业)$", "",
+                    re.sub(r"\s+", "", str(existing.get("degree", "") or "")).casefold(),
+                )
                 if (school, degree) != (existing_school, existing_degree):
                     continue
                 # Different renderings of the same graduation date (for
@@ -1058,10 +1121,37 @@ def _compact_canonical(resume: CanonicalResume) -> CanonicalResume:
     """Remove blank records/items left by model repair or leakage cleanup."""
 
     data = resume.model_dump()
+    meta = data.get("meta") or {}
+    if isinstance(meta, dict):
+        phone = re.search(r"1[3-9]\d{9}", re.sub(r"[\s-]+", "", str(meta.get("phone", ""))))
+        meta["phone"] = phone.group(0) if phone else ""
+        raw_email = re.sub(r"\s+", "", str(meta.get("email", "")))
+        at = raw_email.find("@")
+        cleaned_email = ""
+        if at > 0:
+            local = re.search(r"[A-Za-z0-9._%+-]+$", raw_email[:at])
+            domain = re.match(
+                r"[A-Za-z0-9.-]+?\.(?:com|cn|net|org|edu|gov|io|ai|co)(?:\.cn)?",
+                raw_email[at + 1:],
+                re.IGNORECASE,
+            )
+            if local and domain:
+                local_value = re.sub(r"^1[3-9]\d{9}", "", local.group(0))
+                if local_value:
+                    cleaned_email = f"{local_value}@{domain.group(0)}"
+        meta["email"] = cleaned_email
     for section in ("awards", "publications", "patents", "certifications", "training", "teaching"):
-        data[section] = list(dict.fromkeys(
-            str(v).strip() for v in data.get(section, []) if str(v).strip()
-        ))
+        values = [str(v).strip() for v in data.get(section, []) if str(v).strip()]
+        if section == "certifications":
+            values = [
+                value for value in values
+                if value not in {"资格证书", "证书", "资质证书"}
+                and not re.fullmatch(
+                    r"(?:19|20)\d{2}(?:[./-]\d{1,2}|年\d{1,2}月?)?\s*(?:获得|获)",
+                    value,
+                )
+            ]
+        data[section] = list(dict.fromkeys(values))
     additional = data.get("additional_sections") or {}
     if isinstance(additional, dict):
         data["additional_sections"] = {
@@ -1103,6 +1193,9 @@ def _compact_canonical(resume: CanonicalResume) -> CanonicalResume:
                 continue
             if section == "education":
                 _clean_education_fields(item)
+                major = str(item.get("major", "") or "").strip()
+                if re.fullmatch(r"(?:\d+|[IVXLCDM]+)", major, re.IGNORECASE):
+                    item["major"] = ""
             elif "organization" in item:
                 item["organization"] = _clean_structured_organization(
                     str(item.get("organization", "") or "")
@@ -1126,6 +1219,49 @@ def _compact_canonical(resume: CanonicalResume) -> CanonicalResume:
                         )
                         if not represented:
                             item["bullets"].insert(0, original_role)
+                if section == "projects":
+                    project_name = str(item.get("name", "") or "").strip()
+                    compact_name = re.sub(r"\W+", "", project_name)
+                    invalid_name = bool(
+                        re.fullmatch(r"\d+", compact_name)
+                        or (2 <= len(compact_name) <= 3 and len(set(compact_name)) == 1)
+                        or len(project_name) > 80
+                        or _looks_like_record_body(project_name)
+                    )
+                    if invalid_name:
+                        if _looks_like_record_body(project_name) and not any(
+                            _identity_value(project_name) == _identity_value(bullet)
+                            for bullet in item["bullets"]
+                        ):
+                            item["bullets"].insert(0, project_name)
+                        item["name"] = ""
+                    if not item.get("name"):
+                        for bullet in list(item["bullets"]):
+                            candidate = str(bullet or "").strip(" ，,。；;")
+                            if (
+                                2 <= len(candidate) <= 60
+                                and not _looks_like_record_body(candidate)
+                                and re.search(
+                                    r"(?:项目|系统|平台|小程序|APP|课题|作品)$",
+                                    candidate,
+                                    re.IGNORECASE,
+                                )
+                            ):
+                                item["name"] = candidate
+                                item["bullets"].remove(bullet)
+                                break
+                identity_norms = {
+                    re.sub(r"\W+", "", str(item.get(field, "") or "")).casefold()
+                    for field in fixed_fields
+                    if str(item.get(field, "") or "").strip()
+                }
+                item["bullets"] = [
+                    bullet for bullet in item["bullets"]
+                    if not (
+                        not _looks_like_record_body(bullet)
+                        and re.sub(r"\W+", "", bullet).casefold() in identity_norms
+                    )
+                ]
             bullets = item.get("bullets", []) if section != "education" else []
             if any(str(item.get(field, "")).strip() for field in fixed_fields) or bullets:
                 identity = tuple(
@@ -1146,6 +1282,43 @@ def _compact_canonical(resume: CanonicalResume) -> CanonicalResume:
             cleaned = _coalesce_compatible_education(cleaned)
             cleaned = _drop_subsumed_education(cleaned)
         data[section] = cleaned
+
+    bullet_entries = [
+        (section, item, bullet, re.sub(
+            r"\W+", "",
+            re.sub(r"^(?:[-*•·▪◦]\s*|\d{1,3}(?:[、)]|\.(?!\d))\s*)", "", bullet),
+        ).casefold())
+        for section in ("experience", "projects", "research", "activities")
+        for item in data.get(section, [])
+        for bullet in item.get("bullets", [])
+        if str(bullet).strip()
+    ]
+    all_bullet_norms = [entry[3] for entry in bullet_entries if entry[3]]
+    seen_bullets: set[str] = set()
+    for section in ("experience", "projects", "research", "activities"):
+        for item in data.get(section, []):
+            unique: list[str] = []
+            for bullet in item.get("bullets", []):
+                normalized = re.sub(
+                    r"\W+", "",
+                    re.sub(
+                        r"^(?:[-*•·▪◦]\s*|\d{1,3}(?:[、)]|\.(?!\d))\s*)",
+                        "",
+                        str(bullet),
+                    ),
+                ).casefold()
+                if not normalized or normalized in seen_bullets:
+                    continue
+                if len(normalized) >= 8 and any(
+                    normalized != other
+                    and normalized in other
+                    and len(normalized) <= int(len(other) * 0.72)
+                    for other in all_bullet_norms
+                ):
+                    continue
+                seen_bullets.add(normalized)
+                unique.append(bullet)
+            item["bullets"] = unique
     data["summary"] = str(data.get("summary", "") or "").strip()
     compacted = CanonicalResume.model_validate(data)
     compacted.summary = _build_evidence_summary(compacted)
@@ -1155,19 +1328,26 @@ def _compact_canonical(resume: CanonicalResume) -> CanonicalResume:
 _FALLBACK_PERIOD = re.compile(
     r"(?:(?:19|20)\d{2}(?:(?:[./-]\d{1,2})|(?:年\d{1,2}月?))?|(?:0?[1-9]|1[0-2])[-/](?:19|20)\d{2})"
     r"\s*(?:[-—~至到]\s*(?:(?:19|20)\d{2}(?:(?:[./-]\d{1,2})|(?:年\d{1,2}月?))?|"
-    r"(?:0?[1-9]|1[0-2])[-/](?:19|20)\d{2}|至今|现在))?"
+    r"(?:0?[1-9]|1[0-2])[-/](?:19|20)\d{2}|今|至今|现在))?"
 )
 _FALLBACK_ORGANIZATION = re.compile(
-    r"[\u4e00-\u9fffA-Za-z0-9·.&（）()_-]{0,40}(?:大学|学院|学校|医院|公司|集团|"
-    r"中学|小学|幼儿园|研究院|实验室|中心|部门|协会|学会|学生会|社团|委员会|事务所|银行|"
-    r"基金会|工作室|团队)"
+    r"[\u4e00-\u9fffA-Za-z0-9·.&（）()_-]{0,40}?(?:大学|学院|学校|医院|公司|企业|集团|"
+    r"中学|小学|幼儿园|研究院|实验室|中心|部门|协会|学会|学生会|社团|委员会|事务所|律所|银行|"
+    r"基金会|工作室|团队|基地)(?:\d+)?"
 )
 _FALLBACK_ROLE = re.compile(
     r"[\u4e00-\u9fffA-Za-z0-9/+.#_-]{0,24}(?:工程师|设计师|教师|老师|医生|医师|"
     r"护士|经理|主管|总监|主任|顾问|研究员|专员|助理|负责人|组长|队长|主席|"
-    r"部长|实习生|实习|见习|分析师|架构师|运营|产品|开发|测试|销售|讲师)"
+    r"部长|干事|部员|成员|委员|志愿者|实习生|实习|见习|分析师|架构师|运营|产品|开发|测试|销售|讲师)"
 )
 _FALLBACK_DEGREE = re.compile(r"(?:博士研究生|硕士研究生|本科|硕士|博士|大专|专科|高中)(?:在读|毕业)?")
+_FALLBACK_DATE_TOKEN = re.compile(
+    r"^(?:19|20)\d{2}(?:(?:[./-]\d{1,2})|(?:年\d{1,2}月?))?\s*(?:至)?\s*$"
+)
+_FALLBACK_LABELED_SKILL = re.compile(
+    r"^(?:[-•·]\s*)?(?P<label>技能|专业技能|工具|语言|语言能力)"
+    r"\s*[:：]\s*(?P<value>.+)$"
+)
 
 
 def _first_match(pattern: re.Pattern[str], value: str) -> str:
@@ -1183,9 +1363,15 @@ def _labeled_value(value: str, labels: tuple[str, ...]) -> str:
 
 def _organization_from_text(value: str) -> str:
     cleaned = re.sub(
-        r"^(?:负责|参与|协助|支持|组织|推动|运营|管理|加入|担任)\s*",
+        r"^(?:负责|参与|协助|支持|组织|推动|运营|管理|加入|担任|带领)\s*",
         "",
         value.strip(),
+    )
+    cleaned = re.sub(
+        r"^(?:我|本人)?(?:目前|现在)?(?:是|做过|曾在)?\s*"
+        r"(?:(?:\d+|[一二两三四五六七八九十]+)\s*段)?\s*",
+        "",
+        cleaned,
     )
     # OCR often joins a leading period directly to the organization.  Remove
     # only the recognized date span before matching so the date cannot become
@@ -1194,14 +1380,55 @@ def _organization_from_text(value: str) -> str:
     cleaned = re.sub(r"^[\s\-—~至到]+", "", cleaned)
     contextual = re.search(
         r"(?:就职于|任职于|供职于|在)\s*"
-        r"([\u4e00-\u9fffA-Za-z0-9·.&（）()_-]{1,40}?(?:大学|学院|学校|医院|公司|集团|"
+        r"([\u4e00-\u9fffA-Za-z0-9·.&（）()_-]{1,40}?(?:大学|学院|学校|医院|公司|企业|集团|"
         r"研究院|实验室|中心|部门|协会|学会|学生会|社团|委员会|事务所|银行|"
         r"基金会|工作室|团队))(?=工作|任职|担任|就职|[，,。；;\s])",
         cleaned,
     )
     if contextual:
         return contextual.group(1).strip()
-    return _first_match(_FALLBACK_ORGANIZATION, cleaned)
+    organization_match = _FALLBACK_ORGANIZATION.search(cleaned)
+    organization = organization_match.group(0).strip() if organization_match else ""
+    if (
+        organization_match
+        and organization.endswith("中心")
+        and cleaned[organization_match.end():].startswith("医院")
+    ):
+        organization += "医院"
+    # “做过两段律所实习” identifies an institution type, not a named
+    # employer. Keep the role/duties and ask for the two firm names instead of
+    # rendering a fake company called “律所”.
+    if organization in {
+        "律所", "事务所", "公司", "企业", "医院", "学校", "学院", "部门", "协会",
+        "社团", "组织", "团队", "基地",
+    }:
+        return ""
+    return organization
+
+
+def _fallback_period_from_lines(
+    lines: list[str],
+    joined: str,
+    labels: tuple[str, ...],
+) -> str:
+    """Recover a date span split into start/end OCR columns."""
+
+    labeled = _labeled_value(joined, labels)
+    open_period = re.compile(
+        r"^((?:19|20)\d{2}(?:(?:[./-]\d{1,2})|(?:年\d{1,2}月?))?)\s*至\s*$"
+    )
+    standalone_date = re.compile(
+        r"^((?:19|20)\d{2}(?:(?:[./-]\d{1,2})|(?:年\d{1,2}月?))?)$"
+    )
+    for index, line in enumerate(lines):
+        start = open_period.fullmatch(str(line or "").strip())
+        if not start:
+            continue
+        for later in lines[index + 1:]:
+            end = standalone_date.fullmatch(str(later or "").strip())
+            if end:
+                return f"{start.group(1)} 至 {end.group(1)}"
+    return labeled or _first_match(_FALLBACK_PERIOD, joined)
 
 
 def _role_from_text(value: str, organization: str = "") -> str:
@@ -1217,7 +1444,34 @@ def _role_from_text(value: str, organization: str = "") -> str:
         if identity:
             header = header.replace(identity, " ")
     header = re.sub(r"^[\s|｜:：\-—~至到]+|[\s|｜:：\-—~至到]+$", "", header)
+    header = re.sub(
+        r"(?:技术研发部|产品技术部|研发部|技术部|产品部|运营部|市场部|销售部|"
+        r"职能部门|事业部|校园创业团队)$",
+        "",
+        header,
+    ).strip()
+    narrative = re.search(
+        r"(?:目前|现在|之前|过去|毕业后)?(?:一直)?"
+        r"(?:做过|做|从事|担任|任职为)\s*"
+        r"((?:\d+|[一二两三四五六七八九十]+)?\s*段?[^，,。；;]{2,48})$",
+        header,
+    )
+    if narrative:
+        role = re.sub(
+            r"^(?:\d+|[一二两三四五六七八九十]+)\s*段\s*",
+            "",
+            narrative.group(1).strip(),
+        )
+        role = _clean_role_title(role, explicit=True)
+        if role:
+            return role
     return _clean_role_title(_first_match(_FALLBACK_ROLE, header))
+
+
+def _clean_target_role(value: str) -> str:
+    value = re.sub(r"^(?:(?:更)?适合|转向?|偏)\s*", "", str(value or "")).strip()
+    value = re.sub(r"(?:相关)?(?:岗位|方向|工作)$", "", value).strip()
+    return value
 
 
 def _fallback_target_role(query_text: str, jd_text: str) -> str:
@@ -1225,6 +1479,7 @@ def _fallback_target_role(query_text: str, jd_text: str) -> str:
         product_logic.extract_target_role(query_text, jd_text)
         if hasattr(product_logic, "extract_target_role") else ""
     )
+    extracted = _clean_target_role(extracted)
     invalid = (
         not extracted
         or extracted.casefold() in {"jd", "的jd", "岗位", "目标岗位", "简历"}
@@ -1239,7 +1494,7 @@ def _fallback_target_role(query_text: str, jd_text: str) -> str:
         re.IGNORECASE,
     )
     if labeled:
-        return labeled.group(1).strip()
+        return _clean_target_role(labeled.group(1))
     embedded = re.search(
         r"(?:一个|目标(?:岗位)?\s*[:：]?)\s*"
         r"([A-Za-z0-9+.#/_\-\u4e00-\u9fff]{2,32}?)(?:的)?岗位(?:JD|描述)?",
@@ -1247,7 +1502,7 @@ def _fallback_target_role(query_text: str, jd_text: str) -> str:
         re.IGNORECASE,
     )
     if embedded:
-        return embedded.group(1).strip()
+        return _clean_target_role(embedded.group(1))
     rewrite = re.search(
         r"(?:优化|调整|修改|改写|适配)(?:成|为)\s*"
         r"([A-Za-z0-9+.#/_\-\u4e00-\u9fff]{2,32}?)(?=岗位|方向|[，,。；;\n]|$)",
@@ -1255,7 +1510,7 @@ def _fallback_target_role(query_text: str, jd_text: str) -> str:
         re.IGNORECASE,
     )
     if rewrite:
-        return rewrite.group(1).strip()
+        return _clean_target_role(rewrite.group(1))
     matches = re.finditer(
         r"(?:投递|应聘|申请|求职|想投|继续投|目标岗位(?:是|为)?)\s*"
         r"([A-Za-z0-9+.#/_\-\u4e00-\u9fff]{2,32}?)(?=岗位|[，,。；;\n]|帮我|$)",
@@ -1263,9 +1518,27 @@ def _fallback_target_role(query_text: str, jd_text: str) -> str:
         re.IGNORECASE,
     )
     for match in matches:
-        candidate = match.group(1).strip()
+        candidate = _clean_target_role(match.group(1))
         if candidate.casefold() not in {"jd", "的jd", "岗位", "目标岗位", "简历"}:
             return candidate
+    direction = re.search(
+        r"(?:想找(?:一份)?|想做|(?:想)?转(?:到|向)?|偏)\s*"
+        r"([^，,。；;]{2,32}?)(?=(?:相关)?(?:的)?(?:岗位|工作|实习|方向|赛道)|的简历|简历|$)",
+        query_text,
+        re.IGNORECASE,
+    )
+    if direction:
+        candidate = _clean_target_role(direction.group(1))
+        if candidate and not any(token in candidate for token in ("简历", "怎么", "如何")):
+            return candidate
+    domain_direction = re.search(
+        r"(?:这是我在|继续(?:往|向)|希望继续(?:往|向)?)\s*"
+        r"([^，,。；;]{2,24}?)(?=方向)",
+        query_text,
+        re.IGNORECASE,
+    )
+    if domain_direction:
+        return _clean_target_role(domain_direction.group(1))
     return ""
 
 
@@ -1283,25 +1556,123 @@ def _record_groups(source, section: str) -> list[list[str]]:
     return groups
 
 
+def _coalesce_ocr_record_lines(lines: list[str]) -> list[str]:
+    """Join wrapped OCR tails before assigning typed record fields."""
+
+    merged: list[str] = []
+    for raw in lines:
+        line = str(raw or "").strip()
+        if not line:
+            continue
+        previous = merged[-1] if merged else ""
+        continuation = bool(
+            previous
+            and not re.search(r"[。；;!?！？]$", previous)
+            and _looks_like_record_body(previous)
+            and not re.match(r"^(?:\d{1,3}(?:[、)]|\.(?!\d))|[-*•·▪◦])\s*", line)
+            and not _looks_like_record_body(line)
+            and not _FALLBACK_PERIOD.fullmatch(line)
+            and not _FALLBACK_ORGANIZATION.search(line)
+            and len(line) <= 160
+        )
+        if continuation:
+            merged[-1] = previous + line
+        else:
+            merged.append(line)
+    return merged
+
+
+def _coalesce_ocr_summary_lines(lines: list[str]) -> list[str]:
+    """Rejoin visual line wraps in prose without altering wording."""
+
+    merged: list[str] = []
+    for raw in lines:
+        line = str(raw or "").strip()
+        if not line:
+            continue
+        if line == "\0":
+            if merged and merged[-1] != "\0":
+                merged.append(line)
+            continue
+        if (
+            merged
+            and merged[-1] != "\0"
+            and not re.search(r"[。；;!?！？]$", merged[-1])
+            and not re.match(r"^(?:[-*•·▪◦]|\d{1,3}(?:[、)]|\.(?!\d)))\s*", line)
+            and not _FALLBACK_PERIOD.fullmatch(line)
+        ):
+            merged[-1] += line
+        else:
+            merged.append(line)
+    return [value for value in merged if value != "\0"]
+
+
 def _fallback_record(section: str, lines: list[str]) -> tuple[dict, list[str]]:
     """Parse identities conservatively and keep every unconsumed line."""
 
+    lines = _coalesce_ocr_record_lines(lines)
     joined = " ｜ ".join(line for line in lines if line)
-    period = _labeled_value(joined, ("时间", "任职时间", "起止时间", "项目时间")) or _first_match(
-        _FALLBACK_PERIOD, joined,
+    header_lines = [line for line in lines if line and not _looks_like_record_body(line)]
+    header_text = " ｜ ".join(header_lines)
+    period = _fallback_period_from_lines(
+        lines,
+        joined,
+        ("时间", "任职时间", "起止时间", "项目时间"),
     )
-    organization = _labeled_value(joined, ("公司", "单位", "组织", "机构", "学校"))
+    organization = _labeled_value(header_text, ("公司", "单位", "组织", "机构", "学校"))
     if not organization:
-        organization = _organization_from_text(joined)
+        organization = _organization_from_text(header_text)
     role = _clean_role_title(
-        _labeled_value(joined, ("岗位", "职位", "角色", "职务")),
+        _labeled_value(header_text, ("岗位", "职位", "角色", "职务")),
         explicit=True,
     )
-    if not role:
-        for line in lines:
+    if section == "activities" and not organization and not role:
+        for line in header_lines:
+            activity_identity = re.fullmatch(
+                r"(.{2,40}?)(干事|部员|成员|委员)", line.strip(" ，,。；;|｜")
+            )
+            if activity_identity:
+                organization = _clean_structured_organization(activity_identity.group(1))
+                role = activity_identity.group(2)
+                break
+    if not role and section != "projects":
+        for line in header_lines:
             role = _role_from_text(line, organization)
             if role:
                 break
+    identity_lines = [
+        line.strip(" ，,。；;|｜")
+        for line in header_lines
+        if line.strip(" ，,。；;|｜")
+        and line.strip(" ，,。；;|｜") not in {period, organization, role}
+        and not (role and role in line)
+        and not _FALLBACK_PERIOD.fullmatch(line.strip())
+        and not re.fullmatch(r"[\d./年月\-—~至到今]+", line.strip())
+        and not _looks_like_record_body(line)
+        and len(line.strip()) <= 40
+        and not re.search(r"[。；;!?！？]$", line.strip())
+    ]
+    if section != "projects" and not organization and role and identity_lines:
+        # Brand/team names such as “Wonderlab” need not end in 公司/中心.
+        # Their position before an independently recognized role is enough
+        # structure to retain the literal name without guessing its type.
+        role_line_index = next(
+            (index for index, line in enumerate(header_lines) if role in line),
+            len(header_lines),
+        )
+        preceding_identity = next(
+            (
+                candidate for candidate in identity_lines
+                if header_lines.index(candidate) < role_line_index
+            ),
+            "",
+        )
+        organization = preceding_identity
+    if section != "projects" and organization and not role and identity_lines:
+        # Conversely, a short line following a named organization is the
+        # source-provided title even when the profession is absent from the
+        # generic suffix grammar (律师、施工员、会长, etc.).
+        role = _clean_role_title(identity_lines[0], explicit=True)
 
     consumed = {value for value in (period, organization, role) if value}
     bullets: list[str] = []
@@ -1321,6 +1692,26 @@ def _fallback_record(section: str, lines: list[str]) -> tuple[dict, list[str]]:
         )
         residual = re.sub(r"^(?:我|本人)?(?:在|于|担任|任职|作为)+\s*$", "", residual)
         residual = re.sub(r"^[\s|｜,，;；:：\-—~至到]+|[\s|｜,，;；:：\-—~至到]+$", "", residual)
+        if re.fullmatch(
+            r"(?:之前|过去|目前|现在|毕业后)?(?:一直|曾经|曾)?(?:做过?|从事)?"
+            r"(?:(?:\d+|[一二两三四五六七八九十]+)\s*段)?",
+            residual,
+        ):
+            continue
+        if (
+            section != "projects"
+            and line in header_lines
+            and not _looks_like_record_body(residual)
+            and len(residual) <= 24
+            and not (
+                section == "activities"
+                and len(re.sub(r"\W+", "", residual)) >= 6
+                and re.search(r"[。；;!?！？]$", residual)
+            )
+        ):
+            # Remaining compact header tokens are departments/locations or
+            # layout qualifiers, not accomplishment bullets.
+            continue
         if len(re.sub(r"\W+", "", residual)) >= 2:
             bullets.append(residual)
     bullets = list(dict.fromkeys(bullets))
@@ -1354,6 +1745,17 @@ def _fallback_record(section: str, lines: list[str]) -> tuple[dict, list[str]]:
 
     name = _labeled_value(joined, ("项目名称", "项目"))
     if not name:
+        for line in lines:
+            action_name = re.search(
+                r"(?:负责|参与|主导|开发|设计|搭建|完成|开展)\s*"
+                r"([^，,。；;]{2,40}(?:项目|系统|平台|课题|作品))",
+                line,
+                re.IGNORECASE,
+            )
+            if action_name:
+                name = action_name.group(1).strip()
+                break
+    if not name:
         header_candidates = [
             line for line in lines
             if not _looks_like_record_body(line) and line not in consumed
@@ -1372,6 +1774,32 @@ def _fallback_record(section: str, lines: list[str]) -> tuple[dict, list[str]]:
         "",
         name,
     ).strip()
+    if not role:
+        for line in header_lines:
+            if name and name in line:
+                continue
+            candidate_role = _role_from_text(line, organization)
+            if candidate_role and candidate_role != name:
+                role = candidate_role
+                break
+    if role:
+        bullets = [bullet for bullet in bullets if bullet.strip() != role]
+    if name:
+        cleaned_project_bullets: list[str] = []
+        for bullet in bullets:
+            residual = bullet
+            if name in residual:
+                residual = residual.replace(name, " ")
+                residual = re.sub(
+                    r"^(?:我|本人)?(?:参与|负责|主导|完成|开发|设计|搭建|开展)\s*",
+                    "",
+                    residual,
+                )
+                residual = re.sub(r"^(?:并|及|和|与)\s*", "", residual)
+                residual = residual.strip(" ，,。；;|｜")
+            if len(re.sub(r"\W+", "", residual)) >= 2:
+                cleaned_project_bullets.append(residual)
+        bullets = list(dict.fromkeys(cleaned_project_bullets))
     return {
         "name": name,
         "organization": organization,
@@ -1382,32 +1810,74 @@ def _fallback_record(section: str, lines: list[str]) -> tuple[dict, list[str]]:
 
 
 def _fallback_education(lines: list[str]) -> tuple[dict, list[str]]:
-    joined = " ｜ ".join(lines)
-    school = _labeled_value(joined, ("学校", "院校")) or _first_match(_FALLBACK_ORGANIZATION, joined)
+    joined = re.sub(
+        r"^(?:教育经历|教育背景|学历信息)\s*[:：]\s*",
+        "",
+        " ｜ ".join(lines),
+    )
+    school = _labeled_value(joined, ("学校", "院校")) or _organization_from_text(joined)
     degree = _labeled_value(joined, ("学历", "学位")) or _first_match(_FALLBACK_DEGREE, joined)
     major = _labeled_value(joined, ("专业",))
-    period = _labeled_value(joined, ("时间", "就读时间", "起止时间")) or _first_match(_FALLBACK_PERIOD, joined)
+    if not major:
+        major_match = re.search(
+            r"(?:我是|就读于?|毕业于?|攻读)?\s*([^|｜，,。；;]{2,40}?)\s*专业(?:毕业|在读|学生)?",
+            joined,
+        )
+        direction_match = re.search(
+            r"(?:方向偏|研究方向(?:是|为)?|专业方向(?:是|为)?)\s*([^|｜，,。；;]{2,40})",
+            joined,
+        )
+        if major_match:
+            major = major_match.group(1).strip()
+        elif direction_match:
+            major = direction_match.group(1).strip()
+    period = _fallback_period_from_lines(
+        lines,
+        joined,
+        ("时间", "就读时间", "起止时间"),
+    )
     parts = [
         part.strip()
         for part in re.split(r"[|｜\t，,;；]+|\s{2,}", joined)
         if part.strip()
     ]
-    if len(parts) >= 2 and not _FALLBACK_PERIOD.fullmatch(parts[0]) and not _FALLBACK_DEGREE.fullmatch(parts[0]):
+    if not major and school and degree:
+        for line in lines:
+            if school not in line or degree not in line:
+                continue
+            source_line = re.sub(
+                r"^(?:教育经历|教育背景|学历信息)\s*[:：]\s*",
+                "",
+                line,
+            )
+            residual = source_line.replace(school, " ").replace(degree, " ")
+            if period:
+                residual = residual.replace(period, " ")
+            residual = re.sub(r"(?:专业|学历|学位)\s*[:：]?", " ", residual)
+            residual = re.sub(r"[\s|｜,，;；:：\-—~至到]+", "", residual)
+            if 2 <= len(residual) <= 40:
+                major = residual
+                break
+    if (
+        not school
+        and len(parts) >= 2
+        and not _FALLBACK_PERIOD.fullmatch(parts[0])
+        and not _FALLBACK_DEGREE.fullmatch(parts[0])
+        and _STRUCTURED_ORG_SUFFIX.search(parts[0])
+    ):
         # Delimited education headers conventionally put the institution first;
         # this also preserves anonymized names such as “学校0”.
         school = parts[0]
-    if not school:
-        school = next((
-            value for value in parts
-            if not _FALLBACK_DEGREE.fullmatch(value)
-            and not _FALLBACK_PERIOD.fullmatch(value)
-        ), "")
     if not major:
         for value in parts:
             if not value or any(item and item in value for item in (school, degree, period)):
                 continue
+            if _FALLBACK_DATE_TOKEN.fullmatch(value):
+                continue
+            if _STRUCTURED_ORG_SUFFIX.search(value):
+                continue
             value = re.sub(r"(?:专业|学历|学位|时间|就读时间|起止时间)\s*[:：]", "", value).strip()
-            if value:
+            if value and len(value) <= 40 and not _looks_like_record_body(value):
                 major = value
                 break
     if not major:
@@ -1425,14 +1895,51 @@ def _fallback_education(lines: list[str]) -> tuple[dict, list[str]]:
             major = residual
     leftovers = []
     for line in lines:
+        if line.strip(" \t-•·") in {"", "其他", "其它", "补充信息"}:
+            continue
         residual = line
         for value in (school, degree, major, period):
             if value:
                 residual = residual.replace(value, " ")
         residual = re.sub(r"[\s|｜,，;；:：\-—~至到]+", "", residual)
-        if len(residual) >= 2:
+        represented_narrative = bool(
+            (major and major in line and re.search(r"(?:专业(?:毕业|在读)|方向偏|研究方向)", line))
+            or (school and school in line and re.search(r"(?:就读|毕业|学生|在读)", line))
+        )
+        if len(residual) >= 2 and not represented_narrative and not re.fullmatch(
+            r"(?:我是|本人|目前是|现在是)?(?:研[一二三四]|大[一二三四]|学生|在读|毕业的?)+",
+            residual,
+        ):
             leftovers.append(line)
     return {"school": school, "degree": degree, "major": major, "period": period}, leftovers
+
+
+def _fallback_project_examples(lines: list[str]) -> list[dict]:
+    """Expand an explicit list of project names without inventing details."""
+
+    if not any(re.search(
+        r"(?:做过|完成过|参与过)[^，。；;]{0,24}(?:一些|多个|若干)[^，。；;]{0,8}项目",
+        line,
+    ) for line in lines):
+        return []
+    for line in lines:
+        match = re.match(r"^(?:比如|例如)\s*(.+)$", line.strip())
+        if not match:
+            continue
+        names = [
+            value.strip(" ，,。；;、")
+            for value in re.split(r"[、]|以及|和", match.group(1))
+            if value.strip(" ，,。；;、")
+        ]
+        if len(names) < 2 or any(len(value) > 40 for value in names):
+            continue
+        if not all(re.search(r"(?:项目|系统|平台|页面|APP|小程序|课题|作品)$", value, re.IGNORECASE) for value in names):
+            continue
+        return [
+            {"name": value, "organization": "", "role": "", "period": "", "bullets": []}
+            for value in names
+        ]
+    return []
 
 
 def _deterministic_fallback(cv_text: str, query_text: str, jd_text: str) -> CanonicalResume:
@@ -1464,12 +1971,21 @@ def _deterministic_fallback(cv_text: str, query_text: str, jd_text: str) -> Cano
         record, leftovers = _fallback_education(lines)
         if any(record.values()):
             education.append(record)
-        if leftovers:
-            additional.setdefault("补充信息", []).extend(leftovers)
+        education_extras = [
+            value for value in leftovers
+            if not _FALLBACK_LABELED_SKILL.fullmatch(value.strip())
+        ]
+        if education_extras:
+            additional.setdefault("补充信息", []).extend(education_extras)
 
     records: dict[str, list[dict]] = {name: [] for name in ("experience", "research", "activities", "projects")}
     for section in records:
         for lines in _record_groups(source, section):
+            if section == "projects":
+                example_records = _fallback_project_examples(lines)
+                if example_records:
+                    records[section].extend(example_records)
+                    continue
             record, leftovers = _fallback_record(section, lines)
             if any(value for key, value in record.items() if key != "bullets") or record.get("bullets"):
                 records[section].append(record)
@@ -1487,48 +2003,216 @@ def _deterministic_fallback(cv_text: str, query_text: str, jd_text: str) -> Cano
     scalars: dict[str, list[str]] = {target: [] for target in scalar_sections.values()}
     summary_lines: list[str] = []
     skill_items: list[dict[str, str]] = []
+
+    def add_skill_values(raw_values: str, category: str) -> None:
+        """Parse labeled skill lists even when OCR assigns the wrong section."""
+
+        raw_values = str(raw_values or "").strip()
+        explicit_proficiency = re.fullmatch(
+            r"(.{2,80}?)\s*[·•]\s*(?:精通|熟练(?:使用|掌握)?|熟悉|了解|掌握)\s*",
+            raw_values,
+        )
+        if explicit_proficiency:
+            name = explicit_proficiency.group(1).strip(" \t-•·")
+            if name:
+                skill_items.append({"name": name, "category": category})
+            return
+        raw_values = re.sub(
+            r"^(?:我)?(?:学过|自学过?|会用|会使用|使用过|掌握|熟悉|了解)\s*",
+            "",
+            raw_values,
+        )
+        raw_values = re.sub(r"^转行(?:做|从事)?\s*", "", raw_values)
+        for item in re.split(
+            r"[、，,；;|｜]+|\s+/\s+|"
+            r"(?<=[A-Za-z0-9\u4e00-\u9fff])(?:和|及|与)(?=[A-Za-z0-9\u4e00-\u9fff])",
+            raw_values,
+        ):
+            item = item.strip(" \t-•·")
+            if re.match(r"^(?:能|能够|可以|具备|善于)", item):
+                continue
+            item = re.sub(
+                r"^(?:编程语言|机器学习|深度学习|开发工具|技术栈)\s*[:：]\s*",
+                "",
+                item,
+            ).strip()
+            if re.search(r"(?:算法|神经网络)\s*[:：]?\s*如\s*", item):
+                item = re.split(r"(?:算法|神经网络)\s*[:：]?\s*如\s*", item, maxsplit=1)[-1]
+            item = re.sub(
+                r"^(?:精通|熟练(?:使用|掌握)?|熟悉|了解|掌握)\s*",
+                "",
+                item,
+            ).strip()
+            item = re.sub(r"^各种", "", item).strip()
+            item = re.sub(
+                r"等(?:相关)?(?:知识|技能|技术|工具|框架)?$",
+                "",
+                item,
+            ).strip()
+            item = re.sub(
+                r"(?:精通|熟练(?:使用|掌握)?|熟悉|了解|掌握)$",
+                "",
+                item,
+            ).strip()
+            if (
+                2 <= len(item) <= 50
+                and not re.fullmatch(r"(?:扎实|熟练|精通|熟悉|掌握|了解|良好|优秀)", item)
+                and not re.fullmatch(r"(?:主流)?(?:框架|平台|工具|技能|能力|知识|算法)", item)
+                and not re.search(r"^主流.*平台$|能力$", item)
+                and not _looks_like_record_body(item)
+                and not re.search(r"[。；;]", item)
+            ):
+                skill_items.append({"name": item, "category": category})
+
+    source_candidates = candidate_blocks(source)
+    summary_open = False
+    for source_block in source_candidates:
+        value = source_block.text.strip()
+        section = source_block.section_hint or ""
+        if _is_section_heading(value):
+            if summary_open:
+                summary_lines.append("\0")
+            summary_open = False
+            continue
+        if section == "summary":
+            summary_lines.append(value)
+            summary_open = True
+            continue
+        if section:
+            if summary_open:
+                summary_lines.append("\0")
+            summary_open = False
+            continue
+        if (
+            _looks_like_record_body(value)
+            or _FALLBACK_PERIOD.fullmatch(value)
+            or (phone_match and phone_match.group(0) in value)
+            or (email_match and email_match.group(0) in value)
+        ):
+            if summary_open:
+                summary_lines.append("\0")
+            summary_open = False
+            continue
+        signal = bool(re.match(
+            r"^(?:[-*•·▪◦]\s*)?(?:本人|我|具备|拥有|曾|有|熟悉|掌握|精通|"
+            r"从事|就职|实习|近?\d+\s*(?:年|个月|月)|"
+            r"[^，,。；;]{1,20}(?:大学|学院)(?:本科|硕士|博士)?(?:在读|毕业)?)",
+            value,
+        ))
+        continuation = bool(
+            summary_open
+            and summary_lines
+            and not re.search(r"[。；;!?！？]$", summary_lines[-1])
+            and not re.match(r"^(?:[-*•·▪◦]|\d{1,3}(?:[、)]|\.(?!\d)))", value)
+        )
+        if len(value) >= 8 and (signal or continuation):
+            summary_lines.append(value)
+            summary_open = True
+        else:
+            if summary_open:
+                summary_lines.append("\0")
+            summary_open = False
+
     unclassified: list[str] = []
     unstructured_current: tuple[str, int] | None = None
-    for block in candidate_blocks(source):
+    unstructured_last_number: int | None = None
+    for block in source_candidates:
         if _is_section_heading(block.text):
+            unstructured_current = None
+            unstructured_last_number = None
             continue
         section = block.section_hint or ""
         value = block.text.strip()
+        item_number_match = re.match(r"^(\d{1,3})(?:[、)]|\.(?!\d))\s*", value)
+        item_number = int(item_number_match.group(1)) if item_number_match else None
+        labeled_skill = _FALLBACK_LABELED_SKILL.fullmatch(value)
+        if labeled_skill:
+            add_skill_values(
+                labeled_skill.group("value"),
+                (
+                    "natural_language"
+                    if labeled_skill.group("label") in {"语言", "语言能力"}
+                    else "other"
+                ),
+            )
+            unstructured_current = None
+            unstructured_last_number = None
+            continue
         if section == "summary":
-            summary_lines.append(value)
+            unstructured_current = None
+            unstructured_last_number = None
         elif section == "skills":
+            value = value.lstrip(" \t-•·:：")
             value = re.sub(
                 r"^(?:专业技能|技能清单|技能|技术栈|工具|语言能力)\s*[:：]?\s*",
                 "",
                 value,
             )
-            for item in re.split(r"[、，,；;|｜/]+", value):
-                item = item.strip(" \t-•")
-                if len(item) >= 2:
-                    skill_items.append({"name": item, "category": "other"})
+            # OCR may put the heading and its value in separate blocks, for
+            # example ``语言能力`` followed by ``：CET-4``.
+            value = value.lstrip(" \t-•·:：")
+            add_skill_values(value, "other")
+            unstructured_current = None
+            unstructured_last_number = None
+        elif section in {"hobbies", "coursework"}:
+            title = "兴趣爱好" if section == "hobbies" else "相关课程"
+            cleaned = re.sub(r"^[^:：]{1,12}[:：]\s*", "", value).strip()
+            if cleaned and not re.fullmatch(r"[-•·]?\s*[A-Za-z0-9._-]{3,}", cleaned):
+                additional.setdefault(title, []).append(cleaned)
+            unstructured_current = None
+            unstructured_last_number = None
         elif section in scalar_sections:
             cleaned = re.sub(r"^[^:：]{1,12}[:：]\s*", "", value).strip()
             if cleaned:
                 scalars[scalar_sections[section]].append(cleaned)
+            unstructured_current = None
+            unstructured_last_number = None
         elif section not in {"education", "experience", "research", "activities", "projects"}:
-            skill_match = re.match(r"^(?:技能|专业技能|工具)\s*[:：]\s*(.+)$", value)
-            language_match = re.match(r"^(?:语言|语言能力)\s*[:：]\s*(.+)$", value)
-            if skill_match or language_match:
-                category = "natural_language" if language_match else "other"
-                raw_values = (skill_match or language_match).group(1)
-                for item in re.split(r"[、，,；;|｜/]+", raw_values):
-                    item = item.strip(" \t-•")
-                    if len(item) >= 2:
-                        skill_items.append({"name": item, "category": category})
-                unstructured_current = None
-                continue
+            for award_match in re.finditer(
+                r"((?:曾)?参加[^；;。]{2,60}?(?:竞赛|比赛)[^；;。]{0,32}?"
+                r"(?:获得|荣获)[^；;。]{0,16}?(?:一等奖|二等奖|三等奖|金奖|银奖|铜奖))",
+                value,
+            ):
+                scalars["awards"].append(award_match.group(1).strip(" ，,。；;"))
             if re.search(r"(?:奖学金|一等奖|二等奖|三等奖|优秀学生干部|荣誉称号|获奖)$", value):
                 scalars["awards"].append(value)
                 unstructured_current = None
+                unstructured_last_number = None
                 continue
             if re.search(r"(?:证书|资格证|执业证|职业资格|认证|执照)$", value):
                 scalars["certifications"].append(value)
                 unstructured_current = None
+                unstructured_last_number = None
+                continue
+            if (
+                (phone_match and phone_match.group(0) in value)
+                or (email_match and email_match.group(0) in value)
+            ):
+                # A bullet marker on a contact row is visual decoration, not a
+                # professional action. Extract it into meta before body routing.
+                unstructured_current = None
+                unstructured_last_number = None
+                continue
+            if re.search(r"(?:求职意向|目标岗位|应聘岗位)\s*[:：]", value):
+                unstructured_current = None
+                unstructured_last_number = None
+                continue
+            if re.fullmatch(r"[-•·]?\s*[A-Za-z][A-Za-z0-9._-]{2,30}", value):
+                # Bare social handles frequently sit beside phone/email in a
+                # multi-column header. Without a skill heading or action they
+                # must not become a one-line work experience.
+                unstructured_current = None
+                unstructured_last_number = None
+                continue
+            if re.match(
+                r"^[-*•·▪◦]\s*(?:本人|我|具备|拥有|曾担任|有|熟悉|掌握|精通|"
+                r"近?\d+\s*(?:年|个月|月))",
+                value,
+            ):
+                # A résumé summary bullet remains summary evidence even when
+                # de-columnization places it below skills or contact details.
+                unstructured_current = None
+                unstructured_last_number = None
                 continue
             profile_domain = re.search(
                 r"我(?:是)?(?:做|从事|负责)\s*([^，,。；;]{2,30}?)(?:的|方向|工作|$)",
@@ -1538,7 +2222,8 @@ def _deterministic_fallback(cv_text: str, query_text: str, jd_text: str) -> Cano
                 domain = profile_domain.group(1).strip()
                 if domain:
                     skill_items.append({"name": domain, "category": "domain"})
-                    summary_lines.append(value)
+                    unstructured_current = None
+                    unstructured_last_number = None
                     continue
 
             organization = _organization_from_text(value)
@@ -1554,7 +2239,7 @@ def _deterministic_fallback(cv_text: str, query_text: str, jd_text: str) -> Cano
                 and re.search(r"(?:就职于|任职于|供职于|在.+?(?:工作|担任|任职))", value)
             )
             project_match = re.search(
-                r"(?:参与|负责|主导|完成)\s*([^，。；;]{2,36}?(?:APP|系统|平台|项目|课题|产品))"
+                r"(?:参与|负责|主导|完成)\s*([^，。；;]{2,36}(?:APP|系统|平台|项目|课题|产品))"
                 r"(?:的|设计|开发|建设|研究|$)",
                 value,
                 re.IGNORECASE,
@@ -1566,13 +2251,15 @@ def _deterministic_fallback(cv_text: str, query_text: str, jd_text: str) -> Cano
                 if leftovers:
                     additional.setdefault("补充信息", []).extend(leftovers)
                 unstructured_current = None
+                unstructured_last_number = None
                 continue
             if explicit_work or (organization and period and compact_role):
                 record, _leftovers = _fallback_record("experience", [value])
                 records["experience"].append(record)
                 unstructured_current = ("experience", len(records["experience"]) - 1)
+                unstructured_last_number = item_number
                 continue
-            if activity_hint:
+            if activity_hint and not _looks_like_record_body(value):
                 target_section = "activities"
                 if unstructured_current and unstructured_current[0] == target_section:
                     current_record = records[target_section][unstructured_current[1]]
@@ -1586,6 +2273,7 @@ def _deterministic_fallback(cv_text: str, query_text: str, jd_text: str) -> Cano
                     )
                     if same_activity:
                         current_record["bullets"].append(value)
+                        unstructured_last_number = item_number or unstructured_last_number
                         continue
                 if (
                     unstructured_current
@@ -1595,13 +2283,15 @@ def _deterministic_fallback(cv_text: str, query_text: str, jd_text: str) -> Cano
                 ):
                     records[target_section][unstructured_current[1]]["bullets"].append(value)
                 else:
+                    body_only = _looks_like_record_body(value)
                     records[target_section].append({
-                        "organization": organization,
-                        "role": _labeled_value(value, ("岗位", "职位", "角色", "职务")),
-                        "period": _first_match(_FALLBACK_PERIOD, value),
+                        "organization": "" if body_only else organization,
+                        "role": "" if body_only else _labeled_value(value, ("岗位", "职位", "角色", "职务")),
+                        "period": "" if body_only else _first_match(_FALLBACK_PERIOD, value),
                         "bullets": [value],
                     })
                     unstructured_current = (target_section, len(records[target_section]) - 1)
+                unstructured_last_number = item_number
                 continue
             if project_match:
                 name = project_match.group(1).strip()
@@ -1611,35 +2301,89 @@ def _deterministic_fallback(cv_text: str, query_text: str, jd_text: str) -> Cano
                     and re.search(r"^(?:撰写|完成|优化|设计|开发|建设|维护|测试)", name)
                 ):
                     records["projects"][unstructured_current[1]]["bullets"].append(value)
+                    unstructured_last_number = item_number or unstructured_last_number
                     continue
+                project_residual = value.replace(name, " ")
+                project_residual = re.sub(
+                    r"^(?:我|本人)?(?:参与|负责|主导|完成)\s*",
+                    "",
+                    project_residual,
+                ).strip(" ，,。；;|｜")
                 records["projects"].append({
                     "name": name,
                     "organization": "",
                     "role": "",
                     "period": _first_match(_FALLBACK_PERIOD, value),
-                    "bullets": [value],
+                    "bullets": [project_residual] if len(project_residual) >= 2 else [],
                 })
                 unstructured_current = ("projects", len(records["projects"]) - 1)
+                unstructured_last_number = item_number
                 continue
-            if unstructured_current is not None and _looks_like_record_body(value):
-                current_section, current_index = unstructured_current
-                records[current_section][current_index]["bullets"].append(value)
+            if (
+                len(value) <= 60
+                and not _looks_like_record_body(value)
+                and re.search(
+                    r"(?:项目|系统|平台|小程序|APP|课题|作品)$",
+                    value,
+                    re.IGNORECASE,
+                )
+            ):
+                records["projects"].append({
+                    "name": value,
+                    "organization": "",
+                    "role": "",
+                    "period": _first_match(_FALLBACK_PERIOD, value),
+                    "bullets": [],
+                })
+                unstructured_current = ("projects", len(records["projects"]) - 1)
+                unstructured_last_number = item_number
+                continue
+            if _looks_like_record_body(value):
+                if unstructured_current is not None:
+                    current_section, current_index = unstructured_current
+                    current_record = records[current_section][current_index]
+                    has_identity = any(str(current_record.get(key, "") or "").strip() for key in (
+                        "organization", "role", "name", "institution", "topic", "period",
+                    ))
+                    if (
+                        item_number is not None
+                        and unstructured_last_number is not None
+                        and item_number <= unstructured_last_number
+                        and current_record.get("bullets")
+                    ):
+                        # A numbering restart in a de-columnized OCR stream is
+                        # the strongest available boundary between duty lists.
+                        target_section = current_section if not has_identity else "experience"
+                        records[target_section].append({
+                            "organization": "",
+                            "role": "",
+                            "period": "",
+                            "bullets": [value],
+                        })
+                        unstructured_current = (target_section, len(records[target_section]) - 1)
+                    else:
+                        current_record["bullets"].append(value)
+                else:
+                    target_section = "activities" if activity_hint else "experience"
+                    records[target_section].append({
+                        "organization": "",
+                        "role": "",
+                        "period": "",
+                        "bullets": [value],
+                    })
+                    unstructured_current = (
+                        target_section,
+                        len(records[target_section]) - 1,
+                    )
+                unstructured_last_number = item_number or unstructured_last_number
                 continue
             if unstructured_current is not None:
                 # Contact rows, summaries and a following record header must
                 # not leak into the preceding experience merely because OCR
                 # removed the section headings.
                 unstructured_current = None
-            if (
-                (phone_match and phone_match.group(0) in value)
-                or (email_match and email_match.group(0) in value)
-            ):
-                # The values have already been extracted into meta. Keeping a
-                # compact contact row as the personal summary duplicates PII
-                # and crowds out grounded professional content.
-                continue
-            if not summary_lines and len(value) >= 20:
-                summary_lines.append(value)
+                unstructured_last_number = None
+            if value.strip(" \t-•·") in _LAYOUT_RESET_HEADINGS:
                 continue
             if not any(token and token in value for token in (
                 name_match.group(1) if name_match else "",
@@ -1647,6 +2391,135 @@ def _deterministic_fallback(cv_text: str, query_text: str, jd_text: str) -> Cano
                 email_match.group(0) if email_match else "",
             )):
                 unclassified.append(value)
+        else:
+            # Typed records were already parsed through their record IDs.
+            unstructured_current = None
+            unstructured_last_number = None
+
+    # Multi-column resume extractors often emit all identity rows first and
+    # the aligned numbered duty lists later. Reattach those lists in source
+    # order only when both sides are explicit: an identity-bearing empty/weak
+    # record and an anonymous list beginning with an item number.
+    anonymous_numbered = [
+        record for record in records["experience"]
+        if not any(str(record.get(key, "") or "").strip() for key in (
+            "organization", "role", "period",
+        ))
+        and record.get("bullets")
+        and any(
+            re.match(r"^\d{1,3}(?:[、)]|\.(?!\d))\s*", str(value).strip())
+            for value in record["bullets"]
+        )
+    ]
+    identity_candidates: list[tuple[str, dict]] = []
+    for candidate_section in ("experience", "projects", "activities"):
+        identity_fields = (
+            ("organization", "role", "period")
+            if candidate_section != "projects"
+            else ("name", "organization", "role", "period")
+        )
+        for record in records[candidate_section]:
+            if not any(str(record.get(key, "") or "").strip() for key in identity_fields):
+                continue
+            existing = [str(value).strip() for value in record.get("bullets", []) if str(value).strip()]
+            weak_existing = not existing
+            if weak_existing:
+                identity_candidates.append((candidate_section, record))
+
+    routed_ids: set[int] = set()
+    for anonymous, (_candidate_section, destination) in zip(
+        anonymous_numbered, identity_candidates,
+    ):
+        existing = [
+            str(value).strip() for value in destination.get("bullets", []) if str(value).strip()
+        ]
+        strong_existing = [
+            value for value in existing
+            if _looks_like_record_body(value) or len(value) > 32
+        ]
+        destination["bullets"] = list(dict.fromkeys(
+            strong_existing
+            + [str(value).strip() for value in anonymous.get("bullets", []) if str(value).strip()]
+        ))
+        routed_ids.add(id(anonymous))
+    if routed_ids:
+        records["experience"] = [
+            record for record in records["experience"] if id(record) not in routed_ids
+        ]
+
+    # A late OCR column can contain a missing numbered continuation after the
+    # dates/contacts column. Only groups starting above item 1 are eligible;
+    # a fresh list beginning at 1 remains an independent anonymous record.
+    late_continuations: list[dict] = []
+    numbered_destinations = [
+        record for record in records["experience"]
+        if any(str(record.get(key, "") or "").strip() for key in ("organization", "role"))
+        and any(
+            re.match(r"^\d{1,3}(?:[、)]|\.(?!\d))\s*", str(value).strip())
+            for value in record.get("bullets", [])
+        )
+    ]
+    for record in records["experience"]:
+        if any(str(record.get(key, "") or "").strip() for key in ("organization", "role", "period")):
+            continue
+        bullets = [str(value).strip() for value in record.get("bullets", []) if str(value).strip()]
+        first_number = re.match(
+            r"^(\d{1,3})(?:[、)]|\.(?!\d))\s*", bullets[0]
+        ) if bullets else None
+        if first_number and int(first_number.group(1)) > 1 and numbered_destinations:
+            destination = numbered_destinations[0]
+            destination["bullets"] = list(dict.fromkeys(
+                list(destination.get("bullets", [])) + bullets
+            ))
+            late_continuations.append(record)
+    if late_continuations:
+        late_ids = {id(record) for record in late_continuations}
+        records["experience"] = [
+            record for record in records["experience"] if id(record) not in late_ids
+        ]
+
+    # A final OCR column may contain item 1 after item 2 was already routed to
+    # its identity row. Attach only when exactly one destination has the
+    # adjacent numbered suffix and no copy of the incoming numbers.
+    leading_complements: list[dict] = []
+    for record in records["experience"]:
+        if any(str(record.get(key, "") or "").strip() for key in (
+            "organization", "role", "period",
+        )):
+            continue
+        bullets = [str(value).strip() for value in record.get("bullets", []) if str(value).strip()]
+        incoming_numbers = {
+            int(match.group(1))
+            for value in bullets
+            if (match := re.match(r"^(\d{1,3})(?:[、)]|\.(?!\d))\s*", value))
+        }
+        if not incoming_numbers or min(incoming_numbers) != 1:
+            continue
+        destinations: list[dict] = []
+        for destination in numbered_destinations:
+            destination_numbers = {
+                int(match.group(1))
+                for value in destination.get("bullets", [])
+                if (match := re.match(r"^(\d{1,3})(?:[、)]|\.(?!\d))\s*", str(value).strip()))
+            }
+            if (
+                destination_numbers
+                and incoming_numbers.isdisjoint(destination_numbers)
+                and max(incoming_numbers) + 1 == min(destination_numbers)
+            ):
+                destinations.append(destination)
+        if len(destinations) == 1:
+            destination = destinations[0]
+            destination["bullets"] = list(dict.fromkeys(
+                bullets + list(destination.get("bullets", []))
+            ))
+            leading_complements.append(record)
+    if leading_complements:
+        complement_ids = {id(record) for record in leading_complements}
+        records["experience"] = [
+            record for record in records["experience"] if id(record) not in complement_ids
+        ]
+
     if unclassified:
         # These blocks have already passed query/resume fact eligibility.  A
         # neutral public section retains them without exposing an internal
@@ -1661,7 +2534,12 @@ def _deterministic_fallback(cv_text: str, query_text: str, jd_text: str) -> Cano
             "target_role": target_role or meta.get("target_role", ""),
             "work_experience": seniority_match.group(0) if seniority_match else "",
         },
-        "summary": "。".join(item.strip("。") for item in summary_lines if item.strip("。")),
+        "summary": "。".join(
+            item.strip("。")
+            for item in _coalesce_ocr_summary_lines(summary_lines)
+            if len(item.strip("。")) >= 20
+            and not _INCOMPLETE_TEXT_TAIL.search(item.strip("。；; "))
+        ),
         "education": education,
         "experience": records["experience"],
         "research": records["research"],
@@ -1765,6 +2643,56 @@ def _empty_profile_framework(target_role: str = "") -> dict:
 _SOURCE_FALLBACK_FASTPATH_MIN_COVERAGE = 0.90
 
 
+def _fallback_is_structurally_safe(
+    resume: CanonicalResume,
+    *,
+    allow_period_only_experience: bool = False,
+) -> bool:
+    """Reject high-coverage fallbacks whose fields are only lexical matches."""
+
+    required_fields = {
+        "experience": ("organization", "role"),
+        "research": ("institution", "topic"),
+        "activities": ("organization", "role"),
+        "projects": ("name",),
+    }
+    for education in resume.education:
+        if not str(education.school or "").strip():
+            return False
+        if not any(str(value or "").strip() for value in (education.degree, education.major)):
+            return False
+    for section, fields in required_fields.items():
+        for record in getattr(resume, section):
+            identities = [
+                str(getattr(record, field, "") or "").strip()
+                for field in fields
+            ]
+            if not all(identities):
+                # OCR sometimes keeps a distinct employment period and all of
+                # its duties while dropping the employer/title line.  Keeping
+                # that row with blank identity fields is safer than either
+                # discarding the supplied history or inheriting the preceding
+                # employer.  Require a grounded period and real bullets so an
+                # arbitrary prose fragment still cannot pass the fast path.
+                period_only_experience = bool(
+                    section == "experience"
+                    and allow_period_only_experience
+                    and not any(identities)
+                    and str(record.period or "").strip()
+                    and record.bullets
+                )
+                if not period_only_experience:
+                    return False
+            if any(_looks_like_record_body(value) for value in identities if value):
+                return False
+            if not record.bullets:
+                return False
+    return not any(
+        "待整理" in str(title)
+        for title in resume.additional_sections
+    )
+
+
 @dataclass(frozen=True)
 class _RecoveryStats:
     filled_fields: int = 0
@@ -1866,6 +2794,8 @@ def _merge_source_recovery(
     fallback: CanonicalResume,
     *,
     trusted_rewrites: dict[str, str] | None = None,
+    allow_new_records: bool = True,
+    restore_empty_sections: bool = False,
 ) -> tuple[CanonicalResume, _RecoveryStats]:
     """Fill missing source facts without replacing already-optimized content."""
 
@@ -1886,11 +2816,13 @@ def _merge_source_recovery(
     }
     for section, fields in section_fields.items():
         records = getattr(merged, section)
+        section_was_empty = not records
         for fallback_record in getattr(fallback, section):
             match_index = _find_recovery_record(section, records, fallback_record)
             if match_index is None:
-                records.append(fallback_record.model_copy(deep=True))
-                appended_records += 1
+                if allow_new_records or (restore_empty_sections and section_was_empty):
+                    records.append(fallback_record.model_copy(deep=True))
+                    appended_records += 1
                 continue
             record = records[match_index]
             for field in fields:
@@ -1966,6 +2898,79 @@ def _has_structured_history(resume: CanonicalResume) -> bool:
     ))
 
 
+def _merge_query_fallback_sections(
+    resume: CanonicalResume,
+    fallback: CanonicalResume,
+) -> CanonicalResume:
+    """Recover explicit query facts section by section without duplicating rows.
+
+    Query-only Composer output can be schema-valid yet omit an entire section
+    (the log cases lost all internships or skills while retaining education).
+    The deterministic parser is deliberately less fluent but every value is
+    evidence-gated. Use it to fill absent sections and compatible singleton
+    rows; never replace richer Composer prose or append an ambiguous competing
+    record to a populated section.
+    """
+
+    merged = resume.model_copy(deep=True)
+    for field in ("name", "phone", "email", "target_role", "work_experience"):
+        if not getattr(merged.meta, field) and getattr(fallback.meta, field):
+            setattr(merged.meta, field, getattr(fallback.meta, field))
+
+    section_fields = {
+        "education": ("school", "degree", "major", "period"),
+        "experience": ("organization", "role", "period"),
+        "research": ("institution", "topic", "period"),
+        "activities": ("organization", "role", "period"),
+        "projects": ("name", "organization", "role", "period"),
+    }
+    for section, fields in section_fields.items():
+        current = getattr(merged, section)
+        recovery = getattr(fallback, section)
+        if not current and recovery:
+            setattr(merged, section, [item.model_copy(deep=True) for item in recovery])
+            continue
+        if len(current) != 1 or len(recovery) != 1:
+            continue
+        destination = current[0]
+        source_record = recovery[0]
+        conflicts = [
+            field for field in fields
+            if getattr(destination, field)
+            and getattr(source_record, field)
+            and _identity_value(getattr(destination, field))
+            != _identity_value(getattr(source_record, field))
+        ]
+        if conflicts:
+            continue
+        for field in fields:
+            if not getattr(destination, field) and getattr(source_record, field):
+                setattr(destination, field, getattr(source_record, field))
+        if hasattr(destination, "bullets"):
+            for bullet in source_record.bullets:
+                if not _bullet_is_represented(bullet, list(destination.bullets)):
+                    destination.bullets.append(bullet)
+
+    existing_skills = {_identity_value(item.name) for item in merged.skills.items}
+    for item in fallback.skills.items:
+        normalized = _identity_value(item.name)
+        if normalized and normalized not in existing_skills:
+            merged.skills.items.append(item.model_copy(deep=True))
+            existing_skills.add(normalized)
+
+    for section in (
+        "awards", "publications", "patents", "certifications", "training", "teaching"
+    ):
+        values = getattr(merged, section)
+        existing = {_identity_value(value) for value in values}
+        for value in getattr(fallback, section):
+            normalized = _identity_value(value)
+            if normalized and normalized not in existing:
+                values.append(value)
+                existing.add(normalized)
+    return merged
+
+
 def _grounded_source_fallback(
     cv_text: str,
     query_text: str,
@@ -1980,6 +2985,7 @@ def _grounded_source_fallback(
     fallback, fallback_bindings, fallback_removed = enforce_resume_evidence(
         fallback,
         source,
+        allow_reordered_record_bullets=True,
     )
     fallback = _compact_canonical(fallback)
     fallback_bindings = bind_resume_evidence(fallback, source)
@@ -2015,12 +3021,40 @@ def run_v2_pipeline(
     if not cv_text or not cv_text.strip():
         logger.info("V2 | No CV — generating framework from query+JD")
         t_gen = time.perf_counter()
+        evidence_source = build_source_bundle("", query_text, jd_text)
+        trace_event("source_bundle", source=evidence_source)
+        candidate_evidence = "\n".join(
+            block.text for block in candidate_blocks(evidence_source)
+        )
         resume = compose_from_query(query_text, jd_text)
         trace_event("generate_composer_assembled", resume=resume)
         used_fallback = False
+        grounded_fallback = CanonicalResume()
+        if candidate_evidence:
+            raw_fallback = _deterministic_fallback("", query_text, jd_text)
+            fallback_data = raw_fallback.model_dump()
+            _ground_fixed_fields(fallback_data, candidate_evidence)
+            _reclassify_non_work(fallback_data, candidate_evidence)
+            grounded_fallback = CanonicalResume.model_validate(fallback_data)
+            grounded_fallback = _ground_bullets(
+                grounded_fallback,
+                candidate_evidence,
+            )
+            grounded_fallback, _, _ = enforce_resume_evidence(
+                grounded_fallback,
+                evidence_source,
+            )
+            # ``补充信息`` is parser scratch space, not a safe semantic type.
+            # Composer may still emit a named long-tail section when it can
+            # classify one from the same source.
+            grounded_fallback.additional_sections.pop("补充信息", None)
+            grounded_fallback = _compact_canonical(grounded_fallback)
+            before_recovery = resume.model_dump()
+            resume = _merge_query_fallback_sections(resume, grounded_fallback)
+            used_fallback = resume.model_dump() != before_recovery
         if _is_empty_resume(resume) and query_text.strip():
             logger.warning("Generate composer produced an empty resume; using deterministic query fallback")
-            resume = _deterministic_fallback("", query_text, jd_text)
+            resume = grounded_fallback
             used_fallback = not _is_empty_resume(resume)
         n_exp = len(resume.experience)
         n_proj = len(resume.projects)
@@ -2049,6 +3083,11 @@ def run_v2_pipeline(
         # positions exposed by the API.
         resume = _rank_resume_content(resume, jd_text or resume.meta.target_role)
         resume, trusted_rewrites = _atomize_resume_bullets(resume)
+        trusted_outputs = {
+            path: value
+            for path in trusted_rewrites
+            if (value := _bullet_path_value(resume, path)) is not None
+        }
         optimizer_changes: list[Change] = []
         if _needs_optimizer(resume):
             before_optimizer = resume.model_copy(deep=True)
@@ -2056,11 +3095,17 @@ def run_v2_pipeline(
             resume = optimization.resume
             for path, source_value in optimization.trusted_rewrites.items():
                 trusted_rewrites[path] = trusted_rewrites.get(path, source_value)
+                output_value = _bullet_path_value(resume, path)
+                if output_value is not None:
+                    trusted_outputs[path] = output_value
             resume = _ground_optimizer_output(
                 before_optimizer,
                 resume,
                 query_text,
                 trusted_rewrites=trusted_rewrites,
+            )
+            trusted_rewrites = _filter_trusted_rewrites(
+                resume, trusted_rewrites, trusted_outputs,
             )
             optimizer_changes = _bullet_rewrite_changes(before_optimizer, resume)
         else:
@@ -2070,16 +3115,31 @@ def run_v2_pipeline(
             query_text,
             trusted_rewrites=trusted_rewrites,
         )
+        trusted_rewrites = _filter_trusted_rewrites(
+            resume, trusted_rewrites, trusted_outputs,
+        )
         resume = validate_resume(resume, source_text=query_text)
+        trusted_rewrites = _filter_trusted_rewrites(
+            resume, trusted_rewrites, trusted_outputs,
+        )
 
-        evidence_source = build_source_bundle("", query_text, jd_text)
-        trace_event("source_bundle", source=evidence_source)
         resume, evidence_bindings, evidence_removed = enforce_resume_evidence(
             resume,
             evidence_source,
             trusted_rewrites=trusted_rewrites,
         )
+        if not _is_empty_resume(grounded_fallback):
+            resume = _merge_query_fallback_sections(resume, grounded_fallback)
+            resume, evidence_bindings, second_removed = enforce_resume_evidence(
+                resume,
+                evidence_source,
+                trusted_rewrites=trusted_rewrites,
+            )
+            evidence_removed.extend(second_removed)
         resume = _compact_canonical(resume)
+        trusted_rewrites = _filter_trusted_rewrites(
+            resume, trusted_rewrites, trusted_outputs,
+        )
         # Recompute only after unsupported JD-derived records have been
         # removed. Otherwise temporary model output suppresses the framework
         # and produces an almost blank document.
@@ -2154,6 +3214,7 @@ def run_v2_pipeline(
             fallback_candidate is not None
             and fallback_candidate[1] >= _SOURCE_FALLBACK_FASTPATH_MIN_COVERAGE
             and _has_structured_history(fallback_candidate[0].resume)
+            and _fallback_is_structurally_safe(fallback_candidate[0].resume)
         ):
             result, fallback_coverage, _fallback_missing = fallback_candidate
             result.changes.insert(0, Change(
@@ -2202,7 +3263,13 @@ def run_v2_pipeline(
                 source,
                 candidate_evidence,
             )
-            if fallback_coverage >= pre_optimizer_coverage + 0.10:
+            if (
+                fallback_coverage >= pre_optimizer_coverage + 0.10
+                and _fallback_is_structurally_safe(
+                    fallback_result.resume,
+                    allow_period_only_experience=True,
+                )
+            ):
                 merged_resume, recovery = _merge_source_recovery(
                     result.resume,
                     fallback_result.resume,
@@ -2231,6 +3298,11 @@ def run_v2_pipeline(
     result.resume, atom_provenance = _atomize_resume_bullets(result.resume)
     t_optimizer = time.perf_counter()
     trusted_rewrites: dict[str, str] = dict(atom_provenance)
+    trusted_outputs = {
+        path: value
+        for path in trusted_rewrites
+        if (value := _bullet_path_value(result.resume, path)) is not None
+    }
     if _needs_optimizer(result.resume):
         before_optimizer = result.resume.model_copy(deep=True)
         trace_event("optimizer_input_resume", resume=before_optimizer, jd_text=jd_text)
@@ -2242,11 +3314,17 @@ def run_v2_pipeline(
             # bullet when atomization created it; otherwise use the optimizer's
             # verified pre-edit wording.
             trusted_rewrites[path] = atom_provenance.get(path, source_value)
+            output_value = _bullet_path_value(result.resume, path)
+            if output_value is not None:
+                trusted_outputs[path] = output_value
         result.resume = _ground_optimizer_output(
             before_optimizer,
             result.resume,
             candidate_evidence,
             trusted_rewrites=trusted_rewrites,
+        )
+        trusted_rewrites = _filter_trusted_rewrites(
+            result.resume, trusted_rewrites, trusted_outputs,
         )
         result.changes.extend(_bullet_rewrite_changes(before_optimizer, result.resume))
     else:
@@ -2256,12 +3334,18 @@ def run_v2_pipeline(
         candidate_evidence,
         trusted_rewrites=trusted_rewrites,
     )
+    trusted_rewrites = _filter_trusted_rewrites(
+        result.resume, trusted_rewrites, trusted_outputs,
+    )
     logger.info("V2 | Optimizer done (%.1fs)", time.perf_counter() - t_optimizer)
 
     # Deterministic repair uses candidate evidence only.  JD schools, employers
     # and dates must never backfill candidate fields.
     _source_for_validate = candidate_evidence
     result.resume = validate_resume(result.resume, source_text=_source_for_validate)
+    trusted_rewrites = _filter_trusted_rewrites(
+        result.resume, trusted_rewrites, trusted_outputs,
+    )
     result.resume, _, evidence_removed = enforce_resume_evidence(
         result.resume,
         source,
@@ -2278,6 +3362,9 @@ def run_v2_pipeline(
         for path in evidence_removed
     )
     result.resume = _compact_canonical(result.resume)
+    trusted_rewrites = _filter_trusted_rewrites(
+        result.resume, trusted_rewrites, trusted_outputs,
+    )
     result.evidence_bindings = bind_resume_evidence(
         result.resume,
         source,
@@ -2305,23 +3392,42 @@ def run_v2_pipeline(
                 source,
                 candidate_evidence,
             )
-            if fallback_coverage >= coverage + 0.10:
+            if (
+                fallback_coverage >= coverage + 0.10
+                and _fallback_is_structurally_safe(
+                    fallback_result.resume,
+                    allow_period_only_experience=True,
+                )
+            ):
                 merged_resume, recovery = _merge_source_recovery(
                     result.resume,
                     fallback_result.resume,
                     trusted_rewrites=trusted_rewrites,
+                    allow_new_records=False,
+                    restore_empty_sections=True,
                 )
                 if recovery.total:
+                    merged_trusted_rewrites = _filter_trusted_rewrites(
+                        merged_resume,
+                        trusted_rewrites,
+                        trusted_outputs,
+                    )
                     merged_resume, _, merged_removed = enforce_resume_evidence(
                         merged_resume,
                         source,
-                        trusted_rewrites=trusted_rewrites,
+                        trusted_rewrites=merged_trusted_rewrites,
+                        allow_reordered_record_bullets=True,
                     )
                     merged_resume = _compact_canonical(merged_resume)
+                    merged_trusted_rewrites = _filter_trusted_rewrites(
+                        merged_resume,
+                        merged_trusted_rewrites,
+                        trusted_outputs,
+                    )
                     merged_bindings = bind_resume_evidence(
                         merged_resume,
                         source,
-                        trusted_rewrites=trusted_rewrites,
+                        trusted_rewrites=merged_trusted_rewrites,
                     )
                     merged_coverage, merged_missing = _deterministic_source_coverage(
                         source,
@@ -2339,6 +3445,7 @@ def run_v2_pipeline(
                         )
                         result.resume = merged_resume
                         result.evidence_bindings = merged_bindings
+                        trusted_rewrites = merged_trusted_rewrites
                         result.changes.extend(
                             Change(
                                 path=path,

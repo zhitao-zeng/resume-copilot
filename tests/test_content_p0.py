@@ -602,3 +602,40 @@ def test_static_docx_template_preserves_style_package_and_replaces_sample_body(t
     assert abs(rendered.sections[0].top_margin.inches - 1.05) < 0.01
     assert abs(rendered.sections[0].left_margin.inches - 0.92) < 0.01
     assert rendered.styles["Normal"].font.name == "Arial"
+
+
+def test_custom_template_keeps_section_order_and_heading_styles(tmp_path):
+    template = tmp_path / "sectioned-template.docx"
+    template_doc = Document()
+    template_doc.add_paragraph("个人总结", style="Heading 2")
+    template_doc.add_paragraph("示例总结")
+    template_doc.add_paragraph("工作经历", style="Heading 2")
+    template_doc.add_paragraph("示例工作内容")
+    template_doc.save(template)
+
+    payload = {
+        "meta": {"name": "李明", "target_role": "产品经理"},
+        "summary": "负责真实产品需求分析与版本推进。",
+        "experience": [{
+            "company": "甲公司",
+            "role": "产品经理",
+            "period": "2022-2024",
+            "bullets": ["完成用户调研并推动版本上线"],
+        }],
+        "education": [],
+        "projects": [],
+        "skills": {},
+    }
+    output = tmp_path / "sectioned-output.docx"
+    with patch("resume_renderer.inspect_docx_layout", return_value={"available": False, "issues": []}):
+        render_docx(payload, output, template=str(template))
+
+    rendered = Document(output)
+    texts = [paragraph.text for paragraph in rendered.paragraphs if paragraph.text.strip()]
+    summary_heading = texts.index("个人总结")
+    work_heading = texts.index("工作经历")
+    assert summary_heading < texts.index("负责真实产品需求分析与版本推进。") < work_heading
+    assert work_heading < texts.index("完成用户调研并推动版本上线")
+    assert "示例总结" not in texts
+    assert "示例工作内容" not in texts
+    assert rendered.paragraphs[summary_heading].style.name == "Heading 2"

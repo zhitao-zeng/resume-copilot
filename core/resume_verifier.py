@@ -21,22 +21,35 @@ from diagnostic_trace import trace_event
 
 logger = logging.getLogger(__name__)
 
+_PROFESSIONAL_DUTY = re.compile(
+    r"^(?:[-*•·▪◦]\s*)?(?:\d{1,3}[.、)]\s*)?(?:负责|参与|主导|协助|支持|配合|"
+    r"完成|推动|推进|设计|开发|构建|实现|制定|管理|运营|分析|研究|撰写|输出|"
+    r"交付|维护|优化|搭建|建立|开展|承担|提供|跟进|协调|带领|执行|学会|"
+    r"在[^，。；;]{0,40}(?:领导|指导)下|为[^，。；;]{0,32}提供)",
+    re.IGNORECASE,
+)
+_ACTIVITY_CONTEXT = re.compile(
+    r"(?:学生会|社团|协会|志愿|义工|校园活动|宣传活动|文体活动|竞赛组织)"
+)
+
 
 def _normalize_evidence_text(value: str) -> str:
     value = unicodedata.normalize("NFKC", str(value or "")).lower()
     return re.sub(r"[\s，。；、：:,.!?！？()（）\[\]【】'\"]+", "", value)
 
 
+_DATE_TOKEN_PATTERN = re.compile(
+    r"(?<!\d)(?:(?P<year1>(?:19|20)\d{2})\s*[-./年]\s*(?P<month1>0?[1-9]|1[0-2])\s*月?"
+    r"|(?P<month2>0?[1-9]|1[0-2])\s*[-./]\s*(?P<year2>(?:19|20)\d{2}))(?!\d)"
+)
+
+
 def _date_signature(value: str) -> tuple[str, ...]:
     """Normalize yyyy-mm/mm-yyyy/Chinese dates for factual comparison."""
 
     text = unicodedata.normalize("NFKC", str(value or ""))
-    pattern = re.compile(
-        r"(?<!\d)(?:(?P<year1>(?:19|20)\d{2})\s*[-./年]\s*(?P<month1>0?[1-9]|1[0-2])\s*月?"
-        r"|(?P<month2>0?[1-9]|1[0-2])\s*[-./]\s*(?P<year2>(?:19|20)\d{2}))(?!\d)"
-    )
     signature: list[str] = []
-    for match in pattern.finditer(text):
+    for match in _DATE_TOKEN_PATTERN.finditer(text):
         year = match.group("year1") or match.group("year2")
         month = match.group("month1") or match.group("month2")
         signature.append(f"{year}{int(month):02d}")
@@ -53,6 +66,31 @@ def _has_equivalent_date_evidence(value: str, evidence_text: str) -> bool:
             for index in range(len(source_signature) - len(signature) + 1):
                 if source_signature[index:index + len(signature)] == signature:
                     return True
+    # Multi-column OCR often emits the start date, institution/title and end
+    # date on separate nearby lines. Accept the ordered pair only inside a
+    # small source window; merely finding both dates somewhere in the resume
+    # would synthesize periods across unrelated records.
+    normalized_source = unicodedata.normalize("NFKC", str(evidence_text or ""))
+    occurrences: list[tuple[str, int, int]] = []
+    for match in _DATE_TOKEN_PATTERN.finditer(normalized_source):
+        year = match.group("year1") or match.group("year2")
+        month = match.group("month1") or match.group("month2")
+        occurrences.append((f"{year}{int(month):02d}", match.start(), match.end()))
+    for start in range(len(occurrences)):
+        if occurrences[start][0] != signature[0]:
+            continue
+        cursor = start
+        matched = 1
+        while matched < len(signature):
+            cursor += 1
+            if cursor >= len(occurrences):
+                break
+            if occurrences[cursor][1] - occurrences[start][2] > 180:
+                break
+            if occurrences[cursor][0] == signature[matched]:
+                matched += 1
+        if matched == len(signature):
+            return True
     return False
 
 
@@ -181,8 +219,35 @@ def _reclassify_non_work(parsed: dict, evidence_text: str) -> None:
             })
             continue
         kept.append(item)
+    retained_activities: list[dict] = []
+    for item in activities:
+        if not isinstance(item, dict):
+            continue
+        bullets = [
+            str(value).strip()
+            for value in item.get("bullets", [])
+            if str(value).strip()
+        ]
+        anonymous = not any(
+            str(item.get(field, "") or "").strip()
+            for field in ("organization", "role", "period")
+        )
+        professional_count = sum(bool(_PROFESSIONAL_DUTY.search(value)) for value in bullets)
+        # OCR can move a detached duties column below “在校经历/奖项”. Keep
+        # the supplied duties as an identityless work row instead of attaching
+        # them to a club or inventing an employer. Single award/activity lines
+        # and clearly campus-specific records stay in their original section.
+        if (
+            anonymous
+            and len(bullets) >= 2
+            and professional_count * 2 >= len(bullets)
+            and not _ACTIVITY_CONTEXT.search(" ".join(bullets))
+        ):
+            kept.append(item)
+        else:
+            retained_activities.append(item)
     parsed["experience"] = kept
-    parsed["activities"] = activities
+    parsed["activities"] = retained_activities
     parsed["research"] = research
 
 
@@ -199,6 +264,50 @@ def conservative_fallback() -> VerifiedResult:
         changes=[Change(path="*", action="remove",
                         reason="Verifier failed, emitted empty fallback")],
     )
+
+
+def _merge_adjacent_duplicate_experiences(entries: list) -> list:
+    """Merge only genuinely duplicated adjacent experience rows.
+
+    The same person can hold the same title at the same employer in distinct
+    periods.  Collapsing those rows creates a synthetic record whose bullets
+    span multiple source records, so different non-empty periods are a hard
+    boundary.
+    """
+
+    merged: list = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            merged.append(entry)
+            continue
+        previous = merged[-1] if merged and isinstance(merged[-1], dict) else None
+        same_identity = bool(previous) and (
+            previous.get("organization", "") == entry.get("organization", "")
+            and previous.get("role", "") == entry.get("role", "")
+        )
+        previous_period = str(previous.get("period", "") or "").strip() if previous else ""
+        entry_period = str(entry.get("period", "") or "").strip()
+        periods_compatible = (
+            not previous_period
+            or not entry_period
+            or _normalize_evidence_text(previous_period) == _normalize_evidence_text(entry_period)
+            or (
+                bool(_date_signature(previous_period))
+                and _date_signature(previous_period) == _date_signature(entry_period)
+            )
+        )
+        if not (same_identity and periods_compatible):
+            merged.append(dict(entry))
+            continue
+        if not previous_period and entry_period:
+            previous["period"] = entry_period
+        existing_bullets = previous.setdefault("bullets", [])
+        seen = set(existing_bullets)
+        for bullet in entry.get("bullets", []):
+            if bullet not in seen:
+                existing_bullets.append(bullet)
+                seen.add(bullet)
+    return merged
 
 
 def verify_resume(source: SourceBundle, draft: DraftResume) -> VerifiedResult:
@@ -335,27 +444,7 @@ def verify_resume(source: SourceBundle, draft: DraftResume) -> VerifiedResult:
     # ── Post-processing: merge adjacent duplicate experiences ──
     exp_list = parsed.get("experience", [])
     if isinstance(exp_list, list):
-        merged = []
-        for entry in exp_list:
-            if not isinstance(entry, dict):
-                merged.append(entry)
-                continue
-            if merged and (
-                merged[-1].get("organization", "") == entry.get("organization", "")
-                and merged[-1].get("role", "") == entry.get("role", "")
-            ):
-                # Merge bullets
-                existing_bullets = merged[-1].get("bullets", [])
-                new_bullets = entry.get("bullets", [])
-                # Dedup and append
-                seen = set(existing_bullets)
-                for b in new_bullets:
-                    if b not in seen:
-                        existing_bullets.append(b)
-                        seen.add(b)
-            else:
-                merged.append(dict(entry))
-        parsed["experience"] = merged
+        parsed["experience"] = _merge_adjacent_duplicate_experiences(exp_list)
 
     # ── Post-processing: source-based guard ──
     source_text = "\n".join(b.text for b in source.blocks)

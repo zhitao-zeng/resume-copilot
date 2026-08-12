@@ -2293,11 +2293,17 @@ def render_docx(
             # text would produce empty output since nothing can be injected.
             _has_tables = len(doc.tables) > 0
             _has_placeholders = False
+            _has_section_headings = False
             for p in doc.paragraphs:
                 if re.search(r"[{【].*[}】]|name|phone|email|experience|education|skills", p.text, re.IGNORECASE):
                     _has_placeholders = True
-                    break
-            if _has_tables or _has_placeholders:
+                normalized = re.sub(r"[\s:：]+", "", p.text)
+                if any(
+                    re.sub(r"[\s:：]+", "", title) == normalized
+                    for title in _RESUME_SECTION_TITLES
+                ):
+                    _has_section_headings = True
+            if _has_tables or _has_placeholders or _has_section_headings:
                 _apply_resume_data_to_template(doc, resume_data)
                 if _layout_retry:
                     _apply_docx_compact_typography(doc)
@@ -2419,41 +2425,100 @@ def _apply_resume_data_to_template(doc: "DocxDocument", resume_data: dict[str, A
     # Collect resume sections as a flat list of (heading, items)
     sections = _build_renderable_sections(resume_data)
 
+    def all_paragraphs() -> list[Any]:
+        paragraphs: list[Any] = list(doc.paragraphs)
+        seen = {id(paragraph._element) for paragraph in paragraphs}
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    for paragraph in cell.paragraphs:
+                        if id(paragraph._element) not in seen:
+                            seen.add(id(paragraph._element))
+                            paragraphs.append(paragraph)
+        return paragraphs
+
+    section_headings = [heading for heading, _items in sections]
+
+    def element_text(element: Any) -> str:
+        return "".join(
+            str(node.text or "") for node in element.iter(qn("w:t"))
+        ).strip()
+
+    def is_section_heading(text: str) -> bool:
+        return any(_template_section_matches(text, heading) for heading in section_headings)
+
+    def insert_after(
+        anchor: Any,
+        text: str,
+        *,
+        template_element: Any = None,
+        bold: bool = False,
+    ) -> Any:
+        paragraph = OxmlElement("w:p")
+        if template_element is not None:
+            paragraph_properties = template_element.find(qn("w:pPr"))
+            if paragraph_properties is not None:
+                paragraph.append(copy.deepcopy(paragraph_properties))
+        run = OxmlElement("w:r")
+        if bold:
+            run_properties = OxmlElement("w:rPr")
+            run_properties.append(OxmlElement("w:b"))
+            run.append(run_properties)
+        text_element = OxmlElement("w:t")
+        if text.startswith(" ") or text.endswith(" "):
+            text_element.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+        text_element.text = text
+        run.append(text_element)
+        paragraph.append(run)
+        anchor.addnext(paragraph)
+        return paragraph
+
     for section_heading, items in sections:
         matched = False
-        for para in doc.paragraphs:
+        for para in all_paragraphs():
             full_text = para.text.strip()
             if _template_section_matches(full_text, section_heading):
-                # Clear existing content under this heading
-                parent = para._element
-                parent.getparent().remove(parent)
-                # Add new content under this heading
-                section_para = doc.add_paragraph()
-                run = section_para.add_run(section_heading)
-                run.bold = True
-                run.font.size = Pt(12)
-                section_para.paragraph_format.space_before = Pt(8)
-                section_para.paragraph_format.space_after = Pt(4)
+                # Preserve the heading's exact position/style (including table
+                # cells), clear only stale body paragraphs, then inject the new
+                # section immediately below it using the template body style.
+                anchor = para._element
+                sibling = anchor.getnext()
+                content_template = None
+                stale: list[Any] = []
+                while sibling is not None:
+                    next_sibling = sibling.getnext()
+                    if sibling.tag != qn("w:p"):
+                        break
+                    if is_section_heading(element_text(sibling)):
+                        break
+                    if content_template is None and element_text(sibling):
+                        content_template = sibling
+                    stale.append(sibling)
+                    sibling = next_sibling
+                for element in stale:
+                    element.getparent().remove(element)
+
                 for item in items:
-                    item_para = doc.add_paragraph()
                     if isinstance(item, tuple) and len(item) == 2:
                         sub_heading, sub_items = item
-                        sub_run = item_para.add_run(sub_heading)
-                        sub_run.bold = True
-                        sub_run.font.size = Pt(11)
+                        anchor = insert_after(
+                            anchor,
+                            str(sub_heading),
+                            template_element=content_template,
+                            bold=True,
+                        )
                         for sub_item in sub_items:
-                            bullet = doc.add_paragraph(style="List Bullet")
-                            bullet.text = sub_item
-                            bullet.paragraph_format.space_after = Pt(2)
-                            for run in bullet.runs:
-                                run.font.size = Pt(10)
+                            anchor = insert_after(
+                                anchor,
+                                str(sub_item),
+                                template_element=content_template,
+                            )
                     else:
-                        item_para.text = item
-                        item_para.paragraph_format.space_after = Pt(2)
-                        for run in item_para.runs:
-                            run.font.size = Pt(10)
-
-                # Remove any paragraphs after this section (could be stale content)
+                        anchor = insert_after(
+                            anchor,
+                            str(item),
+                            template_element=content_template,
+                        )
                 matched = True
                 break
         if matched:

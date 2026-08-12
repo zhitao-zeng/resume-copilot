@@ -15,26 +15,42 @@ _SECTION_ALIASES = {
     "experience": ("工作经历", "实习经历", "任职经历", "职业经历"),
     "research": ("科研经历", "研究经历", "实验室经历"),
     "projects": ("项目经历", "项目经验", "课程项目", "个人项目", "开源项目"),
-    "activities": ("校园经历", "社团经历", "志愿经历", "社会实践", "学生工作"),
-    "skills": ("专业技能", "技能清单", "技术栈", "工具", "语言能力"),
-    "awards": ("荣誉奖项", "荣誉与奖项", "获奖经历", "奖项"),
-    "publications": ("论文", "论文发表", "论文成果", "学术成果", "出版物"),
+    "activities": (
+        "校园经历", "在校经历", "社团经历", "志愿经历", "社会实践", "学生工作",
+        "组织经历", "社团和组织经历", "社团和",
+    ),
+    "skills": (
+        "专业技能", "职业技能", "技能清单", "技术栈", "工具", "语言能力",
+        "编程语言", "开发工具", "机器学习", "深度学习",
+    ),
+    "awards": ("荣誉奖项", "荣誉与奖项", "获奖经历", "奖项", "奖学金"),
+    "publications": ("论文", "论文发表", "论文成果", "论文期刊", "学术成果", "出版物"),
     "patents": ("专利", "专利成果"),
-    "certifications": ("证书", "证书与资质", "职业资格", "执业资格", "执照"),
+    "certifications": (
+        "证书", "资格证书", "证书与资质", "职业资格", "执业资格", "执照",
+    ),
     "training": ("培训经历", "进修经历", "住院医师规范化培训"),
     "teaching": ("教学经历", "授课经历", "培养经历"),
+    "hobbies": ("兴趣爱好", "个人爱好"),
+    "coursework": ("相关课程", "主修课程"),
 }
+
+_LAYOUT_RESET_HEADINGS = {"其他", "其它", "其他信息", "其它信息"}
 
 
 _QUERY_DIRECTION_ONLY = re.compile(
-    r"(?:请|帮我|麻烦|需要|希望|想要|优化|润色|修改|调整|改成|删除|去掉|不要|"
-    r"禁止|避免|保留|突出|侧重|针对|适配|申请|应聘|求职|目标岗位|岗位要求|JD)",
+    r"(?:请|帮我|麻烦|希望|想要|优化|润色|修改|调整|改成|删除|去掉|不要|"
+    r"想(?:找|做|转|投)|转(?:到|向)|禁止|避免|保留|突出|侧重|针对|适配|"
+    r"申请|应聘|求职|目标岗位|岗位要求|JD)",
     re.IGNORECASE,
 )
 _QUERY_FACT_SIGNAL = re.compile(
     r"(?:我(?:叫|是|会|有|曾|在|负责|参与|主导|获得|毕业|就读|熟悉|擅长)|"
     r"本人(?:拥有|具备|曾|在|负责|参与|主导|获得|毕业|就读|熟悉|擅长)|"
     r"姓名是|曾任|任职于|就职于|毕业于|就读于|"
+    r"(?:目前|现在|之前|过去|毕业后)?(?:一直)?(?:做|从事|担任|任职|负责)过?|"
+    r"(?:主要|日常|平时|工作中)(?:负责|参与|会|需要|经常)|"
+    r"(?:学过|自学过?|会用|会使用|使用过|掌握|熟悉|做过|参加过)|"
     r"\d+(?:\.\d+)?\s*(?:年|个月)\s*(?:工作|从业|实习)?(?:经验|经历))",
     re.IGNORECASE,
 )
@@ -66,15 +82,48 @@ _INLINE_EDUCATION_FACT = re.compile(
     # education.  Institution suffixes and explicit qualifications are strong
     # enough structural signals without that false positive.
     r"(?:[一-鿿A-Za-z0-9·.&（）()_-]{1,40}(?:大学(?!生)|学院|学校|研究院)|"
-    r"本科|硕士|博士|大专|专科|高中)(?:在读|毕业)?",
+    r"本科|硕士|博士|大专|专科|高中)(?:在读|毕业)?|"
+    r"[^，。；;]{1,40}专业(?:毕业|在读)|学历(?:是|为)?(?:本科|硕士|博士|大专|专科)",
     re.IGNORECASE,
 )
 _INLINE_EXPERIENCE_FACT = re.compile(
     r"(?:(?:19|20)\d{2}[^。；;]{0,80}(?:公司|医院|银行|学校|机构|中心|集团|"
-    r"事务所|研究院|实验室|部门)|(?:在|于)[^。；;]{1,40}(?:任职|工作|担任|负责))",
+    r"事务所|律所|研究院|实验室|部门)|(?:在|于)[^。；;]{1,40}(?:任职|工作|担任|负责)|"
+    r"(?:目前|现在|之前|过去|毕业后)?(?:一直)?(?:做|从事|担任|任职于)[^。；;]{2,60}|"
+    r"做过\s*(?:\d+|[一二两三四五六七八九十]+)?\s*段?[^。；;]{0,30}(?:实习|工作)|"
+    r"(?:工作中|日常工作|平时工作|主要工作)[^。；;]{0,80}(?:负责|参与|统计|分析|策划))",
     re.IGNORECASE,
 )
-_INLINE_SKILL_FACT = re.compile(r"^(?:技能|专业技能|工具|技术栈|语言能力)\s*[:：]?", re.IGNORECASE)
+_INLINE_SKILL_FACT = re.compile(
+    r"^(?:(?:技能|专业技能|工具|技术栈|语言能力)\s*[:：]?|"
+    r"(?:我)?(?:学过|自学过?|会用|会使用|使用过|掌握|熟悉|了解)\s*[^，。；;]{2,100})",
+    re.IGNORECASE,
+)
+_QUERY_FACT_CONTINUATION = re.compile(
+    r"^(?:主要|日常|平时|工作中|期间|其中|包括|比如|例如|一段|另一段|"
+    r"也|并|同时|此外|另外|曾|过去|目前|现在|方向偏|研究方向|"
+    r"负责|参与|主导|协助|支持|完成|开发|设计|搭建|建设|维护|优化|"
+    r"统计|分析|策划|撰写|组织|推动|跟进|处理|培训)",
+    re.IGNORECASE,
+)
+
+
+def _query_clause_continues_section(value: str, section: str) -> bool:
+    """Carry omitted subjects only inside a compatible factual section."""
+
+    text = str(value or "").strip()
+    if not text or not _QUERY_FACT_CONTINUATION.search(text):
+        return False
+    if section == "education":
+        return bool(re.match(
+            r"^(?:方向偏|研究方向|专业(?:是|为)|学历(?:是|为)|预计|将于|期间)",
+            text,
+        ))
+    if section in {"experience", "activities", "research"}:
+        return not re.match(r"^(?:比如|例如)(?:.+?)(?:项目|系统|平台|课题|作品)", text)
+    if section == "projects":
+        return True
+    return False
 
 
 def _query_inline_section_hint(value: str) -> str:
@@ -85,16 +134,26 @@ def _query_inline_section_hint(value: str) -> str:
         return ""
     if _INLINE_PROJECT_FACT.search(text):
         return "projects"
+    if _INLINE_SKILL_FACT.search(text):
+        return "skills"
+    if (
+        re.fullmatch(r"(?:我|本人)?(?:是)?做[^，。；;]{2,40}的", text)
+        and not _RECORD_DATE.search(text)
+        and not _RECORD_ENTITY_TOKEN.search(text)
+    ):
+        # “我是做智能硬件产品的” is a domain/profile fact, not evidence of a
+        # named employment record. The deterministic fallback keeps it as a
+        # domain skill and summary fact.
+        return ""
     if _INLINE_EXPERIENCE_FACT.search(text):
         return "experience"
     if _INLINE_EDUCATION_FACT.search(text):
         return "education"
-    if _INLINE_SKILL_FACT.search(text):
-        return "skills"
     return ""
 
 
 def _is_section_heading(value: str) -> bool:
+    value = re.sub(r"^[^\w\u4e00-\u9fff]+|[^\w\u4e00-\u9fff]+$", "", value.strip())
     normalized = re.sub(r"[\s:：|｜/\\【】\[\]()（）]+", "", value).casefold()
     return any(
         normalized == re.sub(r"\s+", "", alias).casefold()
@@ -122,11 +181,11 @@ def _query_line_is_fact(
         return False
     if _QUERY_NEGATIVE_INSTRUCTION.search(value):
         return False
+    if _QUERY_DIRECTION_ONLY.search(value):
+        return False
     if _QUERY_CONTACT_FACT.search(value) or _QUERY_FACT_SIGNAL.search(value):
         return True
     if _is_section_heading(value):
-        return False
-    if _QUERY_DIRECTION_ONLY.search(value):
         return False
     # Lines placed under an explicit resume section are structured candidate
     # evidence even when they omit first-person wording.  This supports pasted
@@ -143,6 +202,7 @@ def _query_line_is_fact(
 
 
 def _section_hint(line: str) -> str:
+    line = re.sub(r"^[^\w\u4e00-\u9fff]+|[^\w\u4e00-\u9fff]+$", "", line.strip())
     normalized = re.sub(r"[\s:：|｜/\\【】\[\]()（）]+", "", line).casefold()
     for section, aliases in _SECTION_ALIASES.items():
         if any(normalized == re.sub(r"\s+", "", alias).casefold() for alias in aliases):
@@ -159,42 +219,85 @@ def _section_hint(line: str) -> str:
 
 _RECORD_SECTIONS = {"education", "experience", "research", "activities", "projects"}
 _RECORD_BODY_SIGNAL = re.compile(
-    r"^(?:[-*•·▪◦]\s*)?(?:负责|参与|主导|协助|支持|配合|完成|推动|推进|组织|"
-    r"设计|开发|构建|实现|制定|管理|运营|分析|研究|撰写|输出|交付|维护|优化|"
-    r"搭建|建立|开展|承担|提供|跟进|协调|带领|执行)|"
-    r"(?:提升|降低|增长|减少|缩短|节省|达到|达成|上线|获奖|录用|复核|验证)",
+    r"^(?:[-*•·▪◦]\s*)?(?:\d{1,3}[.、)]\s*)?"
+    r"(?:(?:一段|另一段|工作中|日常工作中?|平时工作中?|期间|其中|也会)\s*)?"
+    r"(?:主要\s*)?(?:(?:经常)?(?:需要|会)\s*)?"
+    r"(?:负责|参与|主导|协助|支持|配合|完成|推动|推进|组织|"
+    r"设计|开发|构建|实现|制定|管理|运营|分析|统计|策划|培训|处理|研究|撰写|输出|交付|维护|优化|"
+    r"搭建|建立|开展|承担|提供|跟进|协调|带领|执行|学会)",
     re.IGNORECASE,
+)
+_RECORD_SERVICE_ACTION = re.compile(
+    r"^(?:[-*•·▪◦]\s*)?(?:\d{1,3}[.、)]\s*)?为[^，。；;]{0,32}提供"
+)
+_RECORD_CONTEXT_ACTION = re.compile(
+    r"^(?:[-*•·▪◦]\s*)?(?:\d{1,3}[.、)]\s*)?在[^，。；;]{0,40}"
+    r"(?:领导|指导)下[，,]?\s*[^，。；;]{0,48}(?:负责|分管|担任|参与|协助)"
 )
 _RECORD_RESULT_SIGNAL = re.compile(
     r"(?:提升|降低|增长|减少|缩短|节省|达到|达成|上线|交付|完成|获奖|录用|复核|验证)"
 )
 _RECORD_DATE = re.compile(
     r"(?:19|20)\d{2}(?:[./年-]\d{1,2}月?)?(?:\s*[-—~至到]\s*"
-    r"(?:(?:19|20)\d{2}(?:[./年-]\d{1,2}月?)?|至今|现在))?"
+    r"(?:(?:19|20)\d{2}(?:[./年-]\d{1,2}月?)?|今|至今|现在))?"
+)
+_RECORD_OPEN_START = re.compile(
+    r"^(?:19|20)\d{2}(?:[./年-]\d{1,2}月?)?\s*至\s*$"
 )
 _RECORD_ENTITY = re.compile(
-    r"(?:大学|学院|学校|医院|公司|集团|研究院|实验室|中心|部门|协会|学会|"
-    r"学生会|社团|委员会|事务所|银行|政府|基金会|工作室|团队|项目)$"
+    r"(?:大学|学院|学校|医院|公司|企业|集团|研究院|实验室|中心|部门|协会|学会|"
+    r"学生会|社团|委员会|事务所|律所|银行|政府|基金会|工作室|团队|基地|项目)$"
+)
+_RECORD_ENTITY_TOKEN = re.compile(
+    r"(?:大学|学院|学校|医院|公司|企业|集团|研究院|实验室|中心|部门|协会|学会|"
+    r"学生会|社团|委员会|事务所|律所|银行|政府|基金会|工作室|团队|基地)"
 )
 _RECORD_ROLE = re.compile(
     r"(?:工程师|设计师|教师|老师|医生|医师|护士|经理|主管|总监|主任|顾问|"
-    r"研究员|专员|助理|负责人|组长|队长|主席|部长|实习生|分析师|架构师|"
+    r"研究员|专员|助理|负责人|组长|队长|主席|部长|实习生|实习|分析师|架构师|"
     r"运营|产品|开发|测试|销售|讲师)$"
 )
 
 
 def _looks_like_record_body(value: str) -> bool:
     text = value.strip()
+    bullet = bool(re.match(r"^[-*•·▪◦]\s*", text))
+    numbered = bool(re.match(r"^\d{1,3}(?:[、)]|\.(?!\d))\s*\S{3,}", text))
+    result_at_start = bool(re.match(
+        r"^(?:提升|降低|增长|减少|缩短|节省|达到|达成|上线|交付|完成|"
+        r"获奖|录用|复核|验证)",
+        text,
+        re.IGNORECASE,
+    ))
     return bool(
-        re.match(r"^[-*•·▪◦]\s*", text)
+        bullet
+        or numbered
         or _RECORD_BODY_SIGNAL.search(text)
-        or _RECORD_RESULT_SIGNAL.search(text)
+        or _RECORD_SERVICE_ACTION.search(text)
+        or _RECORD_CONTEXT_ACTION.search(text)
+        or result_at_start
     )
 
 
 def _looks_like_record_header(value: str, section: str) -> bool:
-    text = value.strip(" \t-•")
-    if not text or _looks_like_record_body(text):
+    raw = value.strip()
+    if re.match(r"^[-*•·▪◦]\s*", raw):
+        return False
+    text = raw.strip(" \t-•")
+    if not text:
+        return False
+    # Compact OCR commonly joins organization, role and department without a
+    # delimiter (for example ``某公司 用户增长运营专员运营部``).  Treat the
+    # organization token as structural before scanning words such as “增长”,
+    # which are valid title text but were previously mistaken for result prose.
+    if (
+        section in {"experience", "research", "activities"}
+        and len(text) <= 80
+        and _RECORD_ENTITY_TOKEN.search(text)
+        and not _looks_like_record_body(text)
+    ):
+        return True
+    if _looks_like_record_body(text):
         return False
     if len(re.split(r"[|｜\t]", text)) >= 2:
         return True
@@ -215,28 +318,54 @@ def _assign_record_ids(blocks: list[SourceBlock]) -> None:
     record_index = -1
     saw_body = False
     saw_entity_header = False
+    last_number: int | None = None
     for index, block in enumerate(blocks):
         section = block.section_hint or ""
         if section not in _RECORD_SECTIONS:
             current_section = ""
             current_id = None
+            last_number = None
             continue
         if _is_section_heading(block.text):
             current_section = section
             current_id = None
             saw_body = False
             saw_entity_header = False
+            last_number = None
             continue
         if section != current_section:
             current_section = section
             current_id = None
             saw_body = False
             saw_entity_header = False
+            last_number = None
 
         value = block.text.strip()
+        number_match = re.match(r"^(\d{1,3})(?:[、)]|\.(?!\d))\s*", value)
+        item_number = int(number_match.group(1)) if number_match else None
         is_body = _looks_like_record_body(value)
         is_header = _looks_like_record_header(value, section)
         is_entity = bool(_RECORD_ENTITY.search(value.strip(" \t-•")))
+        previous_value = blocks[index - 1].text.strip() if index > 0 else ""
+        previous_same_section = (
+            index > 0 and (blocks[index - 1].section_hint or "") == section
+        )
+        continuation_from_previous = bool(
+            previous_same_section
+            and previous_value
+            and not re.search(r"[。；;!?！？]$", previous_value)
+            and _looks_like_record_body(previous_value)
+            and item_number is None
+            and not _RECORD_DATE.fullmatch(value)
+            and not _RECORD_ENTITY_TOKEN.search(value)
+            and len(value) <= 160
+        )
+        if continuation_from_previous:
+            # PDF/OCR line wrapping can put the tail of a duty on the next
+            # physical line.  It belongs to the current record even when the
+            # tail itself looks like a short header (for example “月销售率…”).
+            is_body = True
+            is_header = False
         next_value = blocks[index + 1].text.strip() if index + 1 < len(blocks) else ""
         next_same_section = (
             index + 1 < len(blocks)
@@ -251,22 +380,177 @@ def _assign_record_ids(blocks: list[SourceBlock]) -> None:
 
         starts_record = current_id is None
         if current_id is not None:
-            if saw_body and (is_header or short_header_before_role):
+            if (
+                item_number is not None
+                and last_number is not None
+                and item_number <= last_number
+                and saw_body
+            ):
+                # Multi-column OCR frequently removes later project/job
+                # headers while retaining numbered duty lists. A numbering
+                # restart is a domain-neutral, explicit record boundary.
+                starts_record = True
+            elif _RECORD_OPEN_START.fullmatch(value) and saw_entity_header:
+                starts_record = True
+            elif saw_body and (is_header or short_header_before_role):
+                starts_record = True
+            elif (
+                saw_body
+                and not is_body
+                and len(value) <= 64
+                and not re.search(r"[。；;!?！？]$", value)
+            ):
+                # In undated project/campus sections, a short plain line after
+                # bullets is normally the next record header. Requiring a
+                # profession dictionary here caused later projects and clubs
+                # to collapse into the first record.
                 starts_record = True
             elif is_entity and saw_entity_header:
                 starts_record = True
-            elif is_header and saw_entity_header and len(re.split(r"[|｜\t]", value)) >= 2:
+            elif (
+                is_header
+                and saw_entity_header
+                and len(re.split(r"[|｜\t]", value)) >= 2
+                and (
+                    section != "education"
+                    or bool(_RECORD_DATE.search(value))
+                    or bool(_RECORD_ENTITY_TOKEN.search(value))
+                )
+            ):
                 starts_record = True
         if starts_record:
             record_index += 1
             current_id = f"{block.source_type}:{section}:{record_index}"
             saw_body = False
             saw_entity_header = False
+            last_number = None
         block.record_id = current_id
         saw_body = saw_body or is_body
+        if item_number is not None:
+            last_number = item_number
         saw_entity_header = saw_entity_header or is_entity or (
             is_header and len(re.split(r"[|｜\t]", value)) >= 2
         )
+
+
+def _coalesce_wrapped_blocks(blocks: list[SourceBlock]) -> list[SourceBlock]:
+    """Join physical OCR wraps before they enter Composer/evidence checks."""
+
+    merged: list[SourceBlock] = []
+    for block in blocks:
+        value = block.text.strip()
+        previous = merged[-1] if merged else None
+        previous_value = previous.text.strip() if previous else ""
+        same_context = bool(
+            previous
+            and previous.source_type == block.source_type
+            and previous.section_hint == block.section_hint
+            and (
+                previous.record_id == block.record_id
+                or (previous.record_id is None and block.record_id is None)
+            )
+        )
+        continuation = bool(
+            same_context
+            and previous_value
+            and not re.search(r"[。；;!?！？]$", previous_value)
+            and _looks_like_record_body(previous_value)
+            and not _looks_like_record_body(value)
+            and not re.match(r"^(?:[-*•·▪◦]|\d{1,3}(?:[、)]|\.(?!\d)))\s*", value)
+            and not _RECORD_DATE.fullmatch(value)
+            and not _RECORD_ENTITY_TOKEN.search(value)
+            and not _is_section_heading(value)
+            and not _QUERY_CONTACT_FACT.search(value)
+            and not re.search(
+                r"[·•]\s*(?:精通|熟练(?:使用|掌握)?|熟悉|了解|掌握)\s*$",
+                previous_value,
+            )
+            and len(value) <= 180
+        )
+        if continuation and previous is not None:
+            previous.text = previous_value + value
+        else:
+            merged.append(block)
+    # A multi-column extractor can emit the tail of a sentence before the
+    # sentence head.  Rank every structurally eligible earlier fragment and
+    # join only a unique high-confidence match.  This avoids occupation/role
+    # special cases and fixed look-back windows while preserving literal text.
+    split_word_boundaries = {
+        "报告", "提供", "进行", "完成", "负责", "支持", "协助", "管理",
+        "维护", "分析", "统计", "策划", "培训", "处理", "研究", "撰写",
+        "输出", "交付", "推动", "推进", "组织", "设计", "开发", "构建",
+        "实现", "制定", "运营", "建立", "开展", "承担", "跟进", "协调",
+        "带领", "执行", "治疗", "服务",
+    }
+    trailing_object_verb = re.compile(
+        r"(?:协助|引导|支持|帮助|提供|完成|处理|维护|管理|分析|统计|"
+        r"策划|培训|服务)$"
+    )
+    consumed_tail_ids: set[int] = set()
+    for head_index, head in enumerate(merged):
+        head_value = head.text.strip()
+        if (
+            id(head) in consumed_tail_ids
+            or not _looks_like_record_body(head_value)
+            or re.search(r"[。；;!?！？]$", head_value)
+        ):
+            continue
+        candidates: list[tuple[float, str, int, SourceBlock]] = []
+        for tail_index, tail in enumerate(merged[:head_index]):
+            tail_value = tail.text.strip()
+            if (
+                id(tail) in consumed_tail_ids
+                or tail.source_type != head.source_type
+                or len(tail_value) < 2
+                or len(tail_value) > 120
+                or not re.search(r"[。；;!?！？]$", tail_value)
+                or _looks_like_record_body(tail_value)
+                or _RECORD_DATE.fullmatch(tail_value)
+                or _RECORD_ENTITY_TOKEN.search(tail_value)
+                or _is_section_heading(tail_value)
+                or _QUERY_CONTACT_FACT.search(tail_value)
+            ):
+                continue
+            distance = head_index - tail_index
+            split_word = head_value[-1:] + tail_value[:1]
+            if split_word in split_word_boundaries and len(tail_value) <= 24:
+                candidates.append((4.0 + 1.0 / distance, "split_word", tail_index, tail))
+                continue
+            if (
+                trailing_object_verb.search(head_value.strip("。；; "))
+                and tail.record_id
+                and tail.section_hint in _RECORD_SECTIONS
+            ):
+                candidates.append((3.0 + 1.0 / distance, "object", tail_index, tail))
+        if not candidates:
+            continue
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        best_score, mode, _tail_index, tail = candidates[0]
+        if len(candidates) > 1 and best_score - candidates[1][0] < 0.20:
+            continue
+        if mode == "object":
+            object_candidates = [item for item in candidates if item[1] == "object"]
+            latest_record_id = next((
+                candidate.record_id
+                for candidate in reversed(merged[:head_index])
+                if candidate.record_id and id(candidate) not in consumed_tail_ids
+            ), None)
+            if len(object_candidates) != 1 or tail.record_id != latest_record_id:
+                continue
+        head.text = head_value.rstrip("。；; ") + tail.text.strip()
+        # A non-numbered object continuation inherits the record provenance of
+        # its consumed fragment. Numbered duties keep their own unscoped order
+        # so the separate numbering matcher can associate the complete list.
+        if mode == "object" and not re.match(
+            r"^(?:[-*•·▪◦]|\d{1,3}(?:[、)]|\.(?!\d)))\s*",
+            head_value,
+        ):
+            head.section_hint = tail.section_hint
+            head.record_id = tail.record_id
+        consumed_tail_ids.add(id(tail))
+    if consumed_tail_ids:
+        merged = [block for block in merged if id(block) not in consumed_tail_ids]
+    return merged
 
 
 def _split_into_blocks(text: str, source_type: str) -> list[SourceBlock]:
@@ -277,17 +561,81 @@ def _split_into_blocks(text: str, source_type: str) -> list[SourceBlock]:
         line = line.strip()
         if not line:
             continue
+        normalized_line = re.sub(r"[\s:：|｜/\\【】\[\]()（）]+", "", line).casefold()
+        if normalized_line in _LAYOUT_RESET_HEADINGS:
+            current_section = ""
+            blocks.append(SourceBlock(
+                block_id=f"{source_type}_{len(blocks)}",
+                source_type=source_type,  # type: ignore
+                text=line,
+                section_hint=None,
+                fact_eligible=False,
+            ))
+            continue
         detected = _section_hint(line)
+        layout_boundary = bool(
+            re.search(r"(?:^|[。；;，,])\s*(?:求职意向|目标岗位|应聘岗位)\s*[:：]", line)
+            or _QUERY_CONTACT_FACT.search(line)
+        )
+        if layout_boundary and not detected:
+            current_section = ""
         if detected:
             current_section = detected
+        assigned_section = None if layout_boundary else (detected or current_section or None)
+        skill_dense = len(re.findall(r"(?:熟练|精通|掌握|熟悉|了解)", line)) >= 2
+        standalone_skill = bool(re.fullmatch(
+            r"[-•·]?\s*[^，,。；;]{2,48}?(?:熟练|精通|掌握|熟悉|了解)",
+            line,
+        ))
+        if not detected and assigned_section != "skills" and (skill_dense or standalone_skill):
+            assigned_section = "skills"
+        if not detected and assigned_section in {"skills", "hobbies", "coursework"}:
+            compact = line.strip(" \t-•·")
+            detailed_prose = bool(
+                len(compact) >= 28
+                and re.search(r"[，,。；;]", compact)
+                and re.search(
+                    r"(?:负责|参与|主导|协助|完成|推动|运营|策划|项目|实习|"
+                    r"工作|用户|客户|活动|数据|成果|提升|增长|降低|达到|输出|"
+                    r"专业|经验|大学|本科|硕士|营销|担任)",
+                    compact,
+                )
+            )
+            if (
+                (_looks_like_record_body(compact) and not standalone_skill)
+                or detailed_prose
+                or bool(_RECORD_DATE.fullmatch(compact))
+                or bool(_QUERY_CONTACT_FACT.search(compact))
+            ):
+                # Multi-column PDF/OCR often emits all prose first and the
+                # aligned dates last, after a visually separate skills column.
+                # Keeping these lines under skills converts entire jobs into
+                # dozens of bogus skill names. Leave them unscoped so Composer
+                # or the conservative anonymous-history fallback can retain
+                # them without inventing an association.
+                assigned_section = None
+        # Multi-column OCR can leave a later duty list below an awards column.
+        # A numbered/action-led sentence is not an award merely because the
+        # most recent visual heading was “奖学金”. Leave it unscoped so the
+        # Composer may preserve it without inventing an employer association.
+        if (
+            not detected
+            and assigned_section == "awards"
+            and (
+                _RECORD_BODY_SIGNAL.search(line)
+                or _RECORD_SERVICE_ACTION.search(line)
+                or _RECORD_CONTEXT_ACTION.search(line)
+            )
+        ):
+            assigned_section = None
         blocks.append(SourceBlock(
             block_id=f"{source_type}_{len(blocks)}",
             source_type=source_type,  # type: ignore
             text=line,
-            section_hint=detected or current_section or None,
+            section_hint=assigned_section,
         ))
     _assign_record_ids(blocks)
-    return blocks
+    return _coalesce_wrapped_blocks(blocks) if source_type == "resume" else blocks
 
 
 def build_source_bundle(
@@ -312,7 +660,7 @@ def build_source_bundle(
         # Split mixed “fact + instruction” prose into clauses. This lets
         # “我是做智能硬件产品的，帮我优化简历” retain only the first clause as
         # evidence instead of legitimizing the instruction as a candidate fact.
-        segmented_query = re.sub(r"[，；;。]+", "\n", query_text)
+        segmented_query = re.sub(r"(?:[，；;。]+|(?<!不)(?:但是|但|不过|然而))", "\n", query_text)
         query_blocks = _split_into_blocks(segmented_query, "query")
         has_cv = bool(cv_text.strip())
         active_record_section = ""
@@ -326,6 +674,7 @@ def build_source_bundle(
             elif active_record_section and (
                 _looks_like_record_body(block.text)
                 or bool(_RECORD_DATE.fullmatch(block.text.strip()))
+                or _query_clause_continues_section(block.text, active_record_section)
             ):
                 # Compact descriptions are often comma-delimited as
                 # ``company/role, period, action/result``.  Keep a standalone

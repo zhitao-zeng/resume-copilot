@@ -18,7 +18,12 @@ from resume_composer import (
     compose_resume,
 )
 from source_adapter import build_source_bundle, candidate_blocks
-from v2_pipeline import _deterministic_fallback, _merge_source_recovery, run_v2_pipeline
+from v2_pipeline import (
+    _deterministic_fallback,
+    _filter_trusted_rewrites,
+    _merge_source_recovery,
+    run_v2_pipeline,
+)
 from v2_schemas import (
     CanonicalResume,
     Change,
@@ -500,6 +505,69 @@ def test_source_recovery_keeps_optimized_bullet_and_appends_only_missing_fact():
     assert stats.appended_records == 0
 
 
+def test_final_source_recovery_does_not_append_unmatched_structural_records():
+    optimized = CanonicalResume.model_validate({
+        "projects": [{
+            "name": "校园二手交易平台",
+            "role": "产品负责人",
+            "bullets": ["负责需求分析和产品设计"],
+        }],
+    })
+    malformed_fallback = CanonicalResume.model_validate({
+        "projects": [{
+            "name": "智能家居APP设计核心成员",
+            "organization": "与开发团队",
+            "role": "校园二手交易平台产品负责人",
+            "bullets": ["负责活动现场的组织和协调"],
+        }],
+    })
+
+    merged, stats = _merge_source_recovery(
+        optimized,
+        malformed_fallback,
+        allow_new_records=False,
+    )
+
+    assert len(merged.projects) == 1
+    assert stats.appended_records == 0
+
+
+def test_stale_positional_provenance_is_removed_after_record_replacement():
+    resume = CanonicalResume.model_validate({
+        "projects": [{
+            "name": "新补入项目",
+            "bullets": ["新补入项目的真实描述"],
+        }],
+    })
+
+    filtered = _filter_trusted_rewrites(
+        resume,
+        {"projects[0].bullets[0]": "旧志愿者经历"},
+        {"projects[0].bullets[0]": "旧经历的优化表述"},
+    )
+
+    assert filtered == {}
+
+
+def test_fallback_parses_bulleted_skills_even_when_ocr_keeps_education_scope():
+    resume = _deterministic_fallback(
+        "教育经历\n"
+        "XX大学计算机科学与技术本科\n"
+        "2008年9月 - 2012年6月\n"
+        "其他\n"
+        "- 技能：精通Android、Java；熟悉TCP/IP协议；\n"
+        "-\n"
+        "语言能力\n"
+        "：CET-4，掌握基本的听说读写能力；",
+        "请优化",
+        "",
+    )
+
+    names = {item.name for item in resume.skills.items}
+    assert {"Android", "Java", "TCP/IP协议", "CET-4"} <= names
+    assert resume.additional_sections == {}
+
+
 def test_production_startup_shares_configurable_context_window():
     startup = (Path(__file__).parents[1] / "config" / "start.sh").read_text()
 
@@ -508,6 +576,8 @@ def test_production_startup_shares_configurable_context_window():
     assert 'MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"' in startup
     assert 'export LLM_CONTEXT_WINDOW="$MAX_MODEL_LEN"' in startup
     assert 'export LLM_INFLIGHT_LIMIT="${LLM_INFLIGHT_LIMIT:-$MAX_NUM_SEQS}"' in startup
+    assert 'LLM_COMPOSER_MAX_TOKENS="${LLM_COMPOSER_MAX_TOKENS:-6144}"' in startup
+    assert 'LLM_COMPOSER_MAX_FACT_BLOCKS="${LLM_COMPOSER_MAX_FACT_BLOCKS:-50}"' in startup
     assert '--max-model-len "$MAX_MODEL_LEN"' in startup
     assert '--max-num-seqs "$MAX_NUM_SEQS"' in startup
     assert '--max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS"' in startup

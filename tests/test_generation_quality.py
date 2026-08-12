@@ -21,7 +21,11 @@ from resume_renderer import (
 )
 from resume_validator import check_required_fields
 from resume_copilot_pipeline import build_reply_text, _build_targeted_suggestions
-from resume_verifier import _ground_fixed_fields, _reclassify_non_work
+from resume_verifier import (
+    _ground_fixed_fields,
+    _merge_adjacent_duplicate_experiences,
+    _reclassify_non_work,
+)
 from source_adapter import build_source_bundle, candidate_blocks
 from v2_pipeline import (
     _bullet_rewrite_changes,
@@ -469,7 +473,7 @@ def test_summary_prioritizes_grounded_quantified_achievement():
     ranked = _rank_resume_content(resume, "涂布工艺参数优化")
     compacted = _compact_canonical(ranked)
     assert "4.8%降至3.1%" in compacted.summary
-    assert len(compacted.summary) <= 100
+    assert len(compacted.summary) <= 220
     assert compacted.summary.endswith("。")
     assert "4.8%降至3.1%" in compacted.projects[0].bullets[0]
 
@@ -604,6 +608,344 @@ def test_source_blocks_keep_deterministic_section_hints():
     blocks = bundle.blocks
     assert [block.block_id for block in blocks] == ["resume_0", "resume_1", "resume_2", "resume_3"]
     assert [block.section_hint for block in blocks] == ["experience", "experience", "experience", "skills"]
+
+
+def test_source_record_boundaries_keep_company_header_with_following_period():
+    bundle = build_source_bundle(
+        "工作经历\n"
+        "XXX有限公司 UG用户增长运营专员用户运营部\n"
+        "2018年4月 - 至今\n"
+        "- 根据数据分析制定用户增长运营方案。\n"
+        "XXX有限公司 UG用户增长运营专员用户运营部\n"
+        "2015年7月 - 2017年12月\n"
+        "- 分析销售数据并优化运营策略。",
+        "",
+        "",
+    )
+    records = [
+        (block.text, block.record_id)
+        for block in bundle.blocks
+        if block.section_hint == "experience" and block.record_id
+    ]
+
+    assert len({record_id for _, record_id in records}) == 2
+    assert len({record_id for _, record_id in records[:3]}) == 1
+    assert len({record_id for _, record_id in records[3:]}) == 1
+    assert records[0][1] != records[3][1]
+
+
+def test_multicolumn_ocr_dates_and_qualifications_stay_in_two_records():
+    cv_text = (
+        "教育背景\n"
+        "2020-09至\n中国医科大学\n内科|硕士\n2023-06\nGPA: 4.5\n"
+        "2016-09至\n中国医科大学\n内科|本科\n2020-06\nGPA: 4.4\n"
+        "工作经历\n"
+        "2021-06至\n大连市第三人民医院\n2022-02\n实习生\n"
+        "2020-06至\n辽宁省人民医院\n2020-12\n内科实习生"
+    )
+    source = build_source_bundle(cv_text, "", "")
+    education_ids = {
+        block.record_id
+        for block in source.blocks
+        if block.section_hint == "education" and block.record_id
+    }
+    experience_ids = {
+        block.record_id
+        for block in source.blocks
+        if block.section_hint == "experience" and block.record_id
+    }
+
+    assert len(education_ids) == 2
+    assert len(experience_ids) == 2
+
+    data = CanonicalResume.model_validate({
+        "education": [
+            {
+                "school": "中国医科大学",
+                "major": "内科",
+                "degree": "硕士",
+                "period": "2020-09至2023-06",
+            },
+            {
+                "school": "中国医科大学",
+                "major": "内科",
+                "degree": "本科",
+                "period": "2016-09至2020-06",
+            },
+        ],
+        "experience": [
+            {
+                "organization": "大连市第三人民医院",
+                "role": "实习生",
+                "period": "2021-06至2022-02",
+            },
+            {
+                "organization": "辽宁省人民医院",
+                "role": "内科实习生",
+                "period": "2020-06至2020-12",
+            },
+        ],
+    }).model_dump()
+    _ground_fixed_fields(data, cv_text)
+    gated, _, removed = enforce_resume_evidence(
+        CanonicalResume.model_validate(data),
+        source,
+    )
+
+    assert len(gated.education) == 2
+    assert [item.period for item in gated.education] == [
+        "2020-09至2023-06",
+        "2016-09至2020-06",
+    ]
+    assert [item.period for item in gated.experience] == [
+        "2021-06至2022-02",
+        "2020-06至2020-12",
+    ]
+    assert removed == []
+
+
+def test_ocr_section_aliases_and_detached_numbered_duties_are_typed_safely():
+    source = build_source_bundle(
+        "职业技能\n分析心电图\n"
+        "资格证书\n执业医师资格证\n"
+        "在校经历\n社会实践\n"
+        "奖学金\n国家奖学金\n"
+        "1. 负责配合医生管理住院患者。\n"
+        "2.学会使用多种设备开展诊疗。\n"
+        "3. 在上级指导下分管病床并担任值班工作。",
+        "",
+        "",
+    )
+    by_text = {block.text: block for block in source.blocks}
+
+    assert by_text["职业技能"].section_hint == "skills"
+    assert by_text["资格证书"].section_hint == "certifications"
+    assert by_text["在校经历"].section_hint == "activities"
+    assert by_text["奖学金"].section_hint == "awards"
+    assert by_text["1. 负责配合医生管理住院患者。"].section_hint is None
+    assert by_text["2.学会使用多种设备开展诊疗。"].section_hint is None
+    assert by_text["3. 在上级指导下分管病床并担任值班工作。"].section_hint is None
+
+
+def test_anonymous_professional_duty_group_moves_out_of_activities():
+    parsed = {
+        "experience": [{
+            "organization": "某医院",
+            "role": "实习生",
+            "period": "",
+            "bullets": [],
+        }],
+        "activities": [
+            {
+                "organization": "",
+                "role": "",
+                "period": "",
+                "bullets": [
+                    "负责配合医生管理住院患者",
+                    "配合上级完成查房和医疗文书书写",
+                    "在上级指导下分管病床并担任值班工作",
+                ],
+            },
+            {
+                "organization": "",
+                "role": "",
+                "period": "",
+                "bullets": ["获国家奖学金"],
+            },
+        ],
+        "research": [],
+    }
+
+    _reclassify_non_work(parsed, "本科在读")
+
+    assert len(parsed["experience"]) == 2
+    assert parsed["experience"][1]["organization"] == ""
+    assert len(parsed["experience"][1]["bullets"]) == 3
+    assert parsed["activities"] == [{
+        "organization": "",
+        "role": "",
+        "period": "",
+        "bullets": ["获国家奖学金"],
+    }]
+
+
+def test_source_record_boundaries_split_undated_projects_and_wrapped_activity_heading():
+    bundle = build_source_bundle(
+        "项目经历\n"
+        "校园二手交易平台产品负责人\n"
+        "- 负责需求分析和产品设计。\n"
+        "智能家居APP设计核心成员\n"
+        "- 负责界面设计和用户测试。\n"
+        "社团和\n"
+        "组织经历\n"
+        "学生会宣传部部长\n"
+        "- 负责学生会活动宣传。\n"
+        "- 通过公众号发布学生会活动信息。",
+        "",
+        "",
+    )
+    by_text = {block.text: block for block in bundle.blocks}
+
+    assert by_text["校园二手交易平台产品负责人"].record_id != by_text[
+        "智能家居APP设计核心成员"
+    ].record_id
+    assert by_text["组织经历"].section_hint == "activities"
+    assert by_text["学生会宣传部部长"].section_hint == "activities"
+    assert by_text["- 负责学生会活动宣传。"].record_id == by_text[
+        "- 通过公众号发布学生会活动信息。"
+    ].record_id
+
+
+def test_duplicate_bullet_is_disambiguated_within_each_source_record():
+    source = build_source_bundle(
+        "项目经历\n"
+        "智能医疗项目\n"
+        "2025年\n"
+        "- 收集医疗数据并支持模型训练。\n"
+        "- 进行用户测试，收集用户反馈，并对系统进行改进。\n"
+        "AI客服项目\n"
+        "2025年\n"
+        "- 收集客服数据并支持模型训练。\n"
+        "- 进行用户测试，收集用户反馈，并对系统进行改进。",
+        "",
+        "",
+    )
+    resume = CanonicalResume.model_validate({
+        "projects": [
+            {
+                "name": "智能医疗项目",
+                "period": "2025年",
+                "bullets": [
+                    "收集医疗数据并支持模型训练。",
+                    "进行用户测试，收集用户反馈，并对系统进行改进。",
+                ],
+            },
+            {
+                "name": "AI客服项目",
+                "period": "2025年",
+                "bullets": [
+                    "收集客服数据并支持模型训练。",
+                    "进行用户测试，收集用户反馈，并对系统进行改进。",
+                ],
+            },
+        ],
+    })
+
+    gated, _, removed = enforce_resume_evidence(resume, source)
+
+    assert len(gated.projects) == 2
+    assert "projects[1]" not in removed
+
+
+def test_identityless_activity_continuation_merges_with_same_source_record():
+    source = build_source_bundle(
+        "组织经历\n"
+        "志愿者协会 活动策划\n"
+        "- 参与社区志愿活动策划。\n"
+        "- 负责活动现场组织协调。",
+        "",
+        "",
+    )
+    resume = CanonicalResume.model_validate({
+        "activities": [
+            {
+                "organization": "志愿者协会",
+                "role": "活动策划",
+                "bullets": ["参与社区志愿活动策划。"],
+            },
+            {
+                "bullets": ["负责活动现场组织协调。"],
+            },
+        ],
+    })
+
+    gated, _, removed = enforce_resume_evidence(resume, source)
+
+    assert removed == []
+    assert len(gated.activities) == 1
+    assert gated.activities[0].bullets == [
+        "参与社区志愿活动策划。",
+        "负责活动现场组织协调。",
+    ]
+
+
+def test_activity_organization_and_department_role_are_coalesced():
+    source = build_source_bundle(
+        "组织经历\n"
+        "计算机协会\n"
+        "技术部部长技术部\n"
+        "- 组织成员学习Java。\n"
+        "- 举办技术讲座。",
+        "",
+        "",
+    )
+    resume = CanonicalResume.model_validate({
+        "activities": [
+            {"organization": "计算机协会"},
+            {
+                "organization": "技术部",
+                "role": "技术部部长",
+                "bullets": ["组织成员学习Java。", "举办技术讲座。"],
+            },
+        ],
+    })
+
+    gated, _, removed = enforce_resume_evidence(resume, source)
+
+    assert removed == []
+    assert len(gated.activities) == 1
+    assert gated.activities[0].organization == "计算机协会"
+    assert gated.activities[0].role == "技术部部长"
+    assert gated.activities[0].bullets == ["组织成员学习Java。", "举办技术讲座。"]
+
+
+def test_single_education_record_survives_multicolumn_ocr_reordering():
+    source = build_source_bundle(
+        "教育经历\n"
+        "xx大学\n"
+        "统计学本科\n"
+        "其他\n"
+        "负责撰写数据分析报告\n"
+        "2018年6月-2019年10月\n"
+        "商业数据分析师\n"
+        "2013年9月-2017年6月",
+        "",
+        "",
+    )
+    resume = CanonicalResume.model_validate({
+        "education": [{
+            "school": "xx大学",
+            "degree": "本科",
+            "major": "统计学",
+            "period": "2013年9月-2017年6月",
+        }],
+    })
+
+    gated, _, removed = enforce_resume_evidence(resume, source)
+
+    assert len(gated.education) == 1
+    assert "education[0]" not in removed
+
+
+def test_verifier_does_not_merge_same_role_across_distinct_periods():
+    entries = [
+        {
+            "organization": "XXX有限公司",
+            "role": "用户增长运营专员",
+            "period": "2018年4月 - 至今",
+            "bullets": ["负责用户增长。"],
+        },
+        {
+            "organization": "XXX有限公司",
+            "role": "用户增长运营专员",
+            "period": "2015年7月 - 2017年12月",
+            "bullets": ["负责运营策略。"],
+        },
+    ]
+
+    merged = _merge_adjacent_duplicate_experiences(entries)
+
+    assert merged == entries
 
 
 def test_evidence_binding_traces_bullets_and_excludes_jd():

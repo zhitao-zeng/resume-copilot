@@ -44,6 +44,11 @@ export MAX_MODEL_LEN
 export LLM_CONTEXT_WINDOW="$MAX_MODEL_LEN"
 export LLM_TOKENIZER_PATH="${LLM_TOKENIZER_PATH:-$MODEL_FOUND}"
 export LLM_INFLIGHT_LIMIT="${LLM_INFLIGHT_LIMIT:-$MAX_NUM_SEQS}"
+# Dense, OCR-reordered CVs need one extraction request to see company names,
+# dates and duties together.  The 16k context/40 GiB profile can safely reserve
+# a larger completion than the portable 8k default used by unit tests.
+export LLM_COMPOSER_MAX_TOKENS="${LLM_COMPOSER_MAX_TOKENS:-6144}"
+export LLM_COMPOSER_MAX_FACT_BLOCKS="${LLM_COMPOSER_MAX_FACT_BLOCKS:-50}"
 
 vllm serve "$MODEL_FOUND" \
     --host 0.0.0.0 --port 8000 \

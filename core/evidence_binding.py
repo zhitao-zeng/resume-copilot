@@ -29,6 +29,7 @@ _NON_RECORD_SECTION_HINTS = {
     "summary", "skills", "awards", "publications", "patents",
     "certifications", "training", "teaching",
 }
+_SCHOOL_IDENTITY = re.compile(r"(?:大学|学院|学校|研究院)")
 
 
 def _normalize(value: str) -> str:
@@ -55,6 +56,37 @@ def _date_signature(value: str) -> tuple[str, ...]:
     return tuple(signature)
 
 
+def _grouped_date_matches(
+    value: str,
+    blocks: list[SourceBlock],
+) -> list[SourceBlock]:
+    """Match a period whose endpoints were split across one OCR record."""
+
+    target = _date_signature(value)
+    if not target:
+        return []
+    grouped: dict[tuple[str, str, str], list[SourceBlock]] = {}
+    for block in blocks:
+        if not block.record_id:
+            continue
+        grouped.setdefault(
+            (block.source_type, str(block.section_hint or ""), block.record_id),
+            [],
+        ).append(block)
+    matches: list[SourceBlock] = []
+    for group in grouped.values():
+        source_signature = _date_signature("\n".join(item.text for item in group))
+        if len(source_signature) < len(target):
+            continue
+        if not any(
+            source_signature[index:index + len(target)] == target
+            for index in range(len(source_signature) - len(target) + 1)
+        ):
+            continue
+        matches.extend(item for item in group if _date_signature(item.text))
+    return matches
+
+
 def _best_block(value: str, blocks: list[SourceBlock]) -> tuple[SourceBlock | None, float, str]:
     normalized_value = _normalize(value)
     if not normalized_value:
@@ -73,6 +105,9 @@ def _best_block(value: str, blocks: list[SourceBlock]) -> tuple[SourceBlock | No
                 for index in range(len(block_signature) - len(date_signature) + 1)
             ):
                 return block, 1.0, "normalized"
+        grouped_matches = _grouped_date_matches(value, blocks)
+        if grouped_matches:
+            return grouped_matches[0], 1.0, "normalized"
 
     target = _bigrams(value)
     best_block = None
@@ -176,6 +211,9 @@ def _strong_matching_blocks(
                 date_matches.append(block)
         if date_matches:
             return date_matches
+        grouped_matches = _grouped_date_matches(value, blocks)
+        if grouped_matches:
+            return grouped_matches
 
     block, similarity, _ = _best_block(value, blocks)
     return [block] if block is not None and similarity >= minimum else []
@@ -184,7 +222,7 @@ def _strong_matching_blocks(
 _ROLE_FIELD_LABEL = re.compile(r"(?:岗位|职位|角色|职务)\s*[:：]")
 _ROLE_IDENTITY_VERB = re.compile(r"(?:担任|任职为|任职|作为|职位为|岗位为|曾任)\s*")
 _RECORD_DUTY_START = re.compile(
-    r"(?:^|[，,。；;|｜])\s*(?:负责|参与|主导|协助|支持|配合|完成|推动|推进|"
+    r"(?:^|[，,。；;|｜])\s*(?:[-*•·▪◦]\s*)?(?:负责|参与|主导|协助|支持|配合|完成|推动|推进|"
     r"组织|设计|开发|构建|实现|制定|管理|运营|分析|研究|撰写|输出|交付|"
     r"维护|优化|搭建|建立|开展|承担|提供|跟进|协调|带领|执行)"
 )
@@ -310,10 +348,11 @@ def _find_incoherent_records(
     source: SourceBundle,
     blocks: list[SourceBlock],
     trusted_rewrites: Mapping[str, str] | None = None,
+    *,
+    allow_reordered_record_bullets: bool = False,
 ) -> dict[str, set[int]]:
     """Find records whose identity fields resolve to different source records."""
 
-    block_by_id = {block.block_id: block for block in blocks}
     section_fields = {
         "education": ("school", "degree", "major", "period"),
         "experience": ("organization", "role", "period"),
@@ -325,6 +364,9 @@ def _find_incoherent_records(
     for section, fields in section_fields.items():
         for index, record in enumerate(getattr(resume, section)):
             scope_options: list[set[str]] = []
+            identity_scope_options: list[set[str]] = []
+            bullet_scope_options: list[set[str]] = []
+            bullet_evidence_is_unsectioned = True
             explicit_hints: set[str] = set()
             for field in fields:
                 value = str(getattr(record, field, "") or "").strip()
@@ -345,35 +387,194 @@ def _find_incoherent_records(
                         field_scopes.add(scope)
                 if field_scopes:
                     scope_options.append(field_scopes)
+                    identity_scope_options.append(field_scopes)
             if hasattr(record, "bullets"):
                 for bullet_index, value in enumerate(record.bullets):
                     path = f"{section}[{index}].bullets[{bullet_index}]"
-                    binding = _bind_with_provenance(
-                        path,
-                        str(value),
+                    provenance_value = str(
+                        (trusted_rewrites or {}).get(path, "") or ""
+                    ).strip()
+                    matching_blocks = _strong_matching_blocks(
+                        provenance_value or str(value),
                         blocks,
                         minimum=0.30,
-                        trusted_rewrites=trusted_rewrites,
                     )
-                    source_block = block_by_id.get(binding.block_id) if binding else None
-                    if source_block and source_block.section_hint:
-                        explicit_hints.add(source_block.section_hint)
-                    if source_block is not None:
+                    bullet_scopes: set[str] = set()
+                    for source_block in matching_blocks:
+                        if source_block.section_hint:
+                            explicit_hints.add(source_block.section_hint)
                         scope = _record_scope_key(source_block, source, section)
                         if scope:
-                            scope_options.append({scope})
+                            bullet_scopes.add(scope)
+                    if bullet_scopes:
+                        # Repeated phrases such as “进行用户测试并收集反馈”
+                        # legitimately occur in multiple projects. Preserve all
+                        # possible scopes here instead of binding to the first
+                        # global occurrence and falsely deleting later records.
+                        scope_options.append(bullet_scopes)
+                        bullet_scope_options.append(bullet_scopes)
+                        if any(item.section_hint for item in matching_blocks):
+                            bullet_evidence_is_unsectioned = False
             # A repeated value such as "本科" legitimately matches several
             # education records. The record is coherent when at least one
             # source scope can satisfy every scoped identity field; binding a
             # repeated short value to the first global match must not delete a
             # later valid record.
             if len(scope_options) > 1 and not set.intersection(*scope_options):
-                incoherent[section].add(index)
+                # Multi-column PDF extraction can place the sole education
+                # period after unrelated columns while preserving every field
+                # verbatim. When there is only one output education record and
+                # one school identity in the source, field grounding is more
+                # reliable than artificial line-order scopes.
+                source_school_scopes = {
+                    _record_scope_key(item, source, "education")
+                    for item in blocks
+                    if item.section_hint == "education"
+                    and _SCHOOL_IDENTITY.search(item.text)
+                }
+                allow_single_education_reorder = (
+                    section == "education"
+                    and len(resume.education) == 1
+                    and len({value for value in source_school_scopes if value}) <= 1
+                )
+                # Deterministic layout recovery may pair explicit identity rows
+                # with numbered duties emitted later as an unsectioned OCR
+                # column.  The identity fields must still agree on one source
+                # record and every bullet must bind independently; only the
+                # artificial line-order scope is relaxed.
+                allow_deterministic_column_reorder = bool(
+                    allow_reordered_record_bullets
+                    and section in {"experience", "research", "activities", "projects"}
+                    and identity_scope_options
+                    and set.intersection(*identity_scope_options)
+                    and bullet_scope_options
+                    and bullet_evidence_is_unsectioned
+                )
+                if not allow_single_education_reorder and not allow_deterministic_column_reorder:
+                    incoherent[section].add(index)
             elif explicit_hints and explicit_hints.issubset(_NON_RECORD_SECTION_HINTS):
                 # A publication/certificate/training line may not be duplicated
                 # as a fabricated work, project, or research record.
                 incoherent[section].add(index)
     return incoherent
+
+
+def _possible_record_scopes(
+    record,
+    *,
+    section: str,
+    source: SourceBundle,
+    blocks: list[SourceBlock],
+) -> set[str]:
+    """Return source records that can support every populated record claim."""
+
+    fields = {
+        "education": ("school", "degree", "major", "period"),
+        "experience": ("organization", "role", "period"),
+        "research": ("institution", "topic", "period"),
+        "activities": ("organization", "role", "period"),
+        "projects": ("name", "organization", "role", "period"),
+    }[section]
+    options: list[set[str]] = []
+    for field in fields:
+        value = str(getattr(record, field, "") or "").strip()
+        if not value:
+            continue
+        matching = _strong_matching_blocks(value, blocks, minimum=0.65)
+        if field == "role":
+            matching = [item for item in matching if _role_block_is_valid(item, value)]
+        scopes = {
+            scope
+            for item in matching
+            if (scope := _record_scope_key(item, source, section))
+        }
+        if scopes:
+            options.append(scopes)
+    if hasattr(record, "bullets"):
+        for bullet in record.bullets:
+            scopes = {
+                scope
+                for item in _strong_matching_blocks(str(bullet), blocks, minimum=0.30)
+                if (scope := _record_scope_key(item, source, section))
+            }
+            if scopes:
+                options.append(scopes)
+    if not options:
+        return set()
+    return set.intersection(*options)
+
+
+def _merge_identityless_continuations(
+    resume: CanonicalResume,
+    source: SourceBundle,
+    blocks: list[SourceBlock],
+) -> None:
+    """Join chunk continuations only when both rows resolve to one source record."""
+
+    identity_fields = {
+        "research": ("institution", "topic", "period"),
+        "activities": ("organization", "role", "period"),
+        "projects": ("name", "organization", "role", "period"),
+    }
+    for section, fields in identity_fields.items():
+        merged = []
+        for record in getattr(resume, section):
+            if section == "activities" and merged and record.bullets and not merged[-1].bullets:
+                current_scopes = _possible_record_scopes(
+                    record, section=section, source=source, blocks=blocks,
+                )
+                previous_scopes = _possible_record_scopes(
+                    merged[-1], section=section, source=source, blocks=blocks,
+                )
+                current_org = str(record.organization or "").strip()
+                current_role = str(record.role or "").strip()
+                weak_department_org = bool(
+                    current_org
+                    and current_role
+                    and _normalize(current_org) in _normalize(current_role)
+                )
+                organizations_compatible = bool(
+                    not merged[-1].organization
+                    or not current_org
+                    or _normalize(merged[-1].organization) == _normalize(current_org)
+                    or weak_department_org
+                )
+                periods_compatible = bool(
+                    not merged[-1].period
+                    or not record.period
+                    or _date_signature(merged[-1].period) == _date_signature(record.period)
+                )
+                if (
+                    current_scopes & previous_scopes
+                    and organizations_compatible
+                    and periods_compatible
+                ):
+                    if not merged[-1].organization and current_org:
+                        merged[-1].organization = current_org
+                    if not merged[-1].role and current_role:
+                        merged[-1].role = current_role
+                    if not merged[-1].period and record.period:
+                        merged[-1].period = record.period
+                    merged[-1].bullets = list(dict.fromkeys(record.bullets))
+                    continue
+            has_identity = any(
+                str(getattr(record, field, "") or "").strip()
+                for field in fields
+            )
+            if not has_identity and record.bullets and merged:
+                current_scopes = _possible_record_scopes(
+                    record, section=section, source=source, blocks=blocks,
+                )
+                previous_scopes = _possible_record_scopes(
+                    merged[-1], section=section, source=source, blocks=blocks,
+                )
+                if current_scopes & previous_scopes:
+                    merged[-1].bullets = list(dict.fromkeys(
+                        list(merged[-1].bullets) + list(record.bullets)
+                    ))
+                    continue
+            merged.append(record)
+        setattr(resume, section, merged)
 
 
 def bind_resume_evidence(
@@ -443,6 +644,7 @@ def enforce_resume_evidence(
     source: SourceBundle,
     *,
     trusted_rewrites: Mapping[str, str] | None = None,
+    allow_reordered_record_bullets: bool = False,
 ) -> tuple[CanonicalResume, list[EvidenceBinding], list[str]]:
     """Remove final candidate claims that cannot bind to Resume/Query evidence.
 
@@ -464,6 +666,7 @@ def enforce_resume_evidence(
         source,
         eligible_blocks,
         trusted_rewrites=trusted_rewrites,
+        allow_reordered_record_bullets=allow_reordered_record_bullets,
     )
     removed: list[str] = []
 
@@ -524,6 +727,11 @@ def enforce_resume_evidence(
                 record for index, record in enumerate(getattr(gated, section))
                 if index not in incoherent_records[section]
             ])
+
+    # Before optimization there is no positional rewrite provenance to remap.
+    # This is the safe point to join records split only by Composer chunking.
+    if not trusted_rewrites:
+        _merge_identityless_continuations(gated, source, eligible_blocks)
 
     kept_skills = []
     for index, skill in enumerate(gated.skills.items):

@@ -4,7 +4,11 @@ from unittest.mock import patch
 
 from evidence_binding import bind_resume_evidence, measure_source_coverage
 from source_adapter import build_source_bundle
-from v2_pipeline import _deterministic_verify_draft, run_v2_pipeline
+from v2_pipeline import (
+    _deterministic_verify_draft,
+    _fallback_is_structurally_safe,
+    run_v2_pipeline,
+)
 from v2_schemas import CanonicalResume, DraftResume, VerifiedResult
 
 
@@ -149,6 +153,61 @@ def test_high_coverage_raw_extras_do_not_replace_a_structured_verifier_result():
 
     llm_verifier.assert_called_once()
     assert len(result.resume.experience) == 2
+
+
+def test_high_coverage_fallback_with_identityless_records_is_not_safe():
+    fallback = CanonicalResume.model_validate({
+        "experience": [{
+            "organization": "",
+            "role": "",
+            "bullets": ["积累了产品策划和需求分析经验"],
+        }],
+        "projects": [{
+            "name": "",
+            "role": "校园二手交易平台产品负责人",
+            "bullets": ["负责需求分析"],
+        }],
+    })
+
+    assert _fallback_is_structurally_safe(fallback) is False
+
+
+def test_period_only_experience_is_recovery_safe_but_not_replacement_safe():
+    fallback = CanonicalResume.model_validate({
+        "experience": [{
+            "organization": "",
+            "role": "",
+            "period": "2012年7月 - 2015年12月",
+            "bullets": [
+                "负责Android客户端的开发与迭代",
+                "按照计划完成代码实现和单元测试",
+            ],
+        }],
+    })
+
+    assert _fallback_is_structurally_safe(fallback) is False
+    assert _fallback_is_structurally_safe(
+        fallback,
+        allow_period_only_experience=True,
+    ) is True
+
+
+def test_high_coverage_fallback_with_lexical_field_splices_is_not_safe():
+    fallback = CanonicalResume.model_validate({
+        "education": [
+            {"school": "xx大学", "degree": "本科", "major": "统计学"},
+            {"school": "188-8888-8888", "major": "success@jobmail.vip"},
+        ],
+        "experience": [
+            {"organization": "XXXX有限公司", "role": "", "bullets": []},
+        ],
+        "projects": [
+            {"name": "服装产品项目", "role": "负责人", "bullets": []},
+        ],
+        "additional_sections": {"补充信息": ["大量被错放的职责原文"]},
+    })
+
+    assert _fallback_is_structurally_safe(fallback) is False
 
 
 def test_ocr_compound_lines_and_edit_direction_do_not_force_llm_verifier():

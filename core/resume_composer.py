@@ -91,6 +91,12 @@ def _composer_concurrency() -> int:
     return max(1, min(_MAX_COMPOSER_CONCURRENCY, configured))
 
 
+def _composer_output_tokens() -> int:
+    """Return a configurable completion budget for dense full-CV extraction."""
+
+    return _safe_positive_env_int("LLM_COMPOSER_MAX_TOKENS") or _COMPOSER_MAX_TOKENS
+
+
 def _composer_max_fact_blocks() -> int:
     """Bound output complexity independently from input token length.
 
@@ -213,8 +219,9 @@ def _prepare_generate_request(query_text: str, jd_text: str) -> tuple[str, int]:
             prompt,
         )
         available = context_window - prompt_tokens - _COMPOSER_SAFETY_TOKENS
-        if available >= _COMPOSER_MAX_TOKENS:
-            return prompt, _COMPOSER_MAX_TOKENS
+        output_tokens = _composer_output_tokens()
+        if available >= output_tokens:
+            return prompt, output_tokens
 
         # Candidate facts are more important than target context. Shorten JD
         # first to recover the full output budget. Only lower the completion
@@ -356,7 +363,7 @@ def _split_source_bundle(
 
     context_window = _llm_context_window()
     fact_block_limit = max(1, int(max_fact_blocks or _composer_max_fact_blocks()))
-    prompt_limit = context_window - _COMPOSER_MAX_TOKENS - _COMPOSER_SAFETY_TOKENS
+    prompt_limit = context_window - _composer_output_tokens() - _COMPOSER_SAFETY_TOKENS
     if prompt_limit <= 0:
         raise ValueError(
             f"LLM context window {context_window} is too small for Composer output budget"
@@ -523,19 +530,20 @@ def _draft_has_candidate_content(draft: DraftResume) -> bool:
 def _compose_chunk(chunk: SourceBundle) -> DraftResume:
     """Run and validate one independent Composer request."""
     user_prompt = _build_resume_prompt(chunk)
+    output_tokens = _composer_output_tokens()
     trace_event(
         "composer_request",
         source_blocks=chunk.blocks,
         system_prompt=RESUME_COMPOSER_SYSTEM_PROMPT,
         user_prompt=user_prompt,
-        max_tokens=_COMPOSER_MAX_TOKENS,
+        max_tokens=output_tokens,
     )
     parsed = call_llm_typed(
         DraftResume,
         RESUME_COMPOSER_SYSTEM_PROMPT,
         user_prompt,
         temperature=0.0,
-        max_tokens=_COMPOSER_MAX_TOKENS,
+        max_tokens=output_tokens,
     )
     if not isinstance(parsed, dict) or not parsed:
         raise ValueError("Composer returned an empty or invalid chunk")
