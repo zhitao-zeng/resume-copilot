@@ -47,6 +47,11 @@ class _RewriteProposal:
     bullet_index: int
     before: str
     after: str
+    # Grouped proposals are applied atomically per record. ``before`` joins
+    # every source bullet referenced by the final claim with newlines so the
+    # evidence layer can retain multi-block provenance.
+    grouped: bool = False
+    source_indices: tuple[int, ...] = ()
 
     @property
     def path(self) -> str:
@@ -72,24 +77,26 @@ _NAMED_CHINESE_FACT = re.compile(
 )
 
 
-OPTIMIZER_SYSTEM_PROMPT = """你是一位保守的简历编辑，只输出局部文字补丁，不得重写整份简历。
+OPTIMIZER_SYSTEM_PROMPT = """你是一位保守的简历编辑，只输出经历记录内的 bullets 补丁，不得重写整份简历。
 
 输出 JSON：
 {
-  "experience": [{"index": 0, "bullets": ["与原数组一一对应"]}],
-  "research": [{"index": 0, "bullets": ["与原数组一一对应"]}],
-  "activities": [{"index": 0, "bullets": ["与原数组一一对应"]}],
-  "projects": [{"index": 0, "bullets": ["与原数组一一对应"]}]
+  "experience": [{"index": 0, "bullets": [{"text": "完整成果句", "source_indices": [0, 1]}]}],
+  "research": [{"index": 0, "bullets": [{"text": "完整成果句", "source_indices": [0]}]}],
+  "activities": [{"index": 0, "bullets": [{"text": "完整成果句", "source_indices": [0]}]}],
+  "projects": [{"index": 0, "bullets": [{"text": "完整成果句", "source_indices": [0, 1]}]}]
 }
 
 硬约束：
-1. 每个 bullets 数组长度和顺序必须与输入完全相同，一条原文对应一条改写。
-2. 只能改 bullets；不得输出或修改 summary、公司、组织、岗位、学校、日期、技能、奖项。
-3. 责任级别必须保持：原文“参与/协助/支持”不得升级，原文“独立负责/主导/负责”也不得降级。
-4. 原文没有结果时，不得添加提升、降低、增长、确保、高质量交付等结果。
-5. 不得新增数字、工具、技术、业务领域或项目事实。
-6. 重点是压缩重复、改善句式和按目标岗位突出已有事实；不需要为了 STAR 强行补结果。
-7. 保留原文中的关键过程、方法、交付物和结果，不得把多项事实压成空泛短句。
+1. source_indices 是输入 bullets 的 0 起始下标；每个输入下标必须出现且只能出现一次，不得遗漏、重复或越界。
+2. 只有属于同一具体事项的动作、方法、交付物、已有结果才能合并。互不相关的职责保持分开；输出条数可以少于输入。
+3. 每条尽量写成“动作 + 对象/方法 + 交付物/已有结果”的完整成果句，不要把一个完整事项拆成短语碎片，也不要机械套 STAR 模板。
+4. 只能改 bullets；不得输出或修改 summary、公司、组织、岗位、学校、日期、技能、奖项。
+5. 责任级别必须保持：原文“参与/协助/支持”不得升级，原文“独立负责/主导/负责”也不得降级；责任级别不同的动作不要合并。
+6. 原文没有结果时，不得添加提升、降低、增长、确保、高质量交付等结果。
+7. 不得新增数字、工具、技术、业务领域或项目事实。
+8. 保留每条原文的关键动作、对象、过程、方法、交付物和结果，不得压成空泛短句。
+9. 目标岗位只影响已有事实的排序和措辞，不是候选人事实来源。
 只输出 JSON，不要解释。"""
 
 
@@ -142,6 +149,8 @@ def _safe_rewrite_diagnostics(original: str, rewritten: str) -> tuple[bool, list
     # Ownership is a candidate fact: it may neither be inflated nor weakened.
     if original_action and rewritten_action != original_action:
         reasons.append("ownership_level_changed")
+    elif not original_action and rewritten_action:
+        reasons.append("ownership_level_introduced")
     if len(original) >= 20 and len(rewritten) < max(12, int(len(original) * 0.58)):
         reasons.append("source_content_shrunk")
     original_numbers = _numeric_facts(original)
@@ -165,6 +174,181 @@ def _safe_rewrite_diagnostics(original: str, rewritten: str) -> tuple[bool, list
 
 def _safe_rewrite(original: str, rewritten: str) -> bool:
     return _safe_rewrite_diagnostics(original, rewritten)[0]
+
+
+def _fact_bigrams(value: str) -> set[str]:
+    compact = re.sub(r"[^\w\u4e00-\u9fff]+", "", str(value or "")).casefold()
+    return {
+        compact[index:index + 2]
+        for index in range(max(0, len(compact) - 1))
+    }
+
+
+def _source_fact_represented(source: str, candidate: str) -> bool:
+    """Conservative, industry-agnostic lossless check for regrouped facts."""
+
+    source_compact = re.sub(
+        r"[^\w\u4e00-\u9fff+.#/_-]+", "", str(source or ""),
+    ).casefold()
+    candidate_compact = re.sub(
+        r"[^\w\u4e00-\u9fff+.#/_-]+", "", str(candidate or ""),
+    ).casefold()
+    if not source_compact or not candidate_compact:
+        return False
+    if source_compact in candidate_compact:
+        return True
+
+    anchor_pattern = re.compile(
+        r"\d+(?:\.\d+)?(?:%|万|w|k|人|次|个|条|元|年|月|日)?|"
+        r"[A-Za-z][A-Za-z0-9+.#/_-]*",
+        re.IGNORECASE,
+    )
+    source_anchors = {item.casefold() for item in anchor_pattern.findall(source)}
+    candidate_anchors = {item.casefold() for item in anchor_pattern.findall(candidate)}
+    if not source_anchors.issubset(candidate_anchors):
+        return False
+
+    source_bigrams = _fact_bigrams(source)
+    candidate_bigrams = _fact_bigrams(candidate)
+    recall = len(source_bigrams & candidate_bigrams) / max(1, len(source_bigrams))
+    return recall >= 0.52
+
+
+def _normalize_grouped_surface(value: str) -> str:
+    """Remove model-only spacing noise without changing lexical facts."""
+
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    text = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=\d)", "", text)
+    text = re.sub(
+        r"(?<=\d)\s+(?=(?:%|万|w|k|人|次|个|条|元|年|月|日))",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return text
+
+
+def _action_marker_for_level(values: list[str], level: int) -> str:
+    tokens = {
+        3: _STRONG_ACTIONS,
+        2: _MEDIUM_ACTIONS,
+        1: _WEAK_ACTIONS,
+    }.get(level, ())
+    matches = [
+        (value.find(token), token)
+        for value in values
+        for token in tokens
+        if token in value
+    ]
+    return min(matches, default=(0, ""))[1]
+
+
+def _grouped_patch_proposals(
+    resume: CanonicalResume,
+    section: str,
+    record_index: int,
+    proposed: list[Any],
+) -> list[_RewriteProposal] | None:
+    """Parse one lossless variable-count record rewrite, or reject it whole."""
+
+    records = getattr(resume, section)
+    original = [str(item or "").strip() for item in records[record_index].bullets]
+    if not original or not proposed or not all(isinstance(item, dict) for item in proposed):
+        return None
+
+    parsed: list[tuple[str, tuple[int, ...]]] = []
+    used_indices: list[int] = []
+    for item in proposed:
+        text = str(item.get("text", "") or "").strip()
+        raw_indices = item.get("source_indices")
+        if (
+            not text
+            or not isinstance(raw_indices, list)
+            or not raw_indices
+            or not all(isinstance(index, int) for index in raw_indices)
+        ):
+            return None
+        indices = tuple(raw_indices)
+        if len(set(indices)) != len(indices) or any(
+            index < 0 or index >= len(original) for index in indices
+        ):
+            return None
+        parsed.append((text, indices))
+        used_indices.extend(indices)
+
+    # This is the central lossless contract. The model may regroup facts but
+    # cannot make any input bullet disappear or count it twice.
+    if sorted(used_indices) != list(range(len(original))):
+        return None
+    if len({re.sub(r"\W+", "", text).casefold() for text, _ in parsed}) != len(parsed):
+        return None
+
+    proposals: list[_RewriteProposal] = []
+    for bullet_index, (after, indices) in enumerate(parsed):
+        after = _normalize_grouped_surface(after)
+        source_parts = [original[index] for index in indices]
+        source_action_levels = {
+            level for level in (_action_level(item) for item in source_parts) if level
+        }
+        # A single surface verb cannot safely preserve conflicting ownership
+        # levels. Keep those responsibilities as separate output bullets.
+        if len(source_action_levels) > 1:
+            return None
+        candidate_action = _action_level(after)
+        if source_action_levels:
+            expected_action = next(iter(source_action_levels))
+            if not candidate_action:
+                # The model sometimes keeps the exact action and object but
+                # starts the sentence with a method phrase. Reinsert the
+                # source's own ownership marker; this is deterministic source
+                # preservation, not an inferred responsibility upgrade.
+                marker = _action_marker_for_level(source_parts, expected_action)
+                after = f"{marker}{after}" if marker else after
+                candidate_action = _action_level(after)
+            if candidate_action != expected_action:
+                return None
+        elif candidate_action:
+            return None
+
+        before = "\n".join(source_parts)
+        safe, reasons = _safe_rewrite_diagnostics(before, after)
+        # Lossless per-source recall below is more precise for consolidation
+        # than a raw total-length ratio, so that one generic shrink diagnostic
+        # may be ignored while every actual fact still has to survive.
+        material_reasons = [
+            reason for reason in reasons if reason != "source_content_shrunk"
+        ]
+        missing_sources = [
+            index for index, source_part in zip(indices, source_parts)
+            if not _source_fact_represented(source_part, after)
+        ]
+        # Unchanged bullets are valid members of an otherwise regrouped
+        # record. Rejecting one would roll back the genuinely improved sibling
+        # bullets because grouped records are intentionally atomic.
+        accepted = not material_reasons and not missing_sources
+        trace_event(
+            "optimizer_grouped_hard_gate",
+            path=f"{section}[{record_index}].bullets[{bullet_index}]",
+            source_indices=list(indices),
+            before=before,
+            after=after,
+            accepted=accepted,
+            reasons=material_reasons + (
+                [f"missing_source_indices:{missing_sources}"] if missing_sources else []
+            ),
+        )
+        if not accepted:
+            return None
+        proposals.append(_RewriteProposal(
+            section=section,
+            record_index=record_index,
+            bullet_index=bullet_index,
+            before=before,
+            after=after,
+            grouped=True,
+            source_indices=indices,
+        ))
+    return proposals
 
 
 def _rewrite_requires_semantic_review(original: str, rewritten: str) -> bool:
@@ -209,6 +393,27 @@ def _section_patch_proposals(
             continue
         proposed = patch.get("bullets")
         original = list(records[record_index].bullets)
+        if isinstance(proposed, list) and proposed and all(
+            isinstance(item, dict) for item in proposed
+        ):
+            grouped = _grouped_patch_proposals(
+                resume,
+                section,
+                record_index,
+                proposed,
+            )
+            if grouped is None:
+                trace_event(
+                    "optimizer_patch_shape_rejected",
+                    section=section,
+                    record_index=record_index,
+                    original=original,
+                    proposed=proposed,
+                    reason="invalid_or_lossy_grouped_rewrite",
+                )
+                continue
+            proposals.extend(grouped)
+            continue
         if not isinstance(proposed, list) or len(proposed) != len(original):
             trace_event(
                 "optimizer_patch_shape_rejected",
@@ -487,6 +692,7 @@ def optimize_resume_with_provenance(
 
     trusted_rewrites: dict[str, str] = {}
     semantic_rejected = 0
+    accepted_proposal_ids: set[int] = set()
     for proposal in proposals:
         high_risk = _rewrite_requires_semantic_review(proposal.before, proposal.after)
         needs_review = mode == "all" or (mode == "high_risk" and high_risk)
@@ -506,9 +712,7 @@ def optimize_resume_with_provenance(
                 accepted=False,
             )
             continue
-        records = getattr(optimized, proposal.section)
-        records[proposal.record_index].bullets[proposal.bullet_index] = proposal.after
-        trusted_rewrites[proposal.path] = proposal.before
+        accepted_proposal_ids.add(id(proposal))
         trace_event(
             "optimizer_semantic_gate",
             path=proposal.path,
@@ -518,6 +722,36 @@ def optimize_resume_with_provenance(
             verdict=verdict,
             accepted=True,
         )
+
+    grouped_records: dict[tuple[str, int], list[_RewriteProposal]] = {}
+    for proposal in proposals:
+        if proposal.grouped:
+            grouped_records.setdefault(
+                (proposal.section, proposal.record_index), [],
+            ).append(proposal)
+            continue
+        if id(proposal) not in accepted_proposal_ids:
+            continue
+        records = getattr(optimized, proposal.section)
+        records[proposal.record_index].bullets[proposal.bullet_index] = proposal.after
+        trusted_rewrites[proposal.path] = proposal.before
+
+    for (section, record_index), record_proposals in grouped_records.items():
+        # Regrouping changes positional meaning, so partial application would
+        # be unsafe. One failed claim rolls back the entire record.
+        if not all(id(proposal) in accepted_proposal_ids for proposal in record_proposals):
+            trace_event(
+                "optimizer_grouped_record_reverted",
+                section=section,
+                record_index=record_index,
+                reason="semantic_review_rejected_or_unavailable",
+            )
+            continue
+        ordered = sorted(record_proposals, key=lambda item: item.bullet_index)
+        records = getattr(optimized, section)
+        records[record_index].bullets = [proposal.after for proposal in ordered]
+        for proposal in ordered:
+            trusted_rewrites[proposal.path] = proposal.before
 
     accepted = len(trusted_rewrites)
 

@@ -20,8 +20,10 @@ from v2_pipeline import (
     _compact_canonical,
     _canonical_to_v1_format,
     _deterministic_fallback,
+    _expand_optimizer_provenance,
     _ground_bullets,
     _ground_optimizer_output,
+    _recover_missing_record_facts,
     _split_grounded_fact_bullet,
     run_v2_pipeline,
 )
@@ -191,6 +193,55 @@ def test_role_evidence_must_come_from_identity_context_across_industries():
         gated_correct, correct_bindings, _ = enforce_resume_evidence(correct, source)
         assert gated_correct.experience[0].role == valid_role
         assert any(binding.path.endswith(".role") for binding in correct_bindings)
+
+
+def test_leading_body_phrase_cannot_bind_as_role_across_industries():
+    examples = (
+        ("某科技公司", "测试工程师", "单元测试", "负责覆盖核心模块"),
+        ("某实验学校", "语文教师", "课堂教学", "负责课程设计"),
+        ("某人民医院", "住院医师", "患者诊疗", "负责病历复核"),
+        ("某零售公司", "运营专员", "活动运营", "负责排期复盘"),
+    )
+    for organization, valid_role, duty, detail in examples:
+        source = build_source_bundle(
+            f"工作经历\n{organization}｜{valid_role}｜2022.01-2024.01\n{duty}，{detail}",
+            "",
+            "",
+        )
+        wrong = CanonicalResume.model_validate({
+            "experience": [{
+                "organization": organization,
+                "role": duty,
+                "period": "2022.01-2024.01",
+                "bullets": [f"{duty}，{detail}"],
+            }],
+        })
+
+        gated_wrong, wrong_bindings, _ = enforce_resume_evidence(wrong, source)
+
+        assert gated_wrong.experience[0].role == ""
+        assert gated_wrong.experience[0].bullets == [f"{duty}，{detail}"]
+        assert not any(binding.path.endswith(".role") for binding in wrong_bindings)
+
+
+def test_compact_role_before_duties_survives_with_identity_context():
+    source = build_source_bundle(
+        "工作经历\n某科技公司 产品经理，负责需求分析与版本规划",
+        "",
+        "",
+    )
+    resume = CanonicalResume.model_validate({
+        "experience": [{
+            "organization": "某科技公司",
+            "role": "产品经理",
+            "bullets": ["负责需求分析与版本规划"],
+        }],
+    })
+
+    gated, bindings, _ = enforce_resume_evidence(resume, source)
+
+    assert gated.experience[0].role == "产品经理"
+    assert any(binding.path.endswith(".role") for binding in bindings)
 
 
 def test_compound_tool_list_remains_one_coherent_bullet():
@@ -438,6 +489,266 @@ def test_trusted_optimizer_rewrite_still_passes_final_fact_grounder():
     )
 
     assert grounded.experience[0].bullets == [evidence]
+
+
+def test_clause_grounder_removes_only_fabricated_result_and_keeps_source_process():
+    evidence = "通过问卷开展用户调研，覆盖200名用户。"
+    original = CanonicalResume.model_validate({
+        "experience": [{"bullets": [evidence]}],
+    })
+    optimized = original.model_copy(deep=True)
+    optimized.experience[0].bullets = [
+        "通过问卷开展用户调研，覆盖200名用户，提升转化率30%。"
+    ]
+
+    grounded = _ground_optimizer_output(original, optimized, evidence)
+    output = grounded.experience[0].bullets[0]
+
+    assert "通过问卷开展用户调研" in output
+    assert "覆盖200名用户" in output
+    assert "提升转化率" not in output
+    assert "30%" not in output
+
+
+def test_clause_grounder_accepts_one_bullet_supported_by_multiple_source_lines():
+    evidence = (
+        "负责梳理客户需求。\n"
+        "使用半结构化访谈收集反馈。\n"
+        "输出需求优先级清单。"
+    )
+    original = CanonicalResume.model_validate({
+        "experience": [{"bullets": ["负责梳理客户需求。"]}],
+    })
+    optimized = original.model_copy(deep=True)
+    optimized.experience[0].bullets = [
+        "负责梳理客户需求，使用半结构化访谈收集反馈，输出需求优先级清单。"
+    ]
+
+    grounded = _ground_optimizer_output(original, optimized, evidence)
+
+    assert grounded.experience[0].bullets == optimized.experience[0].bullets
+
+
+def test_grouped_rewrite_keeps_every_source_block_in_provenance_and_coverage():
+    source = build_source_bundle(
+        "工作经历\n"
+        "甲公司｜产品经理｜2022.01-2023.01\n"
+        "负责梳理客户需求。\n"
+        "通过10次用户访谈收集反馈。\n"
+        "输出需求优先级清单。",
+        "",
+        "",
+    )
+    resume = CanonicalResume.model_validate({
+        "experience": [{
+            "organization": "甲公司",
+            "role": "产品经理",
+            "period": "2022.01-2023.01",
+            "bullets": [
+                "负责梳理客户需求，通过10次用户访谈收集反馈，输出需求优先级清单。",
+            ],
+        }],
+    })
+    path = "experience[0].bullets[0]"
+    provenance = (
+        "负责梳理客户需求。\n"
+        "通过10次用户访谈收集反馈。\n"
+        "输出需求优先级清单。"
+    )
+
+    bindings = bind_resume_evidence(
+        resume,
+        source,
+        trusted_rewrites={path: provenance},
+    )
+
+    binding = next(item for item in bindings if item.path == path)
+    assert binding.source_claim == provenance
+    assert len(binding.block_ids) == 3
+    coverage, missing = measure_source_coverage(
+        source,
+        bindings,
+        allow_distributed=True,
+    )
+    assert coverage == 1.0
+    assert missing == []
+
+
+def test_grouped_optimizer_provenance_expands_atom_sources_without_duplicates():
+    compound = (
+        "负责梳理客户需求；通过10次用户访谈收集反馈；"
+        "输出需求优先级清单。"
+    )
+    before = CanonicalResume.model_validate({
+        "experience": [{
+            "bullets": [
+                "负责梳理客户需求",
+                "通过10次用户访谈收集反馈",
+                "输出需求优先级清单",
+            ],
+        }],
+    })
+    atom_provenance = {
+        f"experience[0].bullets[{index}]": compound
+        for index in range(3)
+    }
+
+    expanded = _expand_optimizer_provenance(
+        "experience[0].bullets[0]",
+        "\n".join(before.experience[0].bullets),
+        before,
+        atom_provenance,
+    )
+
+    assert expanded == compound
+
+
+def test_fact_ledger_recovers_missing_body_only_into_its_source_record():
+    source = build_source_bundle(
+        "工作经历\n"
+        "甲公司｜产品经理｜2022.01-2023.01\n"
+        "负责需求分析并输出PRD。\n"
+        "负责通过10次用户访谈整理需求优先级。\n"
+        "乙公司｜运营专员｜2023.02-2024.01\n"
+        "负责活动策划与执行。",
+        "",
+        "",
+    )
+    resume = CanonicalResume.model_validate({
+        "experience": [
+            {
+                "organization": "甲公司",
+                "role": "产品经理",
+                "period": "2022.01-2023.01",
+                "bullets": ["负责需求分析并输出PRD。"],
+            },
+            {
+                "organization": "乙公司",
+                "role": "运营专员",
+                "period": "2023.02-2024.01",
+                "bullets": ["负责活动策划与执行。"],
+            },
+        ],
+    })
+    before_bindings = bind_resume_evidence(resume, source)
+    before_coverage, _ = measure_source_coverage(
+        source,
+        before_bindings,
+        allow_distributed=True,
+    )
+
+    recovered, stats, changed_paths = _recover_missing_record_facts(
+        resume,
+        source,
+        before_bindings,
+    )
+    after_bindings = bind_resume_evidence(recovered, source)
+    after_coverage, _ = measure_source_coverage(
+        source,
+        after_bindings,
+        allow_distributed=True,
+    )
+
+    assert stats.appended_bullets == 1
+    assert stats.expanded_bullets == 0
+    assert changed_paths == {"experience[0].bullets[1]"}
+    assert "负责通过10次用户访谈整理需求优先级" in recovered.experience[0].bullets
+    assert recovered.experience[1].bullets == ["负责活动策划与执行。"]
+    assert after_coverage > before_coverage
+
+
+def test_fact_ledger_recovers_rest_of_compact_ocr_line_after_short_prefix():
+    source = build_source_bundle(
+        "工作经历\n甲公司｜产品经理｜2020.01-2024.01\n"
+        "负责客户沟通、用户调研、竞品分析、输出PRD、推动研发上线、分析数据复盘",
+        "",
+        "",
+    )
+    resume = CanonicalResume.model_validate({
+        "experience": [{
+            "organization": "甲公司",
+            "role": "产品经理",
+            "period": "2020.01-2024.01",
+            "bullets": ["负责客户沟通"],
+        }],
+    })
+    before_bindings = bind_resume_evidence(resume, source)
+
+    recovered, stats, _ = _recover_missing_record_facts(
+        resume,
+        source,
+        before_bindings,
+    )
+    after_bindings = bind_resume_evidence(recovered, source)
+    coverage, missing = measure_source_coverage(
+        source,
+        after_bindings,
+        allow_distributed=True,
+    )
+
+    assert stats.appended_bullets == 0
+    assert stats.expanded_bullets == 1
+    assert len(recovered.experience[0].bullets) == 1
+    assert "推动研发上线" in recovered.experience[0].bullets[-1]
+    assert "分析数据复盘" in recovered.experience[0].bullets[-1]
+    assert coverage == 1.0
+    assert missing == []
+
+
+def test_fact_ledger_uses_period_to_disambiguate_repeated_employer_and_role():
+    source = build_source_bundle(
+        "工作经历\n"
+        "甲公司｜运营专员｜2020.01-2021.01\n"
+        "负责活动策划。\n"
+        "负责通过问卷复盘活动。\n"
+        "甲公司｜运营专员｜2022.01-2023.01\n"
+        "负责社群运营。",
+        "",
+        "",
+    )
+    resume = CanonicalResume.model_validate({
+        "experience": [
+            {
+                "organization": "甲公司",
+                "role": "运营专员",
+                "period": "2020.01-2021.01",
+                "bullets": ["负责活动策划。"],
+            },
+            {
+                "organization": "甲公司",
+                "role": "运营专员",
+                "period": "2022.01-2023.01",
+                "bullets": ["负责社群运营。"],
+            },
+        ],
+    })
+    bindings = bind_resume_evidence(resume, source)
+
+    recovered, stats, _ = _recover_missing_record_facts(resume, source, bindings)
+
+    assert stats.appended_bullets == 1
+    assert "负责通过问卷复盘活动" in recovered.experience[0].bullets
+    assert recovered.experience[1].bullets == ["负责社群运营。"]
+
+
+def test_fact_ledger_does_not_turn_a_short_role_header_into_a_bullet():
+    source = build_source_bundle(
+        "项目经历\n增长项目\n负责人\n负责活动策划与执行。",
+        "",
+        "",
+    )
+    resume = CanonicalResume.model_validate({
+        "projects": [{
+            "name": "增长项目",
+            "role": "负责人",
+            "bullets": ["负责活动策划与执行。"],
+        }],
+    })
+    bindings = bind_resume_evidence(resume, source)
+
+    recovered, _, _ = _recover_missing_record_facts(resume, source, bindings)
+
+    assert recovered.projects[0].bullets == ["负责活动策划与执行。"]
 
 
 def test_grounded_original_summary_keeps_unique_fact_and_stays_complete():

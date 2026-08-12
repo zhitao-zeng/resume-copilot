@@ -24,6 +24,7 @@ from resume_verifier import _ground_fixed_fields, _reclassify_non_work
 from resume_optimizer import (
     optimize_resume_with_provenance,
     _introduces_unsupported_fact,
+    _safe_rewrite_diagnostics,
 )
 from v2_validator import validate_resume
 from evidence_binding import (
@@ -182,7 +183,33 @@ def _char_bigrams(text: str) -> set[str]:
 
 def _source_sentences(text: str) -> list[str]:
     values = [item.strip(" \t-•") for item in re.split(r"[\n。；]+", text) if item.strip()]
-    return [item for item in values if len(item) >= 6]
+    return [
+        item for item in values
+        if len(item) >= 6
+        or re.search(
+            r"\d+(?:\.\d+)?(?:%|万|亿|w|k|人|次|个|条|元|年|月|日)|"
+            r"[A-Za-z][A-Za-z0-9+.#/_-]{1,}",
+            item,
+            re.IGNORECASE,
+        )
+    ]
+
+
+def _fact_clauses(text: str) -> list[str]:
+    """Split a compound statement only for evidence comparison.
+
+    The returned clauses are reassembled before rendering.  This is therefore
+    deliberately finer-grained than ``_split_grounded_fact_bullet``: commas
+    often separate action, method and result evidence that may originate from
+    different source lines, but they should still render as one coherent
+    bullet.
+    """
+
+    return [
+        item.strip(" \t-•·▪◦，,。；;")
+        for item in re.split(r"[\n。；;,，]+", str(text or ""))
+        if len(re.sub(r"\W+", "", item, flags=re.UNICODE)) >= 3
+    ]
 
 
 def _closest_source_sentence(bullet: str, sentences: list[str]) -> tuple[str, float, float]:
@@ -202,13 +229,134 @@ def _closest_source_sentence(bullet: str, sentences: list[str]) -> tuple[str, fl
     return best, score, best_recall
 
 
+def _compound_fact_is_supported(value: str, sentences: list[str]) -> bool:
+    """Recognize a coherent bullet assembled from several source lines.
+
+    OCR often splits one original bullet between lines. Comparing a complete
+    rewrite with only the nearest line makes real tools and metrics look new.
+    This aggregate check is deliberately strict about every numeric/Latin/
+    named fact and still requires each clause to resemble candidate evidence.
+    """
+
+    clauses = _fact_clauses(value)
+    source_clauses = list(dict.fromkeys(
+        clause
+        for sentence in sentences
+        for clause in (_fact_clauses(sentence) or [sentence])
+    ))
+    if len(clauses) < 2 or len(source_clauses) < 2:
+        return False
+    if any(
+        not (
+            generated_coverage >= 0.30
+            or (generated_coverage >= 0.18 and source_recall >= 0.45)
+            or (generated_coverage >= 0.12 and source_recall >= 0.80)
+        )
+        for clause in clauses
+        for _source, generated_coverage, source_recall in [
+            _closest_source_sentence(clause, source_clauses)
+        ]
+    ):
+        return False
+    aggregate = unicodedata.normalize("NFKC", "\n".join(sentences))
+    candidate = unicodedata.normalize("NFKC", str(value or ""))
+    unit_suffix = r"(?:%|万|亿|w|k|人|次|个|条|元|年|月|日)"
+    aggregate = re.sub(rf"(?<=\d)\s+(?={unit_suffix})", "", aggregate, flags=re.IGNORECASE)
+    candidate = re.sub(rf"(?<=\d)\s+(?={unit_suffix})", "", candidate, flags=re.IGNORECASE)
+    _safe, reasons = _safe_rewrite_diagnostics(aggregate, candidate)
+    blocking = {
+        reason for reason in reasons
+        if reason not in {"source_content_shrunk", "ownership_level_changed"}
+    }
+    return not blocking
+
+
 def _ground_bullet_value(
     value: str,
     sentences: list[str],
     *,
     path: str = "",
+    _allow_clause_split: bool = True,
 ) -> tuple[str, str]:
-    """Return ``(text, status)`` where status is accepted/restored/dropped."""
+    """Ground a bullet as a whole or as independently checked clauses.
+
+    Compound bullets are checked clause by clause.  A supported action and
+    method can therefore survive when the model appends one unsupported
+    result, instead of reverting or deleting the entire useful statement.
+    """
+
+    if _allow_clause_split:
+        whole_value, whole_status = _ground_bullet_value(
+            value,
+            sentences,
+            path=path,
+            _allow_clause_split=False,
+        )
+        if whole_status == "accepted":
+            return whole_value, whole_status
+        if _compound_fact_is_supported(value, sentences):
+            trace_event(
+                "bullet_compound_grounding",
+                path=path,
+                candidate=value,
+                output=value,
+                status="accepted",
+                whole_status=whole_status,
+            )
+            return value, "accepted"
+        candidate_clauses = _fact_clauses(value)
+        source_clauses = list(dict.fromkeys(
+            clause
+            for sentence in sentences
+            for clause in (_fact_clauses(sentence) or [sentence])
+        ))
+        if len(candidate_clauses) >= 2 and len(source_clauses) >= 2:
+            safe_clauses: list[str] = []
+            changed = False
+            clause_events: list[dict[str, object]] = []
+            for clause in candidate_clauses:
+                grounded_clause, status = _ground_bullet_value(
+                    clause,
+                    source_clauses,
+                    path=path,
+                    _allow_clause_split=False,
+                )
+                if grounded_clause and grounded_clause not in safe_clauses:
+                    safe_clauses.append(grounded_clause)
+                if status != "accepted" or grounded_clause != clause:
+                    changed = True
+                clause_events.append({
+                    "candidate": clause,
+                    "output": grounded_clause,
+                    "status": status,
+                })
+            if safe_clauses:
+                unchanged = not changed and len(safe_clauses) == len(candidate_clauses)
+                output = (
+                    str(value or "").strip()
+                    if unchanged
+                    else "，".join(safe_clauses).rstrip("，,。；; ") + "。"
+                )
+                status = "accepted" if unchanged else "trimmed"
+                trace_event(
+                    "bullet_clause_grounding",
+                    path=path,
+                    candidate=value,
+                    output=output,
+                    status=status,
+                    clauses=clause_events,
+                )
+                return output, status
+            trace_event(
+                "bullet_clause_grounding",
+                path=path,
+                candidate=value,
+                output=whole_value,
+                status=whole_status,
+                clauses=clause_events,
+            )
+            return whole_value, whole_status
+        return whole_value, whole_status
 
     source, generated_coverage, source_recall = _closest_source_sentence(value, sentences)
     if not source:
@@ -257,7 +405,16 @@ def _ground_bullet_value(
     upgraded = _action_level(value) > _action_level(source)
     unsupported_result = any(term in value and term not in source for term in _RESULT_CLAIMS)
     unsupported_fact = _introduces_unsupported_fact(source, value)
-    if upgraded or unsupported_result or unsupported_fact:
+    _hard_safe, hard_reasons = _safe_rewrite_diagnostics(source, value)
+    # Grounding a concise source subset is valid, so the optimizer's
+    # completeness-oriented shrink check does not apply here. All checks for
+    # newly introduced facts and changed ownership still apply.
+    hard_reasons = [
+        reason for reason in hard_reasons
+        if reason != "source_content_shrunk"
+    ]
+    hard_safe = not hard_reasons
+    if upgraded or unsupported_result or unsupported_fact or not hard_safe:
         logger.info("Restored source wording for over-claimed bullet")
         reasons = []
         if upgraded:
@@ -266,6 +423,7 @@ def _ground_bullet_value(
             reasons.append("unsupported_result_claim")
         if unsupported_fact:
             reasons.append("unsupported_named_fact")
+        reasons.extend(reason for reason in hard_reasons if reason not in reasons)
         trace_event(
             "bullet_grounding",
             path=path,
@@ -354,7 +512,7 @@ def _ground_optimizer_output(
                 # word in the rewrite is grounded. Always validate the emitted
                 # wording; keep provenance only after this check succeeds.
                 safe_value, status = _ground_bullet_value(value, sentences, path=path)
-                if status != "accepted" and bullet_index < len(before_bullets):
+                if status not in {"accepted", "trimmed"} and bullet_index < len(before_bullets):
                     safe_value = str(before_bullets[bullet_index] or "").strip()
                     logger.info(
                         "Reverted unsupported optimizer patch at %s[%d].bullets[%d]",
@@ -587,6 +745,56 @@ def _filter_trusted_rewrites(
         if path in expected_outputs
         and _bullet_path_value(resume, path) == str(expected_outputs[path]).strip()
     }
+
+
+def _expand_optimizer_provenance(
+    path: str,
+    source_value: str,
+    before_optimizer: CanonicalResume,
+    atom_provenance: dict[str, str],
+) -> str:
+    """Lift grouped atom provenance back to every original source sentence."""
+
+    source_parts = [
+        part.strip()
+        for part in re.split(r"[\r\n]+", str(source_value or ""))
+        if part.strip()
+    ]
+    if len(source_parts) <= 1:
+        return atom_provenance.get(path, str(source_value or "").strip())
+
+    match = re.fullmatch(
+        r"(experience|research|activities|projects)\[(\d+)]\.bullets\[\d+]",
+        str(path or ""),
+    )
+    if not match:
+        return "\n".join(source_parts)
+    section, record_index_text = match.groups()
+    record_index = int(record_index_text)
+    records = getattr(before_optimizer, section)
+    if record_index >= len(records):
+        return "\n".join(source_parts)
+
+    original_bullets = [
+        str(item or "").strip() for item in records[record_index].bullets
+    ]
+    used_positions: set[int] = set()
+    expanded: list[str] = []
+    for source_part in source_parts:
+        matched_position = next((
+            index
+            for index, bullet in enumerate(original_bullets)
+            if index not in used_positions and bullet == source_part
+        ), None)
+        if matched_position is None:
+            expanded.append(source_part)
+            continue
+        used_positions.add(matched_position)
+        original_path = (
+            f"{section}[{record_index}].bullets[{matched_position}]"
+        )
+        expanded.append(atom_provenance.get(original_path, source_part))
+    return "\n".join(dict.fromkeys(item for item in expanded if item))
 
 
 _COVERAGE_LAYOUT_LABEL = re.compile(
@@ -2697,6 +2905,7 @@ def _fallback_is_structurally_safe(
 class _RecoveryStats:
     filled_fields: int = 0
     appended_bullets: int = 0
+    expanded_bullets: int = 0
     appended_records: int = 0
     appended_values: int = 0
 
@@ -2705,6 +2914,7 @@ class _RecoveryStats:
         return (
             self.filled_fields
             + self.appended_bullets
+            + self.expanded_bullets
             + self.appended_records
             + self.appended_values
         )
@@ -2715,6 +2925,62 @@ def _identity_value(value: str) -> str:
         r"[^\w\u4e00-\u9fff]+",
         "",
         unicodedata.normalize("NFKC", str(value or "")).casefold(),
+    )
+
+
+def _resume_claim_fingerprints(resume: CanonicalResume) -> set[tuple[str, str]]:
+    """Fingerprint candidate claims so completeness repair cannot delete any."""
+
+    claims: set[tuple[str, str]] = set()
+
+    def add(section: str, value) -> None:
+        normalized = _identity_value(value)
+        if normalized:
+            claims.add((section, normalized))
+
+    for field in ("name", "phone", "email", "work_experience"):
+        add(f"meta.{field}", getattr(resume.meta, field))
+    # Summary is a deterministic projection of the structured claims below;
+    # it may legitimately choose a stronger recovered achievement.
+    section_fields = {
+        "education": ("school", "degree", "major", "period"),
+        "experience": ("organization", "role", "period"),
+        "research": ("institution", "topic", "period"),
+        "activities": ("organization", "role", "period"),
+        "projects": ("name", "organization", "role", "period"),
+    }
+    for section, fields in section_fields.items():
+        for record in getattr(resume, section):
+            for field in fields:
+                add(f"{section}.{field}", getattr(record, field))
+            if hasattr(record, "bullets"):
+                for bullet in record.bullets:
+                    add(f"{section}.bullets", bullet)
+    for skill in resume.skills.items:
+        add("skills", skill.name)
+    for section in (
+        "awards", "publications", "patents", "certifications", "training", "teaching",
+    ):
+        for value in getattr(resume, section):
+            add(section, value)
+    for title, values in resume.additional_sections.items():
+        for value in values:
+            add(f"additional_sections.{title}", value)
+    return claims
+
+
+def _resume_claims_are_preserved(
+    before: CanonicalResume,
+    after: CanonicalResume,
+) -> bool:
+    """Allow an old claim to gain exact source detail, never to disappear."""
+
+    after_by_section: dict[str, list[str]] = {}
+    for section, value in _resume_claim_fingerprints(after):
+        after_by_section.setdefault(section, []).append(value)
+    return all(
+        any(value in candidate for candidate in after_by_section.get(section, []))
+        for section, value in _resume_claim_fingerprints(before)
     )
 
 
@@ -2782,11 +3048,216 @@ def _bullet_is_represented(
             continue
         if source_value == claim_value:
             return True
-        if len(source_value) >= 6 and (
-            source_value in claim_value or claim_value in source_value
-        ):
+        # Coverage is directional: an existing short clause does not represent
+        # a longer source sentence that contains additional duties or results.
+        # The reverse check used to suppress recovery for compact OCR lines such
+        # as ``负责沟通、调研、分析、输出PRD`` as soon as ``负责沟通`` survived.
+        if len(source_value) >= 6 and source_value in claim_value:
+            return True
+        source_anchors = {
+            item.casefold() for item in _COVERAGE_ANCHOR.findall(source_bullet)
+        }
+        claim_anchors = {
+            item.casefold() for item in _COVERAGE_ANCHOR.findall(claim)
+        }
+        if source_anchors and not source_anchors.issubset(claim_anchors):
+            continue
+        source_bigrams = _coverage_bigrams(source_bullet)
+        recall = len(source_bigrams & _coverage_bigrams(claim)) / max(
+            1, len(source_bigrams)
+        )
+        if recall >= 0.62:
             return True
     return False
+
+
+_RECORD_FIELD_PATH = re.compile(
+    r"^(experience|research|activities|projects)\[(\d+)\]\."
+)
+
+
+def _clean_recovered_source_bullet(value: str) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    text = re.sub(r"^(?:[-*•·▪◦]\s*|\d{1,3}(?:[.、)])\s*)", "", text)
+    return text.strip(" \t。；;")
+
+
+def _coherent_recovery_bullets(
+    source_text: str,
+    missing_units: list[dict[str, str]],
+) -> list[str]:
+    """Keep audit units fine-grained but recover readable source clauses."""
+
+    missing_values = [
+        _identity_value(unit.get("match_text", ""))
+        for unit in missing_units
+        if _identity_value(unit.get("match_text", ""))
+    ]
+    coherent = [
+        _clean_recovered_source_bullet(value)
+        for value in re.split(r"[。；;]+", str(source_text or ""))
+    ]
+    return list(dict.fromkeys(
+        value for value in coherent
+        if len(_identity_value(value)) >= 6
+        and any(missing in _identity_value(value) for missing in missing_values)
+    ))
+
+
+def _recover_missing_record_facts(
+    resume: CanonicalResume,
+    source,
+    bindings,
+) -> tuple[CanonicalResume, _RecoveryStats, set[str]]:
+    """Restore omitted record-body facts from an auditable source ledger.
+
+    Recovery is intentionally narrower than the deterministic parser fallback:
+    it never creates a record and never guesses across records.  A missing
+    source block is attached only when evidence already maps that source record
+    to exactly one output record, or when both sides contain one unambiguous
+    record.  The recovered wording is copied from candidate evidence, never JD.
+    """
+
+    units = source_fact_units(source)
+    if not units:
+        return resume, _RecoveryStats(), set()
+    _, missing_ids = measure_source_coverage(
+        source,
+        bindings,
+        allow_distributed=True,
+    )
+    missing = set(missing_ids)
+    if not missing:
+        return resume, _RecoveryStats(), set()
+
+    eligible = candidate_blocks(source)
+    blocks_by_id = {block.block_id: block for block in eligible}
+    block_targets: dict[tuple[str, str], set[int]] = {}
+    record_targets: dict[tuple[str, str], set[int]] = {}
+    record_target_evidence: dict[tuple[str, int], dict[int, set[str]]] = {}
+    for binding in bindings:
+        match = _RECORD_FIELD_PATH.match(str(binding.path or ""))
+        if match is None:
+            continue
+        section, index_text = match.groups()
+        index = int(index_text)
+        # A record-level optimizer rewrite may bind through several original
+        # source blocks.  Every linked block contributes record ownership; using
+        # only the primary block left later facts with no safe recovery target.
+        for block_id in binding.block_ids or [binding.block_id]:
+            block = blocks_by_id.get(str(block_id or ""))
+            if block is None:
+                continue
+            if block.section_hint and block.section_hint != section:
+                continue
+            block_targets.setdefault((section, block.block_id), set()).add(index)
+            if block.record_id:
+                path = str(binding.path or "")
+                priority = 3 if path.endswith(".period") else 2 if ".bullets[" in path else 1
+                record_target_evidence.setdefault((section, index), {}).setdefault(
+                    priority,
+                    set(),
+                ).add(block.record_id)
+    for (section, index), by_priority in record_target_evidence.items():
+        # Periods and already-grounded bullets identify record ownership more
+        # reliably than repeated employer/title strings.  Using every identity
+        # binding equally made two jobs at the same company contaminate each
+        # other's target set and blocked otherwise safe recovery.
+        strongest_ids = by_priority[max(by_priority)]
+        if len(strongest_ids) != 1:
+            continue
+        record_id = next(iter(strongest_ids))
+        record_targets.setdefault((section, record_id), set()).add(index)
+
+    missing_by_block: dict[str, list[dict[str, str]]] = {}
+    for unit in units:
+        if unit.get("unit_id") not in missing:
+            continue
+        if unit.get("section_hint") not in {
+            "experience", "research", "activities", "projects",
+        }:
+            continue
+        if unit.get("record_body") != "true":
+            continue
+        missing_by_block.setdefault(unit["block_id"], []).append(unit)
+
+    merged = resume.model_copy(deep=True)
+    changed_paths: set[str] = set()
+    recovered_blocks: list[str] = []
+    appended_bullets = 0
+    expanded_bullets = 0
+    for block_id, block_units in missing_by_block.items():
+        block = blocks_by_id.get(block_id)
+        if block is None or block.section_hint not in {
+            "experience", "research", "activities", "projects",
+        }:
+            continue
+        section = str(block.section_hint)
+        records = getattr(merged, section)
+        if not records:
+            continue
+
+        targets = set(block_targets.get((section, block_id), set()))
+        if block.record_id:
+            targets.update(record_targets.get((section, block.record_id), set()))
+        if not targets and len(records) == 1:
+            source_record_ids = {
+                item.record_id
+                for item in eligible
+                if item.section_hint == section
+                and item.record_id
+                and _looks_like_record_body(item.text)
+            }
+            if block.record_id and source_record_ids == {block.record_id}:
+                targets.add(0)
+        if len(targets) != 1:
+            continue
+        record_index = next(iter(targets))
+        if record_index >= len(records):
+            continue
+        record = records[record_index]
+
+        recovery_bullets = [
+            value
+            for value in _coherent_recovery_bullets(block.text, block_units)
+            if not _bullet_is_represented(value, list(record.bullets))
+        ]
+        if not recovery_bullets:
+            continue
+        for source_bullet in recovery_bullets:
+            source_value = _identity_value(source_bullet)
+            prefix_index = next((
+                bullet_index
+                for bullet_index, existing in enumerate(record.bullets)
+                if 6 <= len(_identity_value(existing)) < len(source_value)
+                and _identity_value(existing) in source_value
+            ), None)
+            if prefix_index is not None:
+                # Expand an already-retained short prefix in place. Appending
+                # the complete source line created duplicate openings and left
+                # quality dependent on whether the LLM happened to consolidate
+                # them. Exact containment makes this deterministic and lossless.
+                record.bullets[prefix_index] = source_bullet
+                changed_paths.add(f"{section}[{record_index}].bullets[{prefix_index}]")
+                expanded_bullets += 1
+                continue
+            record.bullets.append(source_bullet)
+            changed_paths.add(
+                f"{section}[{record_index}].bullets[{len(record.bullets) - 1}]"
+            )
+            appended_bullets += 1
+        recovered_blocks.append(block_id)
+
+    if recovered_blocks:
+        trace_event(
+            "source_fact_ledger_recovery",
+            recovered_blocks=recovered_blocks,
+            changed_paths=sorted(changed_paths),
+        )
+    return merged, _RecoveryStats(
+        appended_bullets=appended_bullets,
+        expanded_bullets=expanded_bullets,
+    ), changed_paths
 
 
 def _merge_source_recovery(
@@ -3082,7 +3553,8 @@ def run_v2_pipeline(
         # Rank first so optimizer change paths still point at the final bullet
         # positions exposed by the API.
         resume = _rank_resume_content(resume, jd_text or resume.meta.target_role)
-        resume, trusted_rewrites = _atomize_resume_bullets(resume)
+        resume, atom_provenance = _atomize_resume_bullets(resume)
+        trusted_rewrites = dict(atom_provenance)
         trusted_outputs = {
             path: value
             for path in trusted_rewrites
@@ -3094,7 +3566,12 @@ def run_v2_pipeline(
             optimization = optimize_resume_with_provenance(resume, jd_text)
             resume = optimization.resume
             for path, source_value in optimization.trusted_rewrites.items():
-                trusted_rewrites[path] = trusted_rewrites.get(path, source_value)
+                trusted_rewrites[path] = _expand_optimizer_provenance(
+                    path,
+                    source_value,
+                    before_optimizer,
+                    atom_provenance,
+                )
                 output_value = _bullet_path_value(resume, path)
                 if output_value is not None:
                     trusted_outputs[path] = output_value
@@ -3136,6 +3613,44 @@ def run_v2_pipeline(
                 trusted_rewrites=trusted_rewrites,
             )
             evidence_removed.extend(second_removed)
+        before_ledger_coverage, _ = _deterministic_source_coverage(
+            evidence_source,
+            evidence_bindings,
+        )
+        before_ledger_resume = resume.model_copy(deep=True)
+        ledger_resume, ledger_recovery, changed_paths = _recover_missing_record_facts(
+            resume,
+            evidence_source,
+            evidence_bindings,
+        )
+        if ledger_recovery.total:
+            ledger_trusted = dict(trusted_rewrites)
+            for path in changed_paths:
+                ledger_trusted.pop(path, None)
+            ledger_resume, ledger_bindings, ledger_removed = enforce_resume_evidence(
+                ledger_resume,
+                evidence_source,
+                trusted_rewrites=ledger_trusted,
+            )
+            ledger_coverage, _ = _deterministic_source_coverage(
+                evidence_source,
+                ledger_bindings,
+            )
+            if (
+                ledger_coverage > before_ledger_coverage
+                and _resume_claims_are_preserved(before_ledger_resume, ledger_resume)
+            ):
+                resume = ledger_resume
+                evidence_bindings = ledger_bindings
+                trusted_rewrites = ledger_trusted
+                evidence_removed.extend(ledger_removed)
+                logger.info(
+                    "V2 | Query fact-ledger recovery: %.1f%% -> %.1f%%; appended=%d expanded=%d",
+                    before_ledger_coverage * 100,
+                    ledger_coverage * 100,
+                    ledger_recovery.appended_bullets,
+                    ledger_recovery.expanded_bullets,
+                )
         resume = _compact_canonical(resume)
         trusted_rewrites = _filter_trusted_rewrites(
             resume, trusted_rewrites, trusted_outputs,
@@ -3288,6 +3803,52 @@ def run_v2_pipeline(
                     )
         except Exception as exc:
             logger.warning("V2 | Pre-optimizer source fallback failed: %s", exc)
+
+    # Recover record-owned source facts before wording optimization.  The old
+    # post-optimizer-only placement preserved completeness, but the restored raw
+    # clause never participated in record-level consolidation and therefore
+    # looked visibly tacked on.  This pass is evidence-gated and cannot create
+    # records or move a fact across source record boundaries.
+    pre_ledger_bindings = bind_resume_evidence(result.resume, source)
+    pre_ledger_coverage, _ = _deterministic_source_coverage(
+        source,
+        pre_ledger_bindings,
+    )
+    pre_ledger_resume = result.resume.model_copy(deep=True)
+    recovered_resume, pre_ledger_recovery, _ = _recover_missing_record_facts(
+        result.resume,
+        source,
+        pre_ledger_bindings,
+    )
+    if pre_ledger_recovery.total:
+        recovered_resume, recovered_bindings, recovered_removed = enforce_resume_evidence(
+            recovered_resume,
+            source,
+            allow_reordered_record_bullets=True,
+        )
+        recovered_resume = _compact_canonical(recovered_resume)
+        recovered_bindings = bind_resume_evidence(recovered_resume, source)
+        recovered_coverage, _ = _deterministic_source_coverage(
+            source,
+            recovered_bindings,
+        )
+        if (
+            recovered_coverage > pre_ledger_coverage
+            and _resume_claims_are_preserved(pre_ledger_resume, recovered_resume)
+        ):
+            result.resume = recovered_resume
+            result.evidence_bindings = recovered_bindings
+            result.changes.extend(
+                Change(path=path, action="remove", reason="No candidate evidence binding")
+                for path in recovered_removed
+            )
+            logger.warning(
+                "V2 | Recovered record facts before optimizer: %.1f%% -> %.1f%%; appended=%d expanded=%d",
+                pre_ledger_coverage * 100,
+                recovered_coverage * 100,
+                pre_ledger_recovery.appended_bullets,
+                pre_ledger_recovery.expanded_bullets,
+            )
     logger.info("V2 | Verifier done: %d edu, %d exp, %d res, %d changes (%.1fs)",
                 len(result.resume.education), len(result.resume.experience),
                 len(result.resume.research), len(result.changes),
@@ -3313,7 +3874,12 @@ def run_v2_pipeline(
             # A rewritten atom binds through the original compound source
             # bullet when atomization created it; otherwise use the optimizer's
             # verified pre-edit wording.
-            trusted_rewrites[path] = atom_provenance.get(path, source_value)
+            trusted_rewrites[path] = _expand_optimizer_provenance(
+                path,
+                source_value,
+                before_optimizer,
+                atom_provenance,
+            )
             output_value = _bullet_path_value(result.resume, path)
             if output_value is not None:
                 trusted_outputs[path] = output_value
@@ -3346,7 +3912,7 @@ def run_v2_pipeline(
     trusted_rewrites = _filter_trusted_rewrites(
         result.resume, trusted_rewrites, trusted_outputs,
     )
-    result.resume, _, evidence_removed = enforce_resume_evidence(
+    result.resume, post_gate_bindings, evidence_removed = enforce_resume_evidence(
         result.resume,
         source,
         trusted_rewrites=trusted_rewrites,
@@ -3361,6 +3927,54 @@ def run_v2_pipeline(
         Change(path=path, action="remove", reason="No candidate evidence binding")
         for path in evidence_removed
     )
+    before_ledger_coverage, _ = _deterministic_source_coverage(
+        source,
+        post_gate_bindings,
+    )
+    before_ledger_resume = result.resume.model_copy(deep=True)
+    ledger_resume, ledger_recovery, changed_paths = _recover_missing_record_facts(
+        result.resume,
+        source,
+        post_gate_bindings,
+    )
+    if ledger_recovery.total:
+        ledger_trusted = dict(trusted_rewrites)
+        for path in changed_paths:
+            ledger_trusted.pop(path, None)
+        ledger_resume, ledger_bindings, ledger_removed = enforce_resume_evidence(
+            ledger_resume,
+            source,
+            trusted_rewrites=ledger_trusted,
+            allow_reordered_record_bullets=True,
+        )
+        ledger_resume = _compact_canonical(ledger_resume)
+        ledger_bindings = bind_resume_evidence(
+            ledger_resume,
+            source,
+            trusted_rewrites=ledger_trusted,
+        )
+        ledger_coverage, _ = _deterministic_source_coverage(
+            source,
+            ledger_bindings,
+        )
+        if (
+            ledger_coverage > before_ledger_coverage
+            and _resume_claims_are_preserved(before_ledger_resume, ledger_resume)
+        ):
+            result.resume = ledger_resume
+            result.evidence_bindings = ledger_bindings
+            trusted_rewrites = ledger_trusted
+            result.changes.extend(
+                Change(path=path, action="remove", reason="No candidate evidence binding")
+                for path in ledger_removed
+            )
+            logger.warning(
+                "V2 | Fact-ledger recovery: %.1f%% -> %.1f%%; appended=%d expanded=%d",
+                before_ledger_coverage * 100,
+                ledger_coverage * 100,
+                ledger_recovery.appended_bullets,
+                ledger_recovery.expanded_bullets,
+            )
     result.resume = _compact_canonical(result.resume)
     trusted_rewrites = _filter_trusted_rewrites(
         result.resume, trusted_rewrites, trusted_outputs,

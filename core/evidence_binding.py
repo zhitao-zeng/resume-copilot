@@ -17,7 +17,7 @@ _SOURCE_HEADINGS = {
     "个人信息", "基本信息", "联系方式", "个人总结", "个人简介", "职业概述", "自我评价",
     "教育经历", "教育背景", "学历信息",
     "工作经历", "实习经历", "任职经历", "职业经历", "科研经历", "研究经历", "实验室经历",
-    "项目经历", "项目经验", "课程项目", "个人项目", "开源项目", "校园经历", "社团经历",
+    "项目经历", "项目经验", "课程项目", "个人项目", "开源项目", "校园经历", "社团经历", "组织经历",
     "志愿经历", "社会实践", "学生工作", "专业技能", "技能清单", "技术栈", "工具", "语言能力",
     "荣誉奖项", "荣誉与奖项", "获奖经历", "奖项", "论文", "论文发表", "论文成果", "学术成果",
     "出版物", "专利", "专利成果", "证书", "证书与资质", "职业资格", "执业资格", "执照",
@@ -143,6 +143,7 @@ def _bind(path: str, value: str, blocks: list[SourceBlock], *, minimum: float = 
     return EvidenceBinding(
         path=path,
         block_id=block.block_id,
+        block_ids=[block.block_id],
         quote=quote,
         claim=str(value).strip(),
         mode=mode,
@@ -170,12 +171,33 @@ def _bind_with_provenance(
         if trusted_rewrites else ""
     )
     if source_value:
-        source_binding = _bind(path, source_value, blocks, minimum=minimum)
-        if source_binding is not None:
-            return source_binding.model_copy(update={
+        # Record-level optimization can combine several already-grounded
+        # bullets. Newlines are an internal provenance separator rather than
+        # user-facing content. Every component must independently bind; a
+        # partial match must never make the whole rewrite trusted.
+        source_parts = [
+            part.strip()
+            for part in re.split(r"[\r\n]+", source_value)
+            if part.strip()
+        ]
+        source_bindings = [
+            _bind(path, part, blocks, minimum=minimum)
+            for part in source_parts
+        ]
+        if source_parts and all(item is not None for item in source_bindings):
+            resolved = [item for item in source_bindings if item is not None]
+            block_ids = list(dict.fromkeys(
+                block_id
+                for item in resolved
+                for block_id in (item.block_ids or [item.block_id])
+            ))
+            primary = resolved[0]
+            return primary.model_copy(update={
                 "claim": str(value or "").strip(),
                 "source_claim": source_value,
                 "mode": "rewritten",
+                "block_ids": block_ids,
+                "similarity": round(min(item.similarity for item in resolved), 4),
             })
         return None
     return _bind(path, value, blocks, minimum=minimum)
@@ -227,6 +249,10 @@ _RECORD_DUTY_START = re.compile(
     r"维护|优化|搭建|建立|开展|承担|提供|跟进|协调|带领|执行)"
 )
 _NON_ROLE_CONTEXT = re.compile(r"(?:熟悉|擅长|掌握|具备|负责|参与|协助|完成|开展)\s*$")
+_ROLE_HEADER_CONTEXT = re.compile(
+    r"(?:19|20)\d{2}|(?:大学|学院|学校|医院|公司|企业|集团|研究院|实验室|中心|"
+    r"部门|协会|学会|学生会|社团|委员会|事务所|律所|银行|政府|基金会|工作室|团队|基地)"
+)
 
 
 def _flexible_literal(value: str) -> str:
@@ -262,6 +288,7 @@ def _role_block_is_valid(block: SourceBlock, value: str) -> bool:
         return True
 
     duty = _RECORD_DUTY_START.search(text)
+    body_like = _looks_like_record_body(text)
     for occurrence in occurrences:
         prefix = text[max(0, occurrence.start() - 12):occurrence.start()]
         if _NON_ROLE_CONTEXT.search(prefix):
@@ -275,6 +302,16 @@ def _role_block_is_valid(block: SourceBlock, value: str) -> bool:
             # Delimited record headers such as ``公司｜运营专员｜日期``
             # legitimately contain titles that are also verbs in other prose.
             return True
+        if body_like or duty is not None:
+            # A leading duty noun followed by ``负责/参与/...`` is still body
+            # prose (for example ``需求分析，负责梳理...``), not a title.  Accept
+            # a title embedded in a compact body line only when the text before
+            # it also contains structural identity evidence such as an employer
+            # or a date.  This deliberately uses field grammar, not an industry
+            # title dictionary.
+            header_prefix = text[:occurrence.start()]
+            if not _ROLE_HEADER_CONTEXT.search(header_prefix):
+                continue
         if duty is not None and occurrence.start() >= duty.start():
             continue
         if block.section_hint in {"experience", "activities", "projects"}:
@@ -394,11 +431,18 @@ def _find_incoherent_records(
                     provenance_value = str(
                         (trusted_rewrites or {}).get(path, "") or ""
                     ).strip()
-                    matching_blocks = _strong_matching_blocks(
-                        provenance_value or str(value),
-                        blocks,
-                        minimum=0.30,
-                    )
+                    provenance_parts = [
+                        part.strip()
+                        for part in re.split(r"[\r\n]+", provenance_value)
+                        if part.strip()
+                    ] or [str(value)]
+                    matching_blocks = []
+                    for provenance_part in provenance_parts:
+                        matching_blocks.extend(_strong_matching_blocks(
+                            provenance_part,
+                            blocks,
+                            minimum=0.30,
+                        ))
                     bullet_scopes: set[str] = set()
                     for source_block in matching_blocks:
                         if source_block.section_hint:
@@ -796,6 +840,40 @@ _STRONG_FACT_ANCHOR = re.compile(
     r"[A-Za-z][A-Za-z0-9+.#/_-]{1,}",
     re.IGNORECASE,
 )
+_FACT_ACTION_SIGNAL = re.compile(
+    r"(?:负责|参与|主导|协助|支持|配合|推动|推进|组织|协调|带领|执行|"
+    r"设计|开发|构建|实现|制定|管理|运营|分析|统计|策划|培训|处理|研究|"
+    r"撰写|输出|交付|维护|优化|搭建|建立|开展|承担|提供|跟进|编制|制作|"
+    r"诊断|治疗|授课|教学|复核|检索|调研)"
+)
+_FACT_METHOD_SIGNAL = re.compile(
+    r"(?:通过|使用|采用|基于|借助|运用|利用|结合|按照|依托|围绕|"
+    r"经由|以[^，。；;]{1,20}(?:方式|方法|流程|标准|规范))"
+)
+_FACT_DELIVERABLE_SIGNAL = re.compile(
+    r"(?:输出|交付|完成|形成|上线|发布|落地|搭建|建立|制定|编制|制作|"
+    r"撰写|产出|提交|复核|验证|诊断|治疗|授课|培养)"
+)
+_FACT_RESULT_SIGNAL = re.compile(
+    r"(?:提升|提高|降低|减少|增长|缩短|节省|达到|达成|获得|获奖|录用|"
+    r"成交|销售率|准确率|转化率|留存率|满意度)"
+)
+
+
+def _fact_dimensions(value: str) -> str:
+    """Return generic evidence dimensions without an industry dictionary."""
+
+    dimensions: list[str] = []
+    for name, pattern in (
+        ("action", _FACT_ACTION_SIGNAL),
+        ("method", _FACT_METHOD_SIGNAL),
+        ("deliverable", _FACT_DELIVERABLE_SIGNAL),
+        ("result", _FACT_RESULT_SIGNAL),
+        ("anchor", _STRONG_FACT_ANCHOR),
+    ):
+        if pattern.search(value):
+            dimensions.append(name)
+    return ",".join(dimensions)
 
 
 def source_fact_units(source: SourceBundle) -> list[dict[str, str]]:
@@ -822,6 +900,9 @@ def source_fact_units(source: SourceBundle) -> list[dict[str, str]]:
                 "block_id": block.block_id,
                 "source_type": block.source_type,
                 "section_hint": block.section_hint or "",
+                "record_id": block.record_id or "",
+                "record_body": "true" if _looks_like_record_body(block.text) else "",
+                "dimensions": _fact_dimensions(part),
                 "text": display,
                 "match_text": part,
             })
@@ -891,10 +972,12 @@ def measure_source_coverage(
     claims_by_block: dict[str, list[str]] = {}
     legacy_covered: set[str] = set()
     for binding in bindings:
-        legacy_covered.add(binding.block_id)
+        linked_block_ids = binding.block_ids or [binding.block_id]
+        legacy_covered.update(linked_block_ids)
         coverage_claim = str(binding.source_claim or binding.claim).strip()
         if coverage_claim:
-            claims_by_block.setdefault(binding.block_id, []).append(coverage_claim)
+            for block_id in linked_block_ids:
+                claims_by_block.setdefault(block_id, []).append(coverage_claim)
     missing: list[str] = []
     for unit in units:
         block_id = unit["block_id"]

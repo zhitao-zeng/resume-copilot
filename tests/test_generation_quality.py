@@ -1201,6 +1201,122 @@ def test_optimizer_provenance_preserves_reviewed_low_overlap_rewrite():
     assert missing == []
 
 
+def test_optimizer_regroups_one_record_into_a_lossless_achievement_sentence():
+    from resume_optimizer import optimize_resume_with_provenance
+
+    original_bullets = [
+        "负责梳理客户需求",
+        "通过10次用户访谈收集反馈",
+        "输出需求优先级清单",
+    ]
+    resume = CanonicalResume.model_validate({
+        "experience": [{
+            "organization": "甲公司",
+            "role": "产品经理",
+            "period": "2022.01-2023.01",
+            "bullets": original_bullets,
+        }],
+    })
+    combined = "负责梳理客户需求，通过10次用户访谈收集反馈并输出需求优先级清单"
+    response = json.dumps({
+        "experience": [{
+            "index": 0,
+            "bullets": [{
+                "text": combined,
+                "source_indices": [0, 1, 2],
+            }],
+        }],
+    }, ensure_ascii=False)
+    with patch("resume_optimizer.llm_enabled", return_value=True), patch(
+        "resume_optimizer.call_llm_text", return_value=response,
+    ), patch(
+        "resume_optimizer.review_entailment_batch", return_value=[True],
+    ):
+        outcome = optimize_resume_with_provenance(resume, "产品经理")
+
+    path = "experience[0].bullets[0]"
+    assert outcome.resume.experience[0].bullets == [combined]
+    assert outcome.trusted_rewrites[path] == "\n".join(original_bullets)
+
+    source = build_source_bundle(
+        "工作经历\n"
+        "甲公司｜产品经理｜2022.01-2023.01\n"
+        "负责梳理客户需求。\n"
+        "通过10次用户访谈收集反馈。\n"
+        "输出需求优先级清单。",
+        "",
+        "",
+    )
+    gated, bindings, removed = enforce_resume_evidence(
+        outcome.resume,
+        source,
+        trusted_rewrites=outcome.trusted_rewrites,
+    )
+    assert removed == []
+    assert gated.experience[0].bullets == [combined]
+    binding = next(item for item in bindings if item.path == path)
+    assert len(binding.block_ids) == 3
+
+
+def test_optimizer_rejects_a_grouped_record_when_any_source_bullet_is_missing():
+    from resume_optimizer import optimize_resume_with_provenance
+
+    original_bullets = [
+        "负责梳理客户需求",
+        "通过10次用户访谈收集反馈",
+        "输出需求优先级清单",
+    ]
+    resume = CanonicalResume.model_validate({
+        "experience": [{"bullets": original_bullets}],
+    })
+    response = json.dumps({
+        "experience": [{
+            "index": 0,
+            "bullets": [{
+                "text": "负责梳理客户需求，通过10次用户访谈收集反馈",
+                "source_indices": [0, 1],
+            }],
+        }],
+    }, ensure_ascii=False)
+    with patch("resume_optimizer.llm_enabled", return_value=True), patch(
+        "resume_optimizer.call_llm_text", return_value=response,
+    ):
+        outcome = optimize_resume_with_provenance(resume, "产品经理")
+
+    assert outcome.resume.experience[0].bullets == original_bullets
+    assert outcome.trusted_rewrites == {}
+
+
+def test_optimizer_keeps_unchanged_sibling_inside_an_atomic_grouped_record():
+    from resume_optimizer import optimize_resume_with_provenance
+
+    original_bullets = [
+        "负责梳理客户需求通过10次用户访谈收集反馈",
+        "协调研发和设计团队跟进需求落地",
+        "输出需求优先级清单",
+    ]
+    resume = CanonicalResume.model_validate({
+        "experience": [{"bullets": original_bullets}],
+    })
+    combined = "负责通过10次用户访谈收集反馈，梳理客户需求并输出需求优先级清单"
+    response = json.dumps({
+        "experience": [{
+            "index": 0,
+            "bullets": [
+                {"text": combined, "source_indices": [0, 2]},
+                {"text": original_bullets[1], "source_indices": [1]},
+            ],
+        }],
+    }, ensure_ascii=False)
+    with patch("resume_optimizer.llm_enabled", return_value=True), patch(
+        "resume_optimizer.call_llm_text", return_value=response,
+    ):
+        outcome = optimize_resume_with_provenance(resume, "产品经理")
+
+    assert outcome.resume.experience[0].bullets == [combined, original_bullets[1]]
+    assert len(outcome.trusted_rewrites) == 2
+
+
 def test_optimizer_reverts_high_risk_rewrite_when_semantic_review_rejects():
     from resume_optimizer import optimize_resume_with_provenance
 

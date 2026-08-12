@@ -222,6 +222,11 @@ class EvidenceBinding(BaseModel):
     model_config = ConfigDict(extra="forbid")
     path: str
     block_id: str
+    # A polished achievement may faithfully regroup several source bullets
+    # from the same experience record. ``block_id`` stays as the primary
+    # binding for backward compatibility, while this list retains every
+    # source block used by that one final claim.
+    block_ids: list[str] = Field(default_factory=list)
     quote: str
     # Final claim text is kept internally so reverse coverage can verify which
     # source fact units actually survived, rather than treating one binding as
