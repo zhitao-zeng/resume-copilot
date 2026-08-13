@@ -8,4 +8,4 @@ inferenceVolumeMounts:
 
 inferenceImage:
   repository: "harbor-contest.4pd.io/zengzhitao/resume-copilot"
-  tag: "f507820-post-guard-consistency"
+  tag: "5ff1b7d-grounded-core"
