@@ -9,8 +9,10 @@ import re
 import unicodedata
 from collections.abc import Mapping
 
+from atomic_fact_audit import atomize_claim_text, match_atomic_claim
+from diagnostic_trace import trace_event
 from source_adapter import _is_section_heading, _looks_like_record_body, candidate_blocks
-from v2_schemas import CanonicalResume, EvidenceBinding, SourceBlock, SourceBundle
+from v2_schemas import CanonicalResume, EvidenceBinding, FactUnit, SourceBlock, SourceBundle
 
 
 _SOURCE_HEADINGS = {
@@ -205,37 +207,113 @@ def _bind_with_provenance(
         ]
         if source_parts and all(item is not None for item in source_bindings):
             resolved = [item for item in source_bindings if item is not None]
-            block_ids = list(dict.fromkeys(
-                block_id
-                for item in resolved
-                for block_id in (item.block_ids or [item.block_id])
-            ))
-            fact_ids = list(dict.fromkeys(
-                fact_id
-                for item in resolved
-                for fact_id in item.fact_ids
-            ))
-            source_spans = []
-            seen_spans: set[tuple[str, int, int]] = set()
-            for item in resolved:
-                for span in item.source_spans:
-                    key = (span.source_id, span.char_start, span.char_end)
-                    if key in seen_spans:
-                        continue
-                    seen_spans.add(key)
-                    source_spans.append(span)
-            primary = resolved[0]
-            return primary.model_copy(update={
-                "claim": str(value or "").strip(),
-                "source_claim": source_value,
-                "mode": "rewritten",
-                "block_ids": block_ids,
-                "fact_ids": fact_ids,
-                "source_spans": source_spans,
-                "similarity": round(min(item.similarity for item in resolved), 4),
-            })
+            return _merge_bindings(
+                path,
+                value,
+                resolved,
+                source_claim=source_value,
+                mode="rewritten",
+            )
         return None
-    return _bind(path, value, blocks, minimum=minimum)
+    compound = _bind_exact_compound(path, value, blocks, minimum=minimum)
+    return compound or _bind(path, value, blocks, minimum=minimum)
+
+
+def _merge_bindings(
+    path: str,
+    value: str,
+    resolved: list[EvidenceBinding],
+    *,
+    source_claim: str,
+    mode: str,
+) -> EvidenceBinding:
+    block_ids = list(dict.fromkeys(
+        block_id
+        for item in resolved
+        for block_id in (item.block_ids or [item.block_id])
+    ))
+    fact_ids = list(dict.fromkeys(
+        fact_id
+        for item in resolved
+        for fact_id in item.fact_ids
+    ))
+    source_spans = []
+    seen_spans: set[tuple[str, int, int]] = set()
+    for item in resolved:
+        for span in item.source_spans:
+            key = (span.source_id, span.char_start, span.char_end)
+            if key in seen_spans:
+                continue
+            seen_spans.add(key)
+            source_spans.append(span)
+    primary = resolved[0]
+    return primary.model_copy(update={
+        "path": path,
+        "claim": str(value or "").strip(),
+        "source_claim": source_claim,
+        "mode": mode,
+        "block_ids": block_ids,
+        "fact_ids": fact_ids,
+        "source_spans": source_spans,
+        "similarity": round(min(item.similarity for item in resolved), 4),
+    })
+
+
+def _bind_exact_compound(
+    path: str,
+    value: str,
+    blocks: list[SourceBlock],
+    *,
+    minimum: float,
+) -> EvidenceBinding | None:
+    """Bind a claim assembled from exact clauses in one source record.
+
+    This is the deterministic counterpart to optimizer provenance.  It is
+    intentionally unavailable for fuzzy components or cross-record clauses.
+    """
+
+    parts = atomize_claim_text(value)
+    if len(parts) < 2:
+        return None
+    resolved = [
+        _bind(path, part, blocks, minimum=max(0.58, minimum))
+        for part in parts
+    ]
+    if not all(item is not None for item in resolved):
+        return None
+    bindings = [item for item in resolved if item is not None]
+    if any(
+        item.mode not in {"direct", "normalized"} and item.similarity < 0.78
+        for item in bindings
+    ):
+        return None
+    block_by_id = {block.block_id: block for block in blocks}
+    records = {
+        block_by_id[block_id].record_id
+        for item in bindings
+        for block_id in (item.block_ids or [item.block_id])
+        if block_id in block_by_id and block_by_id[block_id].record_id
+    }
+    if len(records) > 1:
+        return None
+    source_claim = "\n".join(dict.fromkeys(item.quote for item in bindings if item.quote))
+    generated_anchors = {
+        _normalize(item) for item in _STRONG_FACT_ANCHOR.findall(value) if _normalize(item)
+    }
+    source_anchors = {
+        _normalize(item)
+        for item in _STRONG_FACT_ANCHOR.findall(source_claim)
+        if _normalize(item)
+    }
+    if generated_anchors and not generated_anchors.issubset(source_anchors):
+        return None
+    return _merge_bindings(
+        path,
+        value,
+        bindings,
+        source_claim=source_claim,
+        mode="rewritten",
+    )
 
 
 def _strong_matching_blocks(
@@ -291,6 +369,22 @@ _ROLE_HEADER_CONTEXT = re.compile(
 _RELATION_ONLY_ROLE = re.compile(
     r"^(?:指导老师|指导教师|导师|项目导师|论文导师|推荐人|联系人)$",
     re.IGNORECASE,
+)
+_ORGANIZATION_FIELD_LABEL = re.compile(
+    r"(?:公司|单位|组织|机构|学校|院校|所属公司)\s*[:：]"
+)
+_ORGANIZATION_RELATION = re.compile(
+    r"(?:就职于|任职于|供职于|受雇于|在|于)\s*"
+)
+_NON_ORGANIZATION_VALUE = re.compile(
+    r"^(?:做过?|从事|担任|参与|负责|有|具备|完成|开展)"
+)
+_NON_ORGANIZATION_PREFIX = re.compile(
+    r"(?:做过?|从事|担任|参与|负责|有|具备|完成|开展)\s*$"
+)
+_ACTIVITY_ORGANIZATION_END = re.compile(
+    r"(?:协会|学会|学生会|社团|委员会|志愿队|服务队|部门|部|团队|中心|"
+    r"医院|学校|学院|大学)$"
 )
 
 
@@ -389,6 +483,87 @@ def _bind_role(
     return None
 
 
+def _organization_block_is_valid(block: SourceBlock, value: str) -> bool:
+    """Require organization syntax, not just a shared source substring.
+
+    Words such as ``小学`` and ``企业软件`` can be literal parts of a trial
+    lesson or domain-qualified sales title.  They become an organization only
+    when the source labels/relates them as one, places them in a structured
+    record header, or supplies them as a standalone organization row.
+    """
+
+    text = str(block.text or "").strip()
+    organization = str(value or "").strip()
+    if not text or not organization or _NON_ORGANIZATION_VALUE.search(organization):
+        return False
+    literal = _flexible_literal(organization)
+    occurrences = list(re.finditer(literal, text, re.IGNORECASE))
+    if not occurrences:
+        return False
+    if re.search(
+        rf"{_ORGANIZATION_FIELD_LABEL.pattern}\s*{literal}",
+        text,
+        re.IGNORECASE,
+    ):
+        return True
+    if re.search(
+        rf"{_ORGANIZATION_RELATION.pattern}{literal}",
+        text,
+        re.IGNORECASE,
+    ):
+        return True
+    if _normalize(text) == _normalize(organization):
+        return True
+
+    duty = _RECORD_DUTY_START.search(text)
+    for occurrence in occurrences:
+        prefix = text[:occurrence.start()].rstrip()
+        suffix = text[occurrence.end():].lstrip()
+        if _NON_ORGANIZATION_PREFIX.search(prefix):
+            continue
+        if prefix.endswith(("|", "｜")) or suffix.startswith(("|", "｜")):
+            return block.section_hint in {
+                "experience", "activities", "projects", "research",
+            }
+        # A date-leading compact row is a structural identity record.  The
+        # organization must precede the first duty clause; otherwise a company
+        # mentioned in a result/bullet cannot become the current employer.
+        if _date_signature(prefix) and (duty is None or occurrence.start() < duty.start()):
+            return True
+        if (
+            block.section_hint == "activities"
+            and block.record_id
+            and occurrence.start() == 0
+            and not _looks_like_record_body(text)
+            and (
+                bool(text[occurrence.end():occurrence.end() + 1].isspace())
+                or bool(_ACTIVITY_ORGANIZATION_END.search(organization))
+            )
+        ):
+            # Campus/volunteer headers are often ``组织 角色`` or a compact
+            # department-title row without dates.  Restrict this relaxation to
+            # the activities section so ``小学语文试讲`` in a project cannot be
+            # reinterpreted as an employer.
+            return True
+    return False
+
+
+def _bind_organization(
+    path: str,
+    value: str,
+    blocks: list[SourceBlock],
+    *,
+    minimum: float = 0.65,
+) -> EvidenceBinding | None:
+    for block in _strong_matching_blocks(value, blocks, minimum=minimum):
+        if not _organization_block_is_valid(block, value):
+            continue
+        binding = _bind(path, value, [block], minimum=minimum)
+        if binding is not None:
+            return binding
+    return None
+
+
 def _record_scope_key(
     block: SourceBlock,
     source: SourceBundle,
@@ -462,6 +637,11 @@ def _find_incoherent_records(
                     matching_blocks = [
                         block for block in matching_blocks
                         if _role_block_is_valid(block, value)
+                    ]
+                elif field == "organization":
+                    matching_blocks = [
+                        block for block in matching_blocks
+                        if _organization_block_is_valid(block, value)
                     ]
                 field_scopes: set[str] = set()
                 for source_block in matching_blocks:
@@ -575,6 +755,11 @@ def _possible_record_scopes(
         matching = _strong_matching_blocks(value, blocks, minimum=0.65)
         if field == "role":
             matching = [item for item in matching if _role_block_is_valid(item, value)]
+        elif field == "organization":
+            matching = [
+                item for item in matching
+                if _organization_block_is_valid(item, value)
+            ]
         scopes = {
             scope
             for item in matching
@@ -603,11 +788,17 @@ def _value_record_scopes(
     source: SourceBundle,
     blocks: list[SourceBlock],
     role: bool = False,
+    organization: bool = False,
     minimum: float = 0.65,
 ) -> set[str]:
     matching = _strong_matching_blocks(value, blocks, minimum=minimum)
     if role:
         matching = [item for item in matching if _role_block_is_valid(item, value)]
+    elif organization:
+        matching = [
+            item for item in matching
+            if _organization_block_is_valid(item, value)
+        ]
     return {
         scope
         for item in matching
@@ -656,6 +847,7 @@ def _anchored_record_scope(
             source=source,
             blocks=blocks,
             role=False,
+            organization=(field == "organization"),
         )
         for scope in scopes:
             scores[scope] = scores.get(scope, 0) + 8
@@ -686,6 +878,7 @@ def _anchored_record_scope(
             source=source,
             blocks=blocks,
             role=(field == "role"),
+            organization=(field == "organization"),
         )
         for scope in scopes:
             scores[scope] = scores.get(scope, 0) + 2
@@ -788,6 +981,8 @@ def bind_resume_evidence(
         binding = (
             _bind_role(path, value, blocks, minimum=minimum)
             if path.endswith(".role")
+            else _bind_organization(path, value, blocks, minimum=minimum)
+            if path.endswith(".organization")
             else _bind_with_provenance(
                 path,
                 value,
@@ -833,6 +1028,177 @@ def bind_resume_evidence(
         for index, value in enumerate(items):
             add(f"additional_sections.{title}[{index}]", value, 0.65)
     return bindings
+
+
+def _facts_for_record_scope(
+    source: SourceBundle,
+    blocks: list[SourceBlock],
+    *,
+    section: str,
+    scope: str,
+) -> list[FactUnit]:
+    block_by_id = {block.block_id: block for block in blocks}
+    facts: list[FactUnit] = []
+    for fact in source.fact_units:
+        if not fact.fact_eligible or fact.source_type == "jd":
+            continue
+        block = block_by_id.get(fact.block_id)
+        if block is None or block.section_hint != section:
+            continue
+        if _record_scope_key(block, source, section) == scope:
+            facts.append(fact)
+    return facts
+
+
+def _facts_for_binding(
+    source: SourceBundle,
+    binding: EvidenceBinding | None,
+) -> list[FactUnit]:
+    if binding is None:
+        return []
+    fact_ids = set(binding.fact_ids)
+    block_ids = set(binding.block_ids or [binding.block_id])
+    return [
+        fact for fact in source.fact_units
+        if fact.fact_eligible
+        and fact.source_type != "jd"
+        and (fact.fact_id in fact_ids or fact.block_id in block_ids)
+    ]
+
+
+def _source_body_sentences(
+    source: SourceBundle,
+    blocks: list[SourceBlock],
+    *,
+    section: str,
+    scope: str,
+) -> list[str]:
+    result: list[str] = []
+    for block in blocks:
+        if block.section_hint != section:
+            continue
+        if _record_scope_key(block, source, section) != scope:
+            continue
+        text = str(block.text or "").strip()
+        duty = _RECORD_DUTY_START.search(text)
+        if duty is not None:
+            text = text[duty.start():].lstrip("，,。；;|｜ \t-•·▪◦")
+        elif not _looks_like_record_body(text):
+            continue
+        for sentence in re.split(r"[。；;\r\n]+", text):
+            value = sentence.strip("，,。；; \t-•·▪◦")
+            if len(_normalize(value)) >= 4:
+                result.append(value)
+    return list(dict.fromkeys(result))
+
+
+def _unique_source_fallback(value: str, candidates: list[str]) -> str:
+    target = _bigrams(value)
+    if not target:
+        return ""
+    def shared_literal_length(left: str, right: str) -> int:
+        first = _normalize(left)
+        second = _normalize(right)
+        for width in range(min(len(first), len(second)), 3, -1):
+            if any(first[index:index + width] in second for index in range(len(first) - width + 1)):
+                return width
+        return 0
+
+    ranked: list[tuple[float, float, int, str]] = []
+    for candidate in candidates:
+        source_bigrams = _bigrams(candidate)
+        if not source_bigrams:
+            continue
+        shared = len(target & source_bigrams)
+        ranked.append((
+            shared / max(1, len(target)),
+            shared / max(1, len(source_bigrams)),
+            shared_literal_length(value, candidate),
+            candidate,
+        ))
+    if not ranked:
+        return ""
+    ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    generated_coverage, source_recall, literal_length, best = ranked[0]
+    if not (
+        generated_coverage >= 0.42
+        or (generated_coverage >= 0.20 and source_recall >= 0.55)
+        or (generated_coverage >= 0.15 and literal_length >= 4)
+    ):
+        return ""
+    if len(ranked) > 1:
+        second = ranked[1]
+        if (
+            abs(generated_coverage - second[0]) < 0.05
+            and abs(source_recall - second[1]) < 0.08
+            and abs(literal_length - second[2]) <= 1
+        ):
+            return ""
+    return best
+
+
+def _repair_record_bullet(
+    value: str,
+    *,
+    path: str,
+    facts: list[FactUnit],
+    binding: EvidenceBinding | None,
+    source_fallbacks: list[str],
+) -> tuple[str, str] | None:
+    """Minimum-edit one bullet using only an explicit record fact allow-list."""
+
+    if not facts:
+        return None
+    fact_ids = {fact.fact_id for fact in facts}
+    scoped_binding = binding
+    if binding is not None and binding.fact_ids and not set(binding.fact_ids).issubset(fact_ids):
+        scoped_binding = None
+
+    if (
+        scoped_binding is not None
+        and scoped_binding.mode == "rewritten"
+        and scoped_binding.source_claim
+        and scoped_binding.similarity >= 0.75
+    ):
+        whole_match = match_atomic_claim(
+            value,
+            facts,
+            path=path,
+            binding=scoped_binding,
+        )
+        # This provenance exists only after the optimizer's deterministic hard
+        # gate and, for low-overlap wording, its semantic entailment review.
+        # Recheck immutable anchors and record ownership here, but do not undo
+        # an approved paraphrase merely because a single clause has low lexical
+        # overlap with the exact source sentence.
+        if whole_match.reason != "new_hard_anchor":
+            return str(value or "").strip(), "accepted_reviewed_rewrite"
+
+    clauses = atomize_claim_text(value)
+    if not clauses:
+        return "", "removed"
+    safe: list[str] = []
+    for clause in clauses:
+        match = match_atomic_claim(
+            clause,
+            facts,
+            path=path,
+            binding=scoped_binding,
+        )
+        if match.status == "supported" and clause not in safe:
+            safe.append(clause)
+    if len(safe) == len(clauses):
+        return str(value or "").strip(), "accepted"
+    if safe:
+        repaired = "，".join(safe)
+        repaired = re.sub(r"^(?:并且|并|同时|此外|另外)[，,\s]*", "", repaired)
+        repaired = repaired.rstrip("，,。；; ") + "。"
+        return repaired, "trimmed"
+
+    fallback = _unique_source_fallback(value, source_fallbacks)
+    if fallback:
+        return fallback.rstrip("，,。；; ") + "。", "restored"
+    return "", "removed"
 
 
 def enforce_resume_evidence(
@@ -893,14 +1259,14 @@ def enforce_resume_evidence(
     for section, fields in section_fields.items():
         records_to_remove: set[int] = set()
         for index, record in enumerate(getattr(gated, section)):
-            anchored_scope: str | None = None
-            if index in incoherent_records[section]:
-                anchored_scope = _anchored_record_scope(
-                    record,
-                    section=section,
-                    source=source,
-                    blocks=eligible_blocks,
-                )
+            strict_record_scope = index in incoherent_records[section]
+            anchored_scope = _anchored_record_scope(
+                record,
+                section=section,
+                source=source,
+                blocks=eligible_blocks,
+            )
+            if strict_record_scope:
                 if anchored_scope is None:
                     removed.append(f"{section}[{index}]")
                     records_to_remove.add(index)
@@ -910,6 +1276,7 @@ def enforce_resume_evidence(
                 value = str(getattr(record, field, "") or "").strip()
                 wrong_record = bool(
                     value
+                    and strict_record_scope
                     and anchored_scope
                     and anchored_scope not in _value_record_scopes(
                         value,
@@ -917,6 +1284,7 @@ def enforce_resume_evidence(
                         source=source,
                         blocks=eligible_blocks,
                         role=(field == "role"),
+                        organization=(field == "organization"),
                     )
                 )
                 if value and (path not in bound_paths or wrong_record):
@@ -934,12 +1302,70 @@ def enforce_resume_evidence(
                     minimum=0.30,
                     trusted_rewrites=trusted_rewrites,
                 )
+                primary_block = next((
+                    block for block in eligible_blocks
+                    if binding is not None and block.block_id == binding.block_id
+                ), None)
+                binding_is_unsectioned = bool(
+                    primary_block is not None and not primary_block.section_hint
+                )
+                record_facts = (
+                    _facts_for_binding(source, binding)
+                    if binding_is_unsectioned else (
+                        _facts_for_record_scope(
+                        source,
+                        eligible_blocks,
+                        section=section,
+                        scope=anchored_scope,
+                    )
+                        if anchored_scope else _facts_for_binding(source, binding)
+                    )
+                )
+                repair = _repair_record_bullet(
+                    str(bullet or ""),
+                    path=path,
+                    facts=record_facts,
+                    binding=binding,
+                    source_fallbacks=(
+                        _source_body_sentences(
+                            source,
+                            eligible_blocks,
+                            section=section,
+                            scope=anchored_scope,
+                        )
+                        if anchored_scope else []
+                    ),
+                )
+                repaired_bullet = str(bullet or "").strip()
+                repair_status = "not_applicable"
+                if repair is not None:
+                    repaired_bullet, repair_status = repair
+                    if repaired_bullet != str(bullet or "").strip():
+                        trace_event(
+                            "atomic_evidence_repair",
+                            path=path,
+                            before=str(bullet or "").strip(),
+                            after=repaired_bullet,
+                            status=repair_status,
+                            fact_ids=[fact.fact_id for fact in record_facts],
+                            record_scope=anchored_scope,
+                        )
+                    binding = (
+                        _bind_with_provenance(
+                            path,
+                            repaired_bullet,
+                            eligible_blocks,
+                            minimum=0.30,
+                            trusted_rewrites=trusted_rewrites,
+                        )
+                        if repaired_bullet else None
+                    )
                 provenance_value = str((trusted_rewrites or {}).get(path, "") or "").strip()
                 provenance_parts = [
                     part.strip()
                     for part in re.split(r"[\r\n]+", provenance_value)
                     if part.strip()
-                ] or [str(bullet)]
+                ] or [repaired_bullet]
                 bullet_scopes: set[str] = set()
                 for provenance_part in provenance_parts:
                     bullet_scopes.update(_value_record_scopes(
@@ -950,11 +1376,14 @@ def enforce_resume_evidence(
                         minimum=0.30,
                     ))
                 if binding is None or (
-                    anchored_scope and anchored_scope not in bullet_scopes
+                    strict_record_scope
+                    and anchored_scope
+                    and anchored_scope not in bullet_scopes
                 ):
                     removed.append(path)
                 else:
-                    kept_bullets.append(bullet)
+                    if repaired_bullet and repaired_bullet not in kept_bullets:
+                        kept_bullets.append(repaired_bullet)
             record.bullets = kept_bullets
 
         if records_to_remove:

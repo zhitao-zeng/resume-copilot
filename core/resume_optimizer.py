@@ -12,6 +12,7 @@ import logging
 import os
 import re
 from collections import Counter
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 from dataclasses import dataclass, field
@@ -20,7 +21,7 @@ from typing import Any
 from llm_gateway import LLMDeadlineExceeded, parse_json_content
 from server_runtime import call_llm_text, llm_enabled
 from semantic_guard import review_entailment_batch
-from v2_schemas import CanonicalResume
+from v2_schemas import CanonicalResume, EvidenceBinding
 from diagnostic_trace import trace_event
 
 logger = logging.getLogger(__name__)
@@ -98,6 +99,7 @@ OPTIMIZER_SYSTEM_PROMPT = """你是一位保守的简历编辑，只输出经历
 8. 保留每条原文的关键动作、对象、过程、方法、交付物和结果，不得压成空泛短句。
 9. 目标岗位只影响已有事实的排序和措辞，不是候选人事实来源。
 10. 输入中的 evidence_plan 是只读结构提示。先按同一事项分组，再按“情境（若原文有）→责任动作→方法/过程（若原文有）→交付物（若原文有）→结果（仅原文明确提供）”组织；缺少的维度保持缺失，不得补齐。
+11. evidence_plan.fact_ids 是该条 bullet 唯一允许使用的候选事实编号；不得借用其他记录、目标岗位或 JD 的事实。合并多条时只能使用对应 source_indices 的 fact_ids 并集。
 只输出 JSON，不要解释。"""
 
 
@@ -513,7 +515,10 @@ def _apply_section_patches(
     return len(proposals)
 
 
-def _build_optimizer_batches(resume: CanonicalResume) -> list[dict[str, list[dict[str, Any]]]]:
+def _build_optimizer_batches(
+    resume: CanonicalResume,
+    fact_ids_by_path: dict[str, list[str]] | None = None,
+) -> list[dict[str, list[dict[str, Any]]]]:
     """Split long resumes into independently recoverable edit batches."""
 
     batches: list[dict[str, list[dict[str, Any]]]] = []
@@ -524,9 +529,13 @@ def _build_optimizer_batches(resume: CanonicalResume) -> list[dict[str, list[dic
         for index, record in enumerate(getattr(resume, section)):
             dumped = record.model_dump()
             dumped["index"] = index
-            dumped["evidence_plan"] = _bullet_evidence_plan([
+            evidence_plan = _bullet_evidence_plan([
                 str(value or "") for value in record.bullets
             ])
+            for bullet_index, item in enumerate(evidence_plan):
+                path = f"{section}[{index}].bullets[{bullet_index}]"
+                item["fact_ids"] = list((fact_ids_by_path or {}).get(path, []))
+            dumped["evidence_plan"] = evidence_plan
             bullet_count = len(record.bullets)
             char_count = sum(len(str(value)) for value in record.bullets)
             if current_bullets and (
@@ -638,6 +647,7 @@ def _patches_for_payload(
 def optimize_resume_with_provenance(
     resume: CanonicalResume,
     jd_text: str = "",
+    evidence_bindings: Iterable[EvidenceBinding] = (),
 ) -> OptimizationOutcome:
     if not llm_enabled():
         return OptimizationOutcome(resume=resume)
@@ -652,7 +662,12 @@ def optimize_resume_with_provenance(
         return OptimizationOutcome(resume=resume)
 
     optimized = resume.model_copy(deep=True)
-    batches = _build_optimizer_batches(resume)
+    fact_ids_by_path = {
+        binding.path: list(dict.fromkeys(binding.fact_ids))
+        for binding in evidence_bindings
+        if binding.fact_ids
+    }
+    batches = _build_optimizer_batches(resume, fact_ids_by_path)
     initial_batch_count = len(batches)
     pending: list[tuple[tuple[int, ...], dict[str, list[dict[str, Any]]]]] = [
         ((index,), payload) for index, payload in enumerate(batches)

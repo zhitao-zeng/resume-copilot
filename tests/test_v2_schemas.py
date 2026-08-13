@@ -141,6 +141,24 @@ def test_fact_ledger_quotes_are_exact_and_candidate_eligibility_is_bounded():
     assert any("临床经验" in value for value in ineligible)
 
 
+def test_resume_title_and_fact_disclaimer_are_not_candidate_fact_units():
+    from source_adapter import build_source_bundle
+
+    bundle = build_source_bundle(
+        "张晨简历\n个人总结\n过往经历以真实岗位职责和结果为准。\n"
+        "工作经历\n甲公司｜产品经理\n负责用户访谈。",
+        "",
+        "",
+    )
+
+    all_values = [fact.verbatim_text for fact in bundle.fact_units]
+    eligible = [fact.verbatim_text for fact in bundle.fact_units if fact.fact_eligible]
+    assert "张晨简历" not in all_values
+    assert any("真实岗位职责" in value for value in all_values)
+    assert not any("真实岗位职责" in value for value in eligible)
+    assert any("用户访谈" in value for value in eligible)
+
+
 def test_coalesced_resume_block_retains_every_physical_source_span():
     from source_adapter import build_source_bundle
 

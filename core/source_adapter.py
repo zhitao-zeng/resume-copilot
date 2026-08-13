@@ -123,6 +123,16 @@ _INLINE_PROJECT_FACT = re.compile(
     r"(?:项目|系统|平台|课题|作品)",
     re.IGNORECASE,
 )
+_INLINE_PORTFOLIO_FACT = re.compile(
+    r"^(?:我|本人)?(?:在校期间)?(?:做过|完成过|参加过|参与过)"
+    r"[^。；;]{2,100}$|"
+    r"^(?:我|本人)?有(?:过)?[^。；;]{2,100}经历$",
+    re.IGNORECASE,
+)
+_INLINE_EMPLOYMENT_SIGNAL = re.compile(
+    r"(?:工作|实习|任职|就职|全职|兼职|雇员|员工)",
+    re.IGNORECASE,
+)
 _INLINE_EDUCATION_FACT = re.compile(
     # ``大学生`` is an identity word in awards such as ``全国大学生创新创业``;
     # treating its ``大学`` substring as a school silently moves the award into
@@ -136,7 +146,7 @@ _INLINE_EDUCATION_FACT = re.compile(
 _INLINE_EXPERIENCE_FACT = re.compile(
     r"(?:(?:19|20)\d{2}[^。；;]{0,80}(?:公司|医院|银行|学校|机构|中心|集团|"
     r"事务所|律所|研究院|实验室|部门)|(?:在|于)[^。；;]{1,40}(?:任职|工作|担任|负责)|"
-    r"(?:目前|现在|之前|过去|毕业后)?(?:一直)?(?:做|从事|担任|任职于)[^。；;]{2,60}|"
+    r"(?:目前|现在|之前|过去|毕业后)?(?:一直)?(?:做(?!过)|从事|担任|任职于)[^。；;]{2,60}|"
     r"做过\s*(?:\d+|[一二两三四五六七八九十]+)?\s*段?[^。；;]{0,30}(?:实习|工作)|"
     r"(?:工作中|日常工作|平时工作|主要工作)[^。；;]{0,80}(?:负责|参与|统计|分析|策划))",
     re.IGNORECASE,
@@ -163,7 +173,14 @@ _FACT_SEGMENT_SPLIT = re.compile(
     r"(?:[。；;]+|[|｜]+|(?<=[^\s])[,，、](?=[^\s]))"
 )
 _FACT_NON_CONTENT = re.compile(
-    r"^(?:个人简历|简历|resume|curriculum\s+vitae|cv)$",
+    r"^(?:个人简历|简历|resume|curriculum\s+vitae|cv|"
+    r"(?!.*(?:制作|设计|优化|撰写|生成|开发))[\u4e00-\u9fffA-Za-z·]{1,20}(?:个人)?简历)$",
+    re.IGNORECASE,
+)
+_FACT_DISCLAIMER = re.compile(
+    r"(?:以(?:真实|实际|最终)[^。；;]{0,40}(?:为准|为依据)|"
+    r"(?:不得|不要|避免|严禁)[^。；;]{0,30}(?:编造|虚构|杜撰)|"
+    r"(?:信息|内容)[^。；;]{0,20}(?:仅供参考|以.+为准))",
     re.IGNORECASE,
 )
 _FACT_CONTACT = re.compile(
@@ -177,7 +194,10 @@ _FACT_ORGANIZATION = re.compile(
     r"(?:大学|学院|学校|医院|公司|企业|集团|研究院|实验室|中心|银行|"
     r"事务所|律所|协会|基金会|工作室|团队|部门)$"
 )
-_FACT_ROLE = re.compile(r"(?:岗位|职位|角色|职务|担任|任职|作为)\s*[:：]?")
+_FACT_ROLE = re.compile(
+    r"(?:(?:岗位|职位|角色|职务)\s*[:：]|担任|任职(?:于|为)?|作为)",
+    re.IGNORECASE,
+)
 _FACT_ACTION = re.compile(
     r"(?:负责|参与|主导|协助|支持|配合|推动|推进|组织|协调|带领|执行|"
     r"设计|开发|构建|实现|制定|管理|运营|分析|统计|策划|培训|处理|研究|"
@@ -321,6 +341,16 @@ def _query_inline_section_hint(value: str) -> str:
     if not text:
         return ""
     if _INLINE_PROJECT_FACT.search(text):
+        return "projects"
+    if (
+        _INLINE_PORTFOLIO_FACT.search(text)
+        and not _INLINE_EMPLOYMENT_SIGNAL.search(text)
+    ):
+        # A self-contained activity, trial, coursework item or other portfolio
+        # fact is evidence, but ``做过`` alone does not prove employment.  Keep
+        # it in the neutral project bucket unless the user explicitly says it
+        # was work/internship; this avoids manufacturing an employer or title
+        # from phrases such as “做过小学数学试讲”.
         return "projects"
     if _INLINE_SKILL_FACT.search(text):
         return "skills"
@@ -1131,10 +1161,13 @@ def _build_fact_units(
                     verbatim_text=value,
                     normalized_text=normalized,
                     fact_eligible=(
-                        block.source_type == "resume"
-                        or (
+                        (
+                            block.source_type == "resume"
+                            and not _FACT_DISCLAIMER.search(value)
+                        ) or (
                             block.source_type == "query"
                             and block.fact_eligible
+                            and not _FACT_DISCLAIMER.search(value)
                         )
                     ),
                     confidence=1.0,

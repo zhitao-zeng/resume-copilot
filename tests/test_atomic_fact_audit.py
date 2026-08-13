@@ -79,6 +79,75 @@ def test_jd_and_direction_query_never_support_candidate_atoms():
     assert audit["structural_invariants"]["skill_tool"]["added_count"] == 1
 
 
+def test_summary_presentation_shells_do_not_create_false_unsupported_atoms():
+    audit = _audit(
+        "姓名：张晨｜4年经验\n复旦大学本科计算机科学\n"
+        "第四范式产品经理\n技能：SQL",
+        {
+            "meta": {"name": "张晨", "work_experience": "4年经验"},
+            "summary": (
+                "拥有4年经验。代表成果：在第四范式担任产品经理期间。"
+                "核心技能包括SQL。教育背景为复旦大学。"
+                "求职方向为Product PM。"
+            ),
+            "education": [{"school": "复旦大学", "degree": "本科", "major": "计算机科学"}],
+            "experience": [{"organization": "第四范式", "role": "产品经理", "bullets": []}],
+            "skills": {"items": [{"name": "SQL", "category": "tool"}]},
+        },
+        jd="Product PM",
+    )
+
+    factuality = audit["atomic_factuality"]
+    assert factuality["unsupported_atom_count"] == 0
+    assert factuality["precision"] == 1.0
+
+
+def test_summary_accepts_equivalent_month_padding_and_nested_record_shell():
+    audit = _audit(
+        "复旦大学市场营销本科在读，09-2022 到 06-2026。\n"
+        "在校期间做过社群活动项目。",
+        {
+            "summary": (
+                "复旦大学市场营销专业本科在读（2022年9月至2026年6月）。"
+                "代表经历：项目经历（社群活动项目）：在校期间做过社群活动项目。"
+                "项目经历包括社群活动项目。"
+            ),
+            "education": [{
+                "school": "复旦大学", "degree": "本科", "major": "市场营销",
+                "period": "2022年9月至2026年6月",
+            }],
+            "projects": [{
+                "name": "社群活动项目",
+                "bullets": ["在校期间做过社群活动项目。"],
+            }],
+        },
+    )
+
+    assert audit["atomic_factuality"]["unsupported_atom_count"] == 0
+    assert audit["atomic_factuality"]["precision"] == 1.0
+
+
+def test_summary_accepts_role_only_work_and_context_wrappers():
+    audit = _audit(
+        "2017年7月至2025年5月做企业软件销售，负责客户开发和方案演示。",
+        {
+            "summary": (
+                "工作或实习经历包括企业软件销售。"
+                "代表经历：担任企业软件销售期间，负责客户开发和方案演示。"
+            ),
+            "experience": [{
+                "organization": "",
+                "role": "企业软件销售",
+                "period": "2017年7月至2025年5月",
+                "bullets": ["负责客户开发和方案演示"],
+            }],
+        },
+    )
+
+    assert audit["atomic_factuality"]["unsupported_atom_count"] == 0
+    assert audit["atomic_factuality"]["precision"] == 1.0
+
+
 def test_ownership_audit_detects_cross_record_bullet_swap():
     audit = _audit(
         "工作经历\n甲公司｜产品经理｜2022.01-2024.01\n负责用户访谈。\n"

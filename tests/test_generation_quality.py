@@ -1467,6 +1467,37 @@ def test_optimizer_payload_exposes_source_present_star_dimensions_only():
     assert record["evidence_plan"][0]["ownership"] == "responsible"
     assert "deliverable" in record["evidence_plan"][0]["source_dimensions"]
     assert record["evidence_plan"][1]["source_dimensions"] == ["method", "result"]
+    assert record["evidence_plan"][0]["fact_ids"] == []
+
+
+def test_optimizer_payload_carries_only_each_bullets_bound_fact_ids():
+    from resume_optimizer import _build_optimizer_batches
+
+    source = build_source_bundle(
+        "工作经历\n甲公司｜产品经理｜2022.01-2024.01\n"
+        "负责客户访谈。\n输出需求清单。",
+        "",
+        "",
+    )
+    resume = CanonicalResume.model_validate({
+        "experience": [{
+            "organization": "甲公司", "role": "产品经理",
+            "period": "2022.01-2024.01",
+            "bullets": ["负责客户访谈。", "输出需求清单。"],
+        }],
+    })
+    bindings = bind_resume_evidence(resume, source)
+    fact_ids_by_path = {
+        binding.path: binding.fact_ids for binding in bindings
+        if ".bullets[" in binding.path
+    }
+
+    record = _build_optimizer_batches(resume, fact_ids_by_path)[0]["experience"][0]
+
+    first = record["evidence_plan"][0]["fact_ids"]
+    second = record["evidence_plan"][1]["fact_ids"]
+    assert first and second
+    assert set(first).isdisjoint(second)
 
 
 def test_optimizer_reverts_high_risk_rewrite_when_semantic_review_rejects():

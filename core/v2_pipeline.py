@@ -93,7 +93,7 @@ _RESULT_CLAIMS = (
     "确保", "保障", "关键依据", "高质量交付", "打通", "性能达标", "降低成本",
     "提高准确率", "提升准确率", "提升效率", "提升用户体验",
 )
-_SUMMARY_MAX_CHARS = 260
+_SUMMARY_MAX_CHARS = 360
 _SUMMARY_MAX_SENTENCES = 6
 _INTERNAL_ADDITIONAL_SECTION = re.compile(
     r"^(?:待整理(?:的)?原始(?:信息|经历)|教育经历补充|补充信息)$"
@@ -1146,7 +1146,7 @@ def _build_evidence_summary(resume: CanonicalResume) -> str:
 
     candidates: list[str] = []
 
-    target_role = resume.meta.target_role.strip()
+    target_role = _clean_target_role(resume.meta.target_role)
     if re.fullmatch(r"[a-z0-9]+(?:[_-][a-z0-9]+)+", target_role, re.IGNORECASE):
         target_role = " ".join(
             token.upper() if len(token) <= 3 else token.title()
@@ -1350,6 +1350,15 @@ _DUTY_ONLY_ROLE = re.compile(
     r"(?:单元|集成|功能|性能|接口|回归|压力|兼容性|验收|冒烟|安全)测试(?:工作|任务)?",
     re.IGNORECASE,
 )
+_ROLE_PERIOD_SENTENCE = re.compile(
+    r"(?:19|20)\d{2}(?:[./年-]\d{1,2}月?)?\s*"
+    r"(?:[-–—~至到]\s*)(?:(?:19|20)\d{2}|今|至今|现在)",
+    re.IGNORECASE,
+)
+_ROLE_DUTY_SENTENCE = re.compile(
+    r"^(?:负责(?!人)|参与|主导|协助|配合|完成|推动|推进)\S+",
+    re.IGNORECASE,
+)
 
 
 def _clean_role_title(value: str, *, explicit: bool = False) -> str:
@@ -1365,6 +1374,8 @@ def _clean_role_title(value: str, *, explicit: bool = False) -> str:
     text = re.sub(r"\s+", " ", str(value or "")).strip(" ，,。；;|｜:：-–—")
     text = re.sub(r"^(?:岗位|职位|角色|职务)\s*[:：]\s*", "", text)
     text = _ROLE_WRAPPER.sub("", text).strip(" ，,。；;|｜:：-–—")
+    if _ROLE_PERIOD_SENTENCE.search(text) or _ROLE_DUTY_SENTENCE.search(text):
+        return ""
     if not explicit and _DUTY_ONLY_ROLE.fullmatch(text):
         return ""
     return text
@@ -1580,7 +1591,28 @@ def _compact_canonical(resume: CanonicalResume) -> CanonicalResume:
                             for bullet in item["bullets"]
                         )
                         if not represented:
-                            item["bullets"].insert(0, original_role)
+                            replacement_index: int | None = None
+                            original_bigrams = _char_bigrams(original_role)
+                            if original_bigrams:
+                                ranked = sorted(
+                                    (
+                                        len(_char_bigrams(bullet) & original_bigrams)
+                                        / max(1, len(_char_bigrams(bullet))),
+                                        index,
+                                    )
+                                    for index, bullet in enumerate(item["bullets"])
+                                    if _char_bigrams(bullet)
+                                )
+                                if (
+                                    ranked
+                                    and ranked[-1][0] >= 0.60
+                                    and len(original_role) > len(item["bullets"][ranked[-1][1]])
+                                ):
+                                    replacement_index = ranked[-1][1]
+                            if replacement_index is None:
+                                item["bullets"].insert(0, original_role)
+                            else:
+                                item["bullets"][replacement_index] = original_role
                 if section == "projects":
                     project_name = str(item.get("name", "") or "").strip()
                     compact_name = re.sub(r"\W+", "", project_name)
@@ -1723,6 +1755,16 @@ _FALLBACK_ORGANIZATION_END = re.compile(
     r"大学|学院|学校|中学|小学|学部|医院|公司|企业|集团|机构|中心|部门|"
     r"协会|学会|社团|律所|银行|团队|基地|科技|软件|电商|证券|互动)"
 )
+_ROLE_NARRATIVE_PREFIX = re.compile(
+    r"^(?:我|本人)?(?:目前|现在|之前|过去|毕业后)?(?:一直)?"
+    r"(?:做(?!过)|从事|担任|任职为)\s*",
+    re.IGNORECASE,
+)
+_EXPLICIT_ORGANIZATION_END = re.compile(
+    r"(?:幼儿园|研究院|实验室|委员会|工作室|基金会|学生会|事务所|"
+    r"大学|学院|学校|中学|小学|学部|医院|公司|集团|机构|中心|部门|"
+    r"协会|学会|社团|律所|银行|团队|基地)$"
+)
 _FALLBACK_ROLE = re.compile(
     r"[\u4e00-\u9fffA-Za-z0-9/+.#_-]{0,24}(?:工程师|设计师|教师|老师|医生|医师|"
     r"护士|经理|主管|总监|主任|顾问|研究员|专员|助理|助教|负责人|组长|队长|主席|"
@@ -1839,6 +1881,7 @@ def _compact_identity_parts(value: str) -> tuple[str, str]:
     identity = _identity_prefix(value)
     identity = _FALLBACK_PERIOD.sub(" ", identity)
     identity = re.sub(r"^[\s|｜:：\-–—~至到]+|[\s|｜:：\-–—~至到]+$", "", identity)
+    role_narrative = bool(_ROLE_NARRATIVE_PREFIX.match(identity))
     identity = re.sub(
         r"^(?:我|本人)?(?:目前|现在|之前|过去)?(?:一直)?(?:做过|做|从事|担任|任职为)?\s*"
         r"(?:(?:\d+|[一二两三四五六七八九十]+)\s*段)?\s*",
@@ -1851,6 +1894,21 @@ def _compact_identity_parts(value: str) -> tuple[str, str]:
     organization = _organization_from_text(identity)
     if organization:
         role = _role_from_text(identity, organization)
+        if (
+            role_narrative
+            and role
+            and not _EXPLICIT_ORGANIZATION_END.search(organization)
+        ):
+            # “做企业软件销售” supplies a domain-qualified title, not a
+            # company named “企业软件”.  Brand-like suffixes (科技/软件/电商)
+            # are accepted for compact CV headers, but require an explicit
+            # organization preposition/label in free-form role narratives.
+            narrative_role = _clean_role_title(
+                _first_match(_FALLBACK_ROLE, identity),
+                explicit=True,
+            )
+            if narrative_role:
+                return "", narrative_role
         return organization, role
 
     compact = re.sub(r"\s+", "", identity)
@@ -1961,7 +2019,12 @@ def _role_from_text(value: str, organization: str = "") -> str:
 def _clean_target_role(value: str) -> str:
     value = re.sub(r"^(?:(?:更)?适合|转向?|偏)\s*", "", str(value or "")).strip()
     value = re.sub(r"(?:相关)?(?:岗位|方向|工作)$", "", value).strip()
-    return value
+    # Normalize internal taxonomy tokens before they can be copied into the
+    # user-facing summary (the outer service normalizes meta later, which was
+    # too late for strings such as ``Product PM`` or ``operations``).
+    from resume_classifier import normalize_target_role
+
+    return normalize_target_role(value)
 
 
 def _fallback_target_role(query_text: str, jd_text: str) -> str:
@@ -3686,6 +3749,62 @@ def _recover_missing_record_facts(
     ), changed_paths
 
 
+def _restore_attested_source_summary(
+    resume: CanonicalResume,
+    source,
+) -> tuple[CanonicalResume, list[str]]:
+    """Restore exact candidate-authored summary facts after summary rebuilding.
+
+    ``_compact_canonical`` ranks concrete role and achievement facts ahead of
+    generic prose.  That is useful for presentation, but it used to drop an
+    explicitly supplied personal-summary sentence altogether.  This final,
+    deterministic pass restores only eligible facts whose source section is
+    ``summary``.  The text is copied verbatim, never inferred from a JD, and
+    source-adapter disclaimer filtering has already removed instructions such
+    as "不得编造" or "以真实信息为准".
+    """
+
+    candidates = [
+        fact.verbatim_text.strip(" \t。；;！!？?")
+        for fact in source.fact_units
+        if fact.fact_eligible
+        and fact.source_type != "jd"
+        and fact.section_hint == "summary"
+        and fact.verbatim_text.strip()
+    ]
+    candidates = list(dict.fromkeys(value for value in candidates if value))
+    if not candidates:
+        return resume, []
+
+    restored = resume.model_copy(deep=True)
+    current = restored.summary.strip()
+    existing_sentences = [
+        item.strip()
+        for item in re.split(r"[。！？!?；;]+", current)
+        if item.strip()
+    ]
+    added: list[str] = []
+    for value in candidates:
+        if _bullet_is_represented(value, existing_sentences + added):
+            continue
+        # Candidate-authored evidence may exceed the generated-summary target
+        # slightly, but remains bounded and is never truncated mid-sentence.
+        projected = len(current.rstrip("。；; ")) + len(value) + 2
+        if projected > _SUMMARY_MAX_CHARS + 80:
+            continue
+        added.append(value)
+        current = "。".join(
+            part for part in (current.rstrip("。；; "), value) if part
+        ) + "。"
+        if len(added) >= 2:
+            break
+
+    if not added:
+        return resume, []
+    restored.summary = current
+    return restored, added
+
+
 _ANY_RECORD_FIELD_PATH = re.compile(
     r"^(education|experience|research|activities|projects)\[(\d+)]\."
 )
@@ -4696,7 +4815,16 @@ def run_v2_pipeline(
     if _needs_optimizer(result.resume):
         before_optimizer = result.resume.model_copy(deep=True)
         trace_event("optimizer_input_resume", resume=before_optimizer, jd_text=jd_text)
-        optimization = optimize_resume_with_provenance(result.resume, jd_text)
+        optimizer_bindings = bind_resume_evidence(
+            result.resume,
+            source,
+            trusted_rewrites=atom_provenance,
+        )
+        optimization = optimize_resume_with_provenance(
+            result.resume,
+            jd_text,
+            evidence_bindings=optimizer_bindings,
+        )
         trace_event("optimizer_outcome", outcome=optimization)
         result.resume = optimization.resume
         for path, source_value in optimization.trusted_rewrites.items():
@@ -4950,6 +5078,32 @@ def run_v2_pipeline(
                         missing_blocks = merged_missing
         except Exception as exc:
             logger.warning("V2 | Source coverage fallback failed: %s", exc)
+
+    summary_restored, restored_summary_facts = _restore_attested_source_summary(
+        result.resume,
+        source,
+    )
+    if restored_summary_facts:
+        result.resume = summary_restored
+        result.evidence_bindings = bind_resume_evidence(
+            result.resume,
+            source,
+            trusted_rewrites=trusted_rewrites,
+        )
+        coverage, missing_blocks = _deterministic_source_coverage(
+            source,
+            result.evidence_bindings,
+        )
+        trace_event(
+            "attested_summary_recovery",
+            restored=restored_summary_facts,
+            source_coverage=coverage,
+        )
+        logger.info(
+            "V2 | Restored %d exact source summary fact(s); coverage=%.1f%%",
+            len(restored_summary_facts),
+            coverage * 100,
+        )
     if missing_blocks:
         logger.info("V2 | Final source coverage %.1f%%, missing=%s", coverage * 100, missing_blocks[:8])
     result.changes = [

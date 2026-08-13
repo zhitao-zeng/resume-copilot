@@ -41,6 +41,26 @@ _METRIC_ANCHOR = re.compile(
     r"篇|例|台|套|元|小时|分钟|ms|s|qps|tps|fps|mb|gb)",
     re.IGNORECASE,
 )
+_LIST_MARKER = re.compile(
+    r"^\s*(?:\(?\d{1,2}[.、．)）]|[一二三四五六七八九十]{1,3}[、.．)）])\s*"
+)
+_SUMMARY_DIRECTION = re.compile(
+    r"^(?:求职|应聘|职业|目标)(?:方向|岗位|目标)|^希望(?:应聘|求职)",
+    re.IGNORECASE,
+)
+_SUMMARY_PRESENTATION_SHELL = re.compile(
+    r"^(?:代表成果|代表经历|相关经历|核心技能|教育背景|工作背景|项目背景|"
+    r"工作或实习经历|工作经历|项目经历|校园经历|科研经历)\s*[:：]?\s*",
+    re.IGNORECASE,
+)
+_DATE_TOKEN = re.compile(
+    r"(?<!\d)(?:(?P<year1>(?:19|20)\d{2})\s*[-./年]\s*"
+    r"(?P<month1>0?[1-9]|1[0-2])\s*月?|"
+    r"(?P<month2>0?[1-9]|1[0-2])\s*[-./]\s*"
+    r"(?P<year2>(?:19|20)\d{2})|"
+    r"(?P<year_only>(?:19|20)\d{2})\s*年?)(?!\d)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -77,11 +97,25 @@ def _bigrams(value: str) -> set[str]:
 
 
 def _anchors(value: str) -> set[str]:
-    return {
-        _normalize(match.group(0))
-        for match in _HARD_ANCHOR.finditer(str(value or ""))
-        if _normalize(match.group(0))
-    }
+    # A leading ``1.``/``（一）`` is document structure, not a candidate
+    # metric.  Source fact units intentionally omit list markers, so treating
+    # one as a hard anchor would reject an otherwise verbatim source bullet.
+    # Only an explicit enumerator suffix is removed; dates and real quantities
+    # such as ``2024年`` or ``100位患者`` remain immutable anchors.
+    value = _LIST_MARKER.sub("", str(value or ""), count=1)
+    result: set[str] = set()
+    for match in _HARD_ANCHOR.finditer(value):
+        anchor = _normalize(match.group(0))
+        if not anchor:
+            continue
+        # OCR/native text commonly uses ``09-2022`` while the renderer emits
+        # ``2022年9月``.  A leading zero on a one/two-digit integer is formatting,
+        # not a different fact.  Units, percentages, years and identifiers with
+        # letters keep their exact normalized form.
+        if anchor.isdigit() and len(anchor) <= 2:
+            anchor = str(int(anchor))
+        result.add(anchor)
+    return result
 
 
 def _metric_anchors(value: str) -> list[str]:
@@ -90,6 +124,39 @@ def _metric_anchors(value: str) -> list[str]:
         for match in _METRIC_ANCHOR.finditer(str(value or ""))
         if match.group(0).strip()
     ))
+
+
+def _date_signatures(value: str) -> set[tuple[str, str]]:
+    result: set[tuple[str, str]] = set()
+    for match in _DATE_TOKEN.finditer(str(value or "")):
+        year = match.group("year1") or match.group("year2") or match.group("year_only")
+        month = match.group("month1") or match.group("month2") or ""
+        result.add((str(year), str(int(month)) if month else ""))
+    return result
+
+
+def _date_component_anchors(value: str) -> set[str]:
+    result: set[str] = set()
+    for year, month in _date_signatures(value):
+        result.update({year, f"{year}年"})
+        if month:
+            result.update({month, f"{month}月", month.zfill(2)})
+    return result
+
+
+def _unmatched_anchors(claim: str, source: str) -> tuple[str, ...]:
+    unmatched = _anchors(claim) - _anchors(source)
+    claim_dates = _date_signatures(claim)
+    source_dates = _date_signatures(source)
+    if claim_dates and claim_dates.issubset(source_dates):
+        unmatched -= _date_component_anchors(claim)
+    return tuple(sorted(unmatched))
+
+
+def _date_only(value: str) -> bool:
+    stripped = _DATE_TOKEN.sub("", str(value or ""))
+    stripped = re.sub(r"(?:至今|现在|应届|至|到|[-—~年月日/.,，。；;()（）\s])", "", stripped)
+    return not stripped
 
 
 def _excerpt(value: str, limit: int = 140) -> str:
@@ -135,6 +202,12 @@ def _atomic_segments(value: str, *, split_lists: bool) -> list[str]:
                 if _normalize(atom):
                     result.append(atom)
     return result
+
+
+def atomize_claim_text(value: str) -> list[str]:
+    """Public, deterministic clause splitter shared by audit and repair."""
+
+    return _atomic_segments(value, split_lists=True)
 
 
 def _canonical_claims(resume: CanonicalResume) -> list[AtomicClaim]:
@@ -189,6 +262,12 @@ def _canonical_claims(resume: CanonicalResume) -> list[AtomicClaim]:
             continue
         segments = _atomic_segments(value, split_lists=split_lists)
         for atom_index, atom in enumerate(segments):
+            # Target direction is allowed to come from the JD and is not a
+            # candidate biography claim.  ``meta.target_role`` is excluded for
+            # the same reason; keep that distinction when a deterministic
+            # summary renders the direction in prose.
+            if path.startswith("summary[") and _SUMMARY_DIRECTION.search(atom):
+                continue
             claims.append(AtomicClaim(
                 atom_id=f"{path}#atom[{atom_index}]",
                 path=path,
@@ -197,6 +276,32 @@ def _canonical_claims(resume: CanonicalResume) -> list[AtomicClaim]:
                 structural_category=_structural_category(path),
             ))
     return claims
+
+
+def _claim_match_text(claim: AtomicClaim) -> str:
+    """Remove deterministic presentation shells without deleting facts."""
+
+    text = str(claim.text or "").strip()
+    if not claim.path.startswith("summary["):
+        return text
+    shell_removed = bool(_SUMMARY_PRESENTATION_SHELL.search(text))
+    text = _SUMMARY_PRESENTATION_SHELL.sub("", text, count=1).strip()
+    if shell_removed:
+        text = re.sub(r"^(?:包括|为)\s*", "", text, count=1).strip()
+        section_wrapper = re.match(
+            r"^(?:工作|项目|校园|科研|教育)经历(?:[（(][^）)]{1,80}[）)])?\s*[:：]\s*(.+)$",
+            text,
+        )
+        if section_wrapper:
+            text = section_wrapper.group(1).strip()
+    text = re.sub(r"^(?:拥有|曾任)\s*", "", text, count=1).strip()
+    contextual = re.fullmatch(r"在(.+?)担任(.+?)期间", text)
+    if contextual:
+        text = "".join(contextual.groups()).strip()
+    role_contextual = re.fullmatch(r"(?:担任|任职为?|作为)(.+?)期间", text)
+    if role_contextual:
+        text = role_contextual.group(1).strip()
+    return text or claim.text
 
 
 def _binding_map(bindings: Iterable[EvidenceBinding]) -> dict[str, EvidenceBinding]:
@@ -316,20 +421,19 @@ def _match_atom(
     if not facts:
         return AtomicMatch("unsupported", (), 0.0, "no_candidate_fact")
 
+    match_text = _claim_match_text(claim)
     source_text = "；".join(fact.verbatim_text for fact in facts)
     if binding is not None and binding.source_claim:
         source_text += "；" + binding.source_claim
     source_value = _normalize(source_text)
-    atom_value = _normalize(claim.text)
-    atom_anchors = _anchors(claim.text)
-    source_anchors = _anchors(source_text)
-    unmatched = tuple(sorted(atom_anchors - source_anchors))
+    atom_value = _normalize(match_text)
+    unmatched = _unmatched_anchors(match_text, source_text)
     if unmatched:
         return AtomicMatch(
             "unsupported", (), 0.0, "new_hard_anchor", unmatched,
         )
 
-    scores = _individual_fact_scores(claim.text, facts)
+    scores = _individual_fact_scores(match_text, facts)
     best_score = scores[0][0] if scores else 0.0
     selection_floor = max(0.55, best_score - 0.12)
     selected = tuple(
@@ -340,8 +444,16 @@ def _match_atom(
         if not selected and scores:
             selected = (scores[0][1].fact_id,)
         return AtomicMatch("supported", selected, 1.0, "direct_source")
+    if (
+        _date_only(match_text)
+        and _date_signatures(match_text)
+        and _date_signatures(match_text).issubset(_date_signatures(source_text))
+    ):
+        if not selected and scores:
+            selected = (scores[0][1].fact_id,)
+        return AtomicMatch("supported", selected, 1.0, "equivalent_date_format")
 
-    atom_bigrams = _bigrams(claim.text)
+    atom_bigrams = _bigrams(match_text)
     precision = len(atom_bigrams & _bigrams(source_text)) / max(1, len(atom_bigrams))
     direct_binding = bool(
         binding is not None
@@ -367,6 +479,30 @@ def _match_atom(
     )
 
 
+def match_atomic_claim(
+    text: str,
+    facts: Iterable[FactUnit],
+    *,
+    path: str = "",
+    binding: EvidenceBinding | None = None,
+) -> AtomicMatch:
+    """Classify one output clause against an explicit fact allow-list.
+
+    Callers must choose the fact scope.  In particular, the repair layer passes
+    facts from one uniquely owned source record, so a similar duty from another
+    employer cannot legitimize or replace the clause.
+    """
+
+    claim = AtomicClaim(
+        atom_id=f"{path or 'claim'}#atom[0]",
+        path=path,
+        text=str(text or "").strip(),
+        record_key=_record_key(path),
+        structural_category=_structural_category(path),
+    )
+    return _match_atom(claim, list(facts), binding)
+
+
 def _fact_is_represented(
     fact: FactUnit,
     generated_text: str,
@@ -377,10 +513,14 @@ def _fact_is_represented(
         return True
     if fact_value in generated_value:
         return True
-    fact_anchors = _anchors(fact.verbatim_text)
-    generated_anchors = _anchors(generated_text)
-    if fact_anchors and not fact_anchors.issubset(generated_anchors):
+    if _unmatched_anchors(fact.verbatim_text, generated_text):
         return False
+    if (
+        _date_only(fact.verbatim_text)
+        and _date_signatures(fact.verbatim_text)
+        and _date_signatures(fact.verbatim_text).issubset(_date_signatures(generated_text))
+    ):
+        return True
     recall = len(_bigrams(fact.verbatim_text) & _bigrams(generated_text)) / max(
         1, len(_bigrams(fact.verbatim_text)),
     )
@@ -598,4 +738,9 @@ def audit_atomic_facts(
     }
 
 
-__all__ = ["audit_atomic_facts"]
+__all__ = [
+    "AtomicMatch",
+    "atomize_claim_text",
+    "audit_atomic_facts",
+    "match_atomic_claim",
+]

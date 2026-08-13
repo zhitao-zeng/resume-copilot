@@ -450,7 +450,7 @@ def test_complete_fallback_is_merged_before_the_single_optimizer_pass():
     })
     optimized_inputs = []
 
-    def fake_optimize(resume, _jd):
+    def fake_optimize(resume, _jd, **_kwargs):
         from resume_optimizer import OptimizationOutcome
 
         optimized_inputs.append(resume.model_copy(deep=True))

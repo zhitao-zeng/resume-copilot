@@ -20,6 +20,7 @@ from source_adapter import build_source_bundle, candidate_blocks
 from v2_pipeline import (
     _build_evidence_summary,
     _compact_canonical,
+    _compact_identity_parts,
     _canonical_to_v1_format,
     _deterministic_fallback,
     _expand_optimizer_provenance,
@@ -28,6 +29,7 @@ from v2_pipeline import (
     _recover_grounded_source_structure,
     _recover_missing_record_facts,
     _record_source_owners,
+    _restore_attested_source_summary,
     _split_grounded_fact_bullet,
     run_v2_pipeline,
 )
@@ -74,6 +76,41 @@ def test_query_embedded_jd_and_bare_role_are_not_candidate_facts():
     assert candidate_blocks(build_source_bundle("", "保留原学校", "")) == []
 
 
+def test_exact_source_summary_is_restored_without_disclaimer_or_jd_text():
+    source = build_source_bundle(
+        "个人总结\n具备清晰的问题拆解和执行闭环能力，以真实岗位职责和结果为准。",
+        "",
+        "岗位要求：具备战略规划能力",
+    )
+    resume = CanonicalResume.model_validate({
+        "meta": {"name": "张晨", "target_role": "产品经理"},
+        "summary": "曾任星河科技产品经理。",
+    })
+
+    restored, added = _restore_attested_source_summary(resume, source)
+
+    assert added == ["具备清晰的问题拆解和执行闭环能力"]
+    assert "具备清晰的问题拆解和执行闭环能力" in restored.summary
+    assert "以真实岗位职责和结果为准" not in restored.summary
+    assert "战略规划能力" not in restored.summary
+
+
+def test_attested_source_summary_is_not_duplicated_when_already_represented():
+    source = build_source_bundle(
+        "个人总结\n具备清晰的问题拆解和执行闭环能力。",
+        "",
+        "",
+    )
+    resume = CanonicalResume.model_validate({
+        "summary": "具备清晰的问题拆解和执行闭环能力。",
+    })
+
+    restored, added = _restore_attested_source_summary(resume, source)
+
+    assert restored is resume
+    assert added == []
+
+
 def test_structured_query_sections_remain_candidate_facts():
     source = build_source_bundle(
         "",
@@ -84,6 +121,94 @@ def test_structured_query_sections_remain_candidate_facts():
     assert "甲公司｜产品经理｜2022.01-2024.01" in facts
     assert "负责用户调研并输出PRD" in facts
     assert "工作经历" not in facts
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "做过小学数学试讲和班级活动组织",
+        "有小学语文试讲和课程设计经历",
+        "在校期间做过校园社群活动",
+    ],
+)
+def test_unscoped_portfolio_fact_is_not_promoted_to_employment(text):
+    source = build_source_bundle("", text, "")
+    factual = [block for block in candidate_blocks(source) if block.text == text]
+
+    assert len(factual) == 1
+    assert factual[0].section_hint == "projects"
+    assert factual[0].record_id == "query:projects:0"
+
+
+def test_role_narrative_does_not_manufacture_company_from_domain_modifier():
+    assert _compact_identity_parts(
+        "2016年7月至2025年5月做企业软件销售"
+    ) == ("", "企业软件销售")
+
+
+def test_dated_duty_sentence_is_content_not_a_role_field():
+    original = "2019年7月至2025年5月负责培训机构排课、学员服务和数据台账"
+    compacted = _compact_canonical(CanonicalResume.model_validate({
+        "experience": [{
+            "role": original,
+            "period": "2019年7月至2025年5月",
+            "bullets": ["负责排课、学员服务和数据台账"],
+        }],
+    }))
+
+    assert compacted.experience[0].role == ""
+    assert compacted.experience[0].bullets == [original]
+
+
+@pytest.mark.parametrize(
+    ("query", "section", "record", "expected_organization"),
+    [
+        (
+            "2016年7月至2025年5月做企业软件销售，负责客户开发和方案演示",
+            "experience",
+            {"organization": "做企业软件", "role": "企业软件销售", "period": "2016年7月至2025年5月", "bullets": ["负责客户开发和方案演示"]},
+            "",
+        ),
+        (
+            "有小学语文试讲和课程设计经历",
+            "projects",
+            {"name": "小学语文试讲和课程设计", "organization": "有小学", "bullets": ["有小学语文试讲和课程设计经历"]},
+            "",
+        ),
+        (
+            "2020年7月至2025年6月在农商行做柜面和贷款资料审核",
+            "experience",
+            {"organization": "农商行", "role": "柜面和贷款资料审核", "period": "2020年7月至2025年6月", "bullets": []},
+            "农商行",
+        ),
+    ],
+)
+def test_organization_field_requires_organization_grammar(
+    query, section, record, expected_organization,
+):
+    source = build_source_bundle("", query, "")
+    resume = CanonicalResume.model_validate({section: [record]})
+
+    grounded, _, _ = enforce_resume_evidence(resume, source)
+
+    assert getattr(grounded, section)[0].organization == expected_organization
+
+
+@pytest.mark.parametrize(
+    ("token", "display"),
+    [
+        ("product_pm", "产品经理"),
+        ("operations", "运营"),
+        ("sales", "销售"),
+    ],
+)
+def test_internal_target_taxonomy_is_not_rendered_in_summary(token, display):
+    resume = CanonicalResume.model_validate({
+        "meta": {"target_role": token},
+        "skills": {"items": [{"name": "Excel", "category": "tool"}]},
+    })
+
+    assert f"求职方向为{display}" in _build_evidence_summary(resume)
 
 
 def test_compact_query_project_survives_deterministic_fallback():
@@ -635,6 +760,95 @@ def test_clause_grounder_accepts_one_bullet_supported_by_multiple_source_lines()
     assert grounded.experience[0].bullets == optimized.experience[0].bullets
 
 
+def test_final_evidence_gate_repairs_only_unsupported_atomic_clause():
+    source = build_source_bundle(
+        "工作经历\n甲公司｜产品经理｜2022.01-2024.01\n"
+        "通过问卷开展用户调研，覆盖200名用户。",
+        "",
+        "岗位要求：提升转化率30%",
+    )
+    resume = CanonicalResume.model_validate({
+        "experience": [{
+            "organization": "甲公司",
+            "role": "产品经理",
+            "period": "2022.01-2024.01",
+            "bullets": [
+                "通过问卷开展用户调研，覆盖200名用户，提升转化率30%。",
+            ],
+        }],
+    })
+
+    gated, bindings, removed = enforce_resume_evidence(resume, source)
+
+    assert gated.experience[0].bullets == [
+        "通过问卷开展用户调研，覆盖200名用户。",
+    ]
+    assert "30%" not in gated.experience[0].bullets[0]
+    assert "experience[0].bullets[0]" not in removed
+    binding = next(
+        item for item in bindings
+        if item.path == "experience[0].bullets[0]"
+    )
+    assert len(binding.fact_ids) == 2
+
+
+def test_exact_compound_claim_auto_binds_multiple_facts_in_one_record():
+    source = build_source_bundle(
+        "工作经历\n甲公司｜产品经理｜2022.01-2024.01\n"
+        "负责梳理客户需求。\n通过10次用户访谈收集反馈。\n"
+        "输出需求优先级清单。",
+        "",
+        "",
+    )
+    resume = CanonicalResume.model_validate({
+        "experience": [{
+            "organization": "甲公司",
+            "role": "产品经理",
+            "period": "2022.01-2024.01",
+            "bullets": [
+                "负责梳理客户需求，通过10次用户访谈收集反馈，输出需求优先级清单。",
+            ],
+        }],
+    })
+
+    bindings = bind_resume_evidence(resume, source)
+    binding = next(
+        item for item in bindings
+        if item.path == "experience[0].bullets[0]"
+    )
+
+    assert binding.mode == "rewritten"
+    assert len(binding.block_ids) == 3
+    assert len(binding.fact_ids) == 3
+    assert {item.record_id for item in source.fact_units if item.fact_id in binding.fact_ids} == {
+        "resume:experience:0",
+    }
+
+
+def test_atomic_repair_restores_unique_complete_sentence_from_same_record():
+    source = build_source_bundle(
+        "工作经历\n甲公司｜产品经理｜2022.01-2024.01\n"
+        "负责客户沟通并输出需求清单。\n"
+        "乙公司｜运营专员｜2020.01-2021.01\n负责渠道活动执行。",
+        "",
+        "",
+    )
+    resume = CanonicalResume.model_validate({
+        "experience": [{
+            "organization": "甲公司",
+            "role": "产品经理",
+            "period": "2022.01-2024.01",
+            "bullets": ["围绕客户沟通开展全国渠道增长工作。"],
+        }],
+    })
+
+    gated, _bindings, removed = enforce_resume_evidence(resume, source)
+
+    assert gated.experience[0].bullets == ["负责客户沟通并输出需求清单。"]
+    assert "全国渠道增长" not in gated.experience[0].bullets[0]
+    assert "experience[0].bullets[0]" not in removed
+
+
 def test_grouped_rewrite_keeps_every_source_block_in_provenance_and_coverage():
     source = build_source_bundle(
         "工作经历\n"
@@ -1040,7 +1254,8 @@ def test_summary_formats_machine_role_slug_and_bare_seniority_for_people():
 
     compacted = _compact_canonical(resume)
 
-    assert "Product PM" in compacted.summary
+    assert "求职方向为产品经理" in compacted.summary
+    assert "Product PM" not in compacted.summary
     assert "4年经验" in compacted.summary
     assert "product_pm" not in compacted.summary
 

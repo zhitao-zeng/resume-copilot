@@ -320,6 +320,13 @@ def _canonical_resume_from_render_data(resume_data: dict[str, Any]):
 
     data = copy.deepcopy(resume_data) if isinstance(resume_data, dict) else {}
     data.pop("framework", None)
+    # ``education_level`` is a renderer-only convenience derived from the
+    # structured education rows.  It is intentionally not part of the strict
+    # V2 canonical schema; leaving it in the copied meta object made the final
+    # quality report fail validation for otherwise normal resumes.
+    meta = data.get("meta")
+    if isinstance(meta, dict):
+        meta.pop("education_level", None)
     for item in data.get("experience", []) if isinstance(data.get("experience"), list) else []:
         if isinstance(item, dict) and "organization" not in item:
             item["organization"] = item.pop("company", "")

@@ -125,6 +125,34 @@ def test_render_skill_buckets_survive_final_canonical_roundtrip() -> None:
     ]
 
 
+def test_renderer_only_education_level_does_not_break_quality_roundtrip() -> None:
+    render_data = {
+        "meta": {
+            "name": "张晨",
+            "education_level": "本科",
+        },
+        "education": [{
+            "school": "复旦大学",
+            "degree": "本科",
+            "major": "计算机科学",
+            "period": "2016-09 至 2020-06",
+        }],
+        "experience": [],
+        "projects": [],
+        "research": [],
+        "campus_experience": [],
+        "skills": {},
+    }
+
+    final_resume = _canonical_resume_from_render_data(render_data)
+
+    assert final_resume.meta.name == "张晨"
+    assert final_resume.education[0].degree == "本科"
+    # The conversion operates on a deep copy and must not mutate the payload
+    # that is subsequently rendered and returned to the user.
+    assert render_data["meta"]["education_level"] == "本科"
+
+
 def test_v2_evidence_paths_are_mapped_to_render_schema() -> None:
     bindings = [
         EvidenceBinding(
