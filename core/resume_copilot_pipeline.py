@@ -595,7 +595,8 @@ def _build_targeted_suggestions(
         if len(line) < 8 or line.lower().startswith(("http://", "https://")):
             continue
         if any(marker in line for marker in (
-            "职位详情", "招聘官网", "工作地点", "公司介绍", "立即申请", "职位类别",
+            "职位详情", "招聘官网", "工作地点", "办公地点", "工作地址", "办公地址",
+            "校区", "公司介绍", "立即申请", "职位类别",
         )):
             continue
         if not any(marker in line for marker in (
@@ -654,6 +655,100 @@ def _build_targeted_suggestions(
     return suggestions[:3]
 
 
+_REPLY_MAX_SOURCE_GAPS = 5
+_REPLY_MAX_CLAIM_GAPS = 3
+_REPLY_MAX_FOLLOW_UPS = 3
+_REPLY_CONTACT_OR_URL = re.compile(
+    r"(?:\b1[3-9]\d{9}\b|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|"
+    r"https?://\S+|www\.\S+|(?:电话|手机|邮箱|联系方式)\s*[:：]|"
+    r"\bQQ\s*[:：]?\s*[1-9]\d{4,11}\b|"
+    r"(?:微信(?:号|ID)?|WeChat)\s*[:：]?\s*[A-Za-z][\w-]{3,})",
+    re.IGNORECASE,
+)
+_REPLY_NON_ACTIONABLE_PROFILE = re.compile(
+    r"^(?:(?:年龄\s*[:：]?)?\d{1,2}\s*岁(?:\s*[男女])?|性别\s*[:：]?\s*[男女]|"
+    r"(?:求职意向|期望岗位|应聘岗位)\s*[:：])",
+    re.IGNORECASE,
+)
+_REPLY_STRUCTURAL_ONLY = re.compile(
+    r"^(?:个人信息|基本信息|联系方式|教育经历|教育背景|工作经历|实习经历|"
+    r"项目经历|科研经历|校园经历|专业技能|技能|证书|荣誉奖项|个人总结|自我评价)$",
+    re.IGNORECASE,
+)
+
+
+def _clean_report_excerpt(value: Any) -> str:
+    """Remove contact and layout debris before exposing a source gap."""
+
+    text = str(value or "").strip()
+    text = re.sub(r"https?://\S+|www\.\S+", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", "", text)
+    text = re.sub(r"(?<!\d)1[3-9]\d{9}(?!\d)", "", text)
+    text = re.sub(r"\bQQ\s*[:：]?\s*[1-9]\d{4,11}\b", "", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"(?:微信(?:号|ID)?|WeChat)\s*[:：]?\s*[A-Za-z][\w-]{3,}",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"^[\s\-•·▪◦\d.、)）]+", "", text)
+    text = re.sub(r"[✉☎☁▯□]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip(" ，,。；;|｜-/")
+
+
+def _select_reply_source_gaps(values: Any) -> list[dict[str, Any]]:
+    """Rank substantive omissions instead of dumping raw OCR fragments."""
+
+    if not isinstance(values, list):
+        return []
+    section_rank = {
+        "experience": 6,
+        "projects": 6,
+        "research": 5,
+        "activities": 5,
+        "education": 4,
+        "skills": 3,
+        "awards": 2,
+        "certifications": 2,
+        "meta": 0,
+    }
+    candidates: list[tuple[int, int, dict[str, Any]]] = []
+    for index, item in enumerate(values):
+        if not isinstance(item, dict):
+            continue
+        raw_excerpt = str(item.get("excerpt", "")).strip()
+        excerpt = _clean_report_excerpt(raw_excerpt)
+        compact = re.sub(r"[^\w\u4e00-\u9fff]+", "", excerpt).casefold()
+        if (
+            len(compact) < 4
+            or _REPLY_STRUCTURAL_ONLY.fullmatch(excerpt)
+            or _REPLY_NON_ACTIONABLE_PROFILE.search(excerpt)
+            or (_REPLY_CONTACT_OR_URL.search(raw_excerpt) and len(compact) < 12)
+        ):
+            continue
+        section = str(item.get("section_hint", "") or "").strip()
+        dimensions = str(item.get("dimensions", "") or "")
+        score = section_rank.get(section, 1)
+        score += 2 if "action" in dimensions else 0
+        score += 1 if any(token in dimensions for token in ("deliverable", "result", "anchor")) else 0
+        score += 1 if re.search(r"\d|%|万|亿|人|次|个|条|元", excerpt) else 0
+        normalized_item = dict(item)
+        normalized_item["excerpt"] = excerpt
+        candidates.append((score, index, normalized_item))
+
+    selected: list[dict[str, Any]] = []
+    selected_keys: list[str] = []
+    for _, _, item in sorted(candidates, key=lambda row: (-row[0], row[1])):
+        key = re.sub(r"[^\w\u4e00-\u9fff]+", "", item["excerpt"]).casefold()
+        if any(key == existing or (len(key) >= 8 and key in existing) for existing in selected_keys):
+            continue
+        selected.append(item)
+        selected_keys.append(key)
+        if len(selected) >= _REPLY_MAX_SOURCE_GAPS:
+            break
+    return selected
+
+
 def _reply_detail_block(
     missing_fields: list[dict[str, Any]],
     targeted_suggestions: list[str],
@@ -704,7 +799,7 @@ def _reply_detail_block(
             item for item in (alignment.get("requirements", []) or [])
             if isinstance(item, dict) and item.get("status") in {"partial", "missing"}
         ]
-        for item in gap_items[:5]:
+        for item in gap_items[:3]:
             requirement = str(item.get("requirement", "")).strip()
             missing_aspects = [
                 str(value).strip() for value in (item.get("missing_aspects", []) or [])
@@ -729,14 +824,17 @@ def _reply_detail_block(
     if unrepresented:
         total = int(preservation.get("unrepresented_item_count", len(unrepresented)) or 0)
         lines.append(f"原始材料中未充分写入成稿的信息（{total}项）：")
-        for item in unrepresented:
-            if not isinstance(item, dict):
-                continue
+        selected_unrepresented = _select_reply_source_gaps(unrepresented)
+        for item in selected_unrepresented:
             excerpt = str(item.get("excerpt", "")).strip()
             if excerpt:
                 lines.append(f"- {excerpt}")
-        if total > len(unrepresented):
-            lines.append(f"- 另有 {total - len(unrepresented)} 项未在报告中展开，建议对照原始材料复核。")
+        hidden_count = max(0, total - len(selected_unrepresented))
+        if hidden_count:
+            lines.append(
+                f"- 另有 {hidden_count} 项未逐项展开（包含重复或结构性片段），"
+                "建议优先对照上述关键事实复核。"
+            )
     grounding = report.get("fact_grounding", {})
     if isinstance(grounding, dict):
         unsupported_count = int(grounding.get("unsupported_item_count", 0) or 0)
@@ -747,7 +845,7 @@ def _reply_detail_block(
     improvement_items = report.get("claim_improvement_opportunities", [])
     if isinstance(improvement_items, list) and improvement_items:
         lines.append("经历表达仍可补充：")
-        for item in improvement_items[:6]:
+        for item in improvement_items[:_REPLY_MAX_CLAIM_GAPS]:
             if not isinstance(item, dict):
                 continue
             record_label = str(item.get("record_label", "")).strip()
@@ -765,7 +863,11 @@ def _reply_detail_block(
     follow_ups = report.get("follow_up_questions", [])
     if isinstance(follow_ups, list) and follow_ups:
         lines.append("建议补充回答：")
-        lines.extend(f"- {str(item).strip()}" for item in follow_ups[:6] if str(item).strip())
+        lines.extend(
+            f"- {str(item).strip()}"
+            for item in follow_ups[:_REPLY_MAX_FOLLOW_UPS]
+            if str(item).strip()
+        )
     return "\n".join(lines)
 
 

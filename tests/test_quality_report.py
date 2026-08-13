@@ -608,7 +608,7 @@ def test_quality_report_is_exposed_in_user_report_and_reply_details():
     assert "使用SQL的真实场景" in reply
 
 
-def test_reply_expands_jd_gaps_star_dimensions_and_all_reported_source_omissions():
+def test_reply_expands_jd_gaps_star_dimensions_and_bounds_source_omissions():
     quality_report = {
         "job_alignment": {
             "has_job_description": True,
@@ -664,7 +664,9 @@ def test_reply_expands_jd_gaps_star_dimensions_and_all_reported_source_omissions
     assert "1项有直接证据，1项仅部分匹配，1项尚无直接证据" in reply
     assert "部分匹配：负责经营分析并输出看板；需补：交付物或结果" in reply
     assert "未匹配：熟悉SQL；需补：SQL使用场景" in reply
-    assert "原始事实13" in reply
+    assert "原始事实1" in reply
+    assert "原始事实13" not in reply
+    assert "另有 8 项未逐项展开" in reply
     assert "经历表达仍可补充" in reply
     assert "甲公司｜数据分析师" in reply
     assert "方法或过程、交付物或结果" in reply

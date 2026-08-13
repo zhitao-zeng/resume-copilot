@@ -14,7 +14,7 @@ import re
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 from http_compat import HTTPException, UploadFile
 
@@ -274,11 +274,233 @@ def _target_role_from_text(query: str, jd_text: str) -> str:
     return ""
 
 
+def _binding_value(binding: Any, key: str, default: Any = "") -> Any:
+    if isinstance(binding, dict):
+        return binding.get(key, default)
+    return getattr(binding, key, default)
+
+
+def _canonical_path_to_render_path(path: str) -> str:
+    """Map a V2 evidence path to the schema used by the DOCX renderer."""
+
+    value = str(path or "")
+    value = re.sub(r"^activities\[(\d+)]", r"campus_experience[\1]", value)
+    value = re.sub(
+        r"^(experience|projects)\[(\d+)]\.organization$",
+        r"\1[\2].company",
+        value,
+    )
+    value = re.sub(r"^campus_experience\[(\d+)]\.organization$", r"campus_experience[\1].company", value)
+    value = re.sub(r"^research\[(\d+)]\.institution$", r"research[\1].company", value)
+    value = re.sub(r"^research\[(\d+)]\.topic$", r"research[\1].role", value)
+    return value
+
+
+def _protected_render_paths(evidence_bindings: Iterable[Any]) -> set[str]:
+    """Return renderer-field paths already accepted by the V2 evidence gate."""
+
+    return {
+        _canonical_path_to_render_path(str(_binding_value(binding, "path", "")))
+        for binding in evidence_bindings
+        if str(_binding_value(binding, "path", "")).strip()
+    }
+
+
+def _canonical_resume_from_render_data(resume_data: dict[str, Any]):
+    """Invert the V2-to-render bridge for final-state reporting.
+
+    The production fact guard operates on the renderer's V1-compatible keys
+    (``company`` and ``campus_experience``).  Quality reporting and evidence
+    bindings use canonical V2 keys.  Reconstructing the canonical object after
+    the guard prevents the reply from describing fields that were not actually
+    delivered in the DOCX.
+    """
+
+    from v2_schemas import CanonicalResume
+
+    data = copy.deepcopy(resume_data) if isinstance(resume_data, dict) else {}
+    data.pop("framework", None)
+    for item in data.get("experience", []) if isinstance(data.get("experience"), list) else []:
+        if isinstance(item, dict) and "organization" not in item:
+            item["organization"] = item.pop("company", "")
+    for item in data.get("projects", []) if isinstance(data.get("projects"), list) else []:
+        if isinstance(item, dict) and "organization" not in item:
+            item["organization"] = item.pop("company", "")
+    for item in data.get("research", []) if isinstance(data.get("research"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        if "institution" not in item:
+            item["institution"] = item.pop("company", "")
+        if "topic" not in item:
+            item["topic"] = item.pop("role", "")
+
+    activities = data.pop("campus_experience", data.get("activities", []))
+    data["activities"] = activities if isinstance(activities, list) else []
+    for item in data["activities"]:
+        if isinstance(item, dict) and "organization" not in item:
+            item["organization"] = item.pop("company", "")
+
+    skills = data.get("skills")
+    if isinstance(skills, dict) and not isinstance(skills.get("items"), list):
+        category_map = {
+            "languages": "language",
+            "frameworks": "framework",
+            "tools": "tool",
+            "domains": "domain",
+            "methodologies": "methodology",
+            "certifications": "certification",
+            "natural_languages": "natural_language",
+            "others": "other",
+        }
+        skill_items: list[dict[str, str]] = []
+        for bucket, category in category_map.items():
+            values = skills.get(bucket, [])
+            if not isinstance(values, list):
+                continue
+            skill_items.extend(
+                {"name": str(value).strip(), "category": category}
+                for value in values
+                if str(value).strip()
+            )
+        data["skills"] = {"items": skill_items}
+
+    # The rendering bridge mirrors patents into publications with a visible
+    # prefix. Undo that mirror so the final report does not count one fact
+    # twice while leaving the rendered content unchanged.
+    patents = {
+        str(value).strip() for value in data.get("patents", [])
+        if str(value).strip()
+    }
+    publications = data.get("publications", [])
+    if patents and isinstance(publications, list):
+        data["publications"] = [
+            value for value in publications
+            if str(value).strip() not in {f"专利：{patent}" for patent in patents}
+        ]
+    return CanonicalResume.model_validate(data)
+
+
+def _canonical_path_values(value: Any, prefix: str = "") -> dict[str, str]:
+    result: dict[str, str] = {}
+    if isinstance(value, dict):
+        for key, item in value.items():
+            child = f"{prefix}.{key}" if prefix else str(key)
+            result.update(_canonical_path_values(item, child))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            result.update(_canonical_path_values(item, f"{prefix}[{index}]"))
+    elif isinstance(value, str) and prefix:
+        result[prefix] = value.strip()
+    return result
+
+
+def _final_evidence_bindings(final_resume: Any, source: Any, prior_bindings: Iterable[Any]) -> list[Any]:
+    """Keep trusted rewrites that still exist and bind all final direct fields."""
+
+    from evidence_binding import bind_resume_evidence
+    from v2_schemas import EvidenceBinding
+
+    values = _canonical_path_values(final_resume.model_dump())
+    # Bind the final structure first. A guard can remove an earlier record and
+    # shift list indexes, so a fresh exact binding is safer than reusing a
+    # path-identical binding from the pre-guard structure. Prior bindings are
+    # retained only for evidence-preserving rewrites that cannot bind by exact
+    # text after rewriting.
+    retained: dict[str, EvidenceBinding] = {
+        binding.path: binding
+        for binding in bind_resume_evidence(final_resume, source)
+    }
+    for raw_binding in prior_bindings:
+        try:
+            binding = (
+                raw_binding
+                if isinstance(raw_binding, EvidenceBinding)
+                else EvidenceBinding.model_validate(raw_binding)
+            )
+        except Exception:
+            continue
+        # Summary bindings use sentence indexes rather than the scalar summary
+        # path and are not used for coverage or JD claims. Rebind them afresh.
+        if binding.path.startswith("summary["):
+            continue
+        current = values.get(binding.path, "")
+        if current and current == str(binding.claim or "").strip():
+            retained.setdefault(binding.path, binding)
+    return list(retained.values())
+
+
+def _detail_render_paths(
+    resume_data: dict[str, Any],
+    kind: str,
+    content: str,
+) -> set[str]:
+    """Find exact renderer fields targeted by one content-level guard detail."""
+
+    target = str(content or "").strip()
+    if not target:
+        return set()
+    paths: set[str] = set()
+    if kind in {"work_experience", "education_level"}:
+        meta = resume_data.get("meta", {})
+        if isinstance(meta, dict) and str(meta.get(kind, "")).strip() == target:
+            paths.add(f"meta.{kind}")
+        return paths
+
+    field_by_kind = {
+        "company": "company",
+        "school": "school",
+        "name": "name",
+        "role": "role",
+        "degree": "degree",
+        "major": "major",
+        "date": "period",
+    }
+    field = field_by_kind.get(kind)
+    if not field:
+        return paths
+    sections = {
+        "company": ("experience", "projects", "research", "campus_experience"),
+        "school": ("education",),
+        "name": ("projects",),
+        "role": ("experience", "projects", "research", "campus_experience"),
+        "degree": ("education",),
+        "major": ("education",),
+        "date": ("education", "experience", "projects", "research", "campus_experience"),
+    }[kind]
+    for section in sections:
+        records = resume_data.get(section, [])
+        if not isinstance(records, list):
+            continue
+        for index, record in enumerate(records):
+            if isinstance(record, dict) and str(record.get(field, "")).strip() == target:
+                paths.add(f"{section}[{index}].{field}")
+    return paths
+
+
+def _without_protected_details(
+    resume_data: dict[str, Any],
+    report: FabricationReport,
+    protected_paths: set[str],
+) -> FabricationReport:
+    """Suppress a detail only when every matching final field is evidence-bound."""
+
+    if not protected_paths or not report.details:
+        return report
+    details = []
+    for detail in report.details:
+        matching = _detail_render_paths(resume_data, detail.type, detail.content)
+        if matching and matching.issubset(protected_paths):
+            continue
+        details.append(detail)
+    return FabricationReport(fabrication_found=bool(details), details=details)
+
+
 def final_fact_guard(
     source_truth_text: str,
     resume_data: dict[str, Any],
     *,
     max_iterations: int = 2,
+    protected_paths: Iterable[str] = (),
 ) -> tuple[dict[str, Any], FabricationReport]:
     """Remove exact unsupported values and verify the cleaned result again.
 
@@ -295,7 +517,12 @@ def final_fact_guard(
         return resume_data, FabricationReport(fabrication_found=False, details=[])
 
     data = resume_data
-    report = check_fabrication_heuristic(source_truth_text, data)
+    protected = {str(path) for path in protected_paths if str(path).strip()}
+    report = _without_protected_details(
+        data,
+        check_fabrication_heuristic(source_truth_text, data),
+        protected,
+    )
     trace_event(
         "final_fact_guard_initial",
         source_truth=source_truth_text,
@@ -305,7 +532,12 @@ def final_fact_guard(
     for iteration in range(max(1, int(max_iterations))):
         if not report.fabrication_found:
             break
-        cleaned = _remove_fabricated_fields(data, report, source_truth_text)
+        cleaned = _remove_fabricated_fields(
+            data,
+            report,
+            source_truth_text,
+            protected_paths=protected,
+        )
         trace_event(
             "final_fact_guard_cleanup",
             iteration=iteration + 1,
@@ -316,7 +548,11 @@ def final_fact_guard(
         if cleaned == data:
             break
         data = cleaned
-        report = check_fabrication_heuristic(source_truth_text, data)
+        report = _without_protected_details(
+            data,
+            check_fabrication_heuristic(source_truth_text, data),
+            protected,
+        )
     trace_event("final_fact_guard_result", resume_data=data, report=report)
     return data, report
 
@@ -325,10 +561,13 @@ def _remove_fabricated_fields(
     resume_data: dict[str, Any],
     fab_report: FabricationReport,
     source_truth_text: str,
+    *,
+    protected_paths: set[str] | None = None,
 ) -> dict[str, Any]:
     """Remove fields identified as fabricated from resume_data."""
     import copy
     data = copy.deepcopy(resume_data)
+    protected = protected_paths or set()
 
     for detail in fab_report.details:
         kind = detail.type
@@ -336,40 +575,50 @@ def _remove_fabricated_fields(
 
         if kind == "company":
             for section in ("experience", "projects", "research", "campus_experience"):
-                for record in data.get(section, []) if isinstance(data.get(section), list) else []:
-                    if isinstance(record, dict) and str(record.get("company", "")).strip() == content:
+                for index, record in enumerate(data.get(section, []) if isinstance(data.get(section), list) else []):
+                    path = f"{section}[{index}].company"
+                    if path not in protected and isinstance(record, dict) and str(record.get("company", "")).strip() == content:
                         record["company"] = ""
 
         elif kind == "school":
-            for record in data.get("education", []) if isinstance(data.get("education"), list) else []:
-                if isinstance(record, dict) and str(record.get("school", "")).strip() == content:
+            for index, record in enumerate(data.get("education", []) if isinstance(data.get("education"), list) else []):
+                path = f"education[{index}].school"
+                if path not in protected and isinstance(record, dict) and str(record.get("school", "")).strip() == content:
                     record["school"] = ""
 
         elif kind == "name":
-            for record in data.get("projects", []) if isinstance(data.get("projects"), list) else []:
-                if isinstance(record, dict) and str(record.get("name", "")).strip() == content:
+            for index, record in enumerate(data.get("projects", []) if isinstance(data.get("projects"), list) else []):
+                path = f"projects[{index}].name"
+                if path not in protected and isinstance(record, dict) and str(record.get("name", "")).strip() == content:
                     record["name"] = ""
 
         elif kind == "role":
             for section in ("experience", "projects", "research", "campus_experience"):
-                for record in data.get(section, []) if isinstance(data.get(section), list) else []:
-                    if isinstance(record, dict) and str(record.get("role", "")).strip() == content:
+                for index, record in enumerate(data.get(section, []) if isinstance(data.get(section), list) else []):
+                    path = f"{section}[{index}].role"
+                    if path not in protected and isinstance(record, dict) and str(record.get("role", "")).strip() == content:
                         record["role"] = ""
 
         elif kind in {"degree", "major"}:
-            for record in data.get("education", []) if isinstance(data.get("education"), list) else []:
-                if isinstance(record, dict) and str(record.get(kind, "")).strip() == content:
+            for index, record in enumerate(data.get("education", []) if isinstance(data.get("education"), list) else []):
+                path = f"education[{index}].{kind}"
+                if path not in protected and isinstance(record, dict) and str(record.get(kind, "")).strip() == content:
                     record[kind] = ""
 
         elif kind == "date":
             for section in ("education", "experience", "projects", "research", "campus_experience"):
-                for record in data.get(section, []) if isinstance(data.get(section), list) else []:
-                    if isinstance(record, dict) and str(record.get("period", "")).strip() == content:
+                for index, record in enumerate(data.get(section, []) if isinstance(data.get(section), list) else []):
+                    path = f"{section}[{index}].period"
+                    if path not in protected and isinstance(record, dict) and str(record.get("period", "")).strip() == content:
                         record["period"] = ""
 
         elif kind in {"work_experience", "education_level"}:
             meta = data.get("meta", {})
-            if isinstance(meta, dict) and str(meta.get(kind, "")).strip() == content:
+            if (
+                f"meta.{kind}" not in protected
+                and isinstance(meta, dict)
+                and str(meta.get(kind, "")).strip() == content
+            ):
                 meta[kind] = ""
 
         elif kind == "skill":
@@ -385,7 +634,7 @@ def _remove_fabricated_fields(
             _remove_metric_from_data(data, content)
 
     # Clean projects without source support
-    data = _clean_projects(data, source_truth_text)
+    data = _clean_projects(data, source_truth_text, protected_paths=protected)
 
     return data
 
@@ -412,7 +661,12 @@ def _remove_metric_from_data(data: dict[str, Any], metric_value: str) -> None:
     data.update(cleaned)
 
 
-def _clean_projects(resume_data: dict[str, Any], source_truth_text: str) -> dict[str, Any]:
+def _clean_projects(
+    resume_data: dict[str, Any],
+    source_truth_text: str,
+    *,
+    protected_paths: set[str] | None = None,
+) -> dict[str, Any]:
     """Remove projects whose names can't be traced back to original input text.
 
     Allows project names derived from text phrases:
@@ -448,13 +702,18 @@ def _clean_projects(resume_data: dict[str, Any], source_truth_text: str) -> dict
         "主要工作", "工作内容包括", "负责需求", "负责设计", "负责开发",
     )
 
+    protected = protected_paths or set()
     cleaned = []
-    for proj in projects:
+    for index, proj in enumerate(projects):
         if not isinstance(proj, dict):
             continue
         name = str(proj.get("name", "")).strip()
         if not name:
             # Keep unnamed projects (they may be from experience split)
+            cleaned.append(proj)
+            continue
+
+        if f"projects[{index}].name" in protected:
             cleaned.append(proj)
             continue
 
@@ -890,9 +1149,11 @@ async def _resume_copilot_service_impl(
     framework = ctx.resume_data.get("framework")
     fact_resume_data = dict(ctx.resume_data)
     fact_resume_data.pop("framework", None)
+    protected_paths = _protected_render_paths(v2_result.evidence_bindings)
     fact_resume_data, ctx.fabrication_report = final_fact_guard(
         candidate_truth,
         fact_resume_data,
+        protected_paths=protected_paths,
     )
     if isinstance(framework, dict):
         fact_resume_data["framework"] = framework
@@ -915,11 +1176,22 @@ async def _resume_copilot_service_impl(
     ctx.conflicts = _collect_content_conflicts(ctx.resume_data, ctx.jd_text)
     quality_started = time.perf_counter()
     try:
+        final_canonical = _canonical_resume_from_render_data(ctx.resume_data)
+        final_bindings = _final_evidence_bindings(
+            final_canonical,
+            truth_bundle,
+            v2_result.evidence_bindings,
+        )
+        ctx.perf["evidence_bindings"] = float(len(final_bindings))
+        ctx._write_debug(
+            "09_final_evidence_bindings.json",
+            [binding.model_dump() for binding in final_bindings],
+        )
         from quality_report import build_quality_report
         ctx.quality_report = build_quality_report(
             source=truth_bundle,
-            resume=v2_result.resume,
-            evidence_bindings=v2_result.evidence_bindings,
+            resume=final_canonical,
+            evidence_bindings=final_bindings,
             changes=v2_result.changes,
             missing_fields=ctx.missing_fields,
             jd_text=ctx.jd_text,

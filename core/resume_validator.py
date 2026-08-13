@@ -177,6 +177,31 @@ def _parse_period(period: str) -> tuple[Optional[tuple[int, int]], Optional[tupl
     return (start, end)
 
 
+def _date_signatures(text: str) -> set[str]:
+    """Return normalized ``YYYYMM`` tokens from common resume date spellings.
+
+    The final resume uses normalized periods such as ``2022-09`` while OCR
+    source text may use ``2022.09``, ``2022年9月`` or ``09/2022``.  Comparing
+    an endpoint after reversing it to ``09-2022`` with raw source substrings
+    caused real dates in the ordinary ``YYYY-MM`` form to be marked as
+    fabricated.  Normalize both directions before making that decision.
+    """
+
+    value = unicodedata.normalize("NFKC", str(text or ""))
+    signatures: set[str] = set()
+    pattern = re.compile(
+        r"(?<!\d)(?:(?P<year1>(?:19|20)\d{2})\s*(?:[-./]|年)\s*"
+        r"(?P<month1>0?[1-9]|1[0-2])\s*月?"
+        r"|(?P<month2>0?[1-9]|1[0-2])\s*[-./]\s*"
+        r"(?P<year2>(?:19|20)\d{2}))(?!\d)"
+    )
+    for match in pattern.finditer(value):
+        year = match.group("year1") or match.group("year2")
+        month = match.group("month1") or match.group("month2")
+        signatures.add(f"{year}{int(month):02d}")
+    return signatures
+
+
 def _extract_named_entities(text: str) -> dict[str, set[str]]:
     """Extract potential company/school names from text using heuristics."""
     companies = set()
@@ -856,6 +881,8 @@ def check_fabrication_heuristic(original_text: str, resume_data: dict[str, Any])
         date_match = re.match(r"^(0?[1-9]|1[0-2])[-/](19\d{2}|20\d{2})$", value)
         if date_match:
             month, year = int(date_match.group(1)), date_match.group(2)
+            if f"{year}{month:02d}" in _date_signatures(original_text):
+                return True
             year_short = year[-2:]
             norm_text = _normalize_for_match(original_text.lower())
             year_ok = (
@@ -886,6 +913,8 @@ def check_fabrication_heuristic(original_text: str, resume_data: dict[str, Any])
             yr, mo = int(date_match2.group(1)), int(date_match2.group(2))
             if 20 <= yr <= 99:
                 full_year = f"20{yr:02d}"
+                if f"{full_year}{mo:02d}" in _date_signatures(original_text):
+                    return True
                 month_ok = (
                     f"{mo}月" in original_text or f"{mo:02d}月" in original_text
                     or f"{mo}-" in original_text or f"{mo:02d}-" in original_text

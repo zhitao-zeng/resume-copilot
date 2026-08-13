@@ -25,10 +25,10 @@ from v2_schemas import CanonicalResume, EvidenceBinding, SourceBundle
 
 
 _MAX_REQUIREMENTS = 10
-_MAX_UNREPRESENTED_ITEMS = 24
+_MAX_UNREPRESENTED_ITEMS = 12
 _MAX_REMOVED_ITEMS = 12
-_MAX_CLAIM_GAPS = 6
-_MAX_FOLLOW_UP_QUESTIONS = 6
+_MAX_CLAIM_GAPS = 4
+_MAX_FOLLOW_UP_QUESTIONS = 4
 
 _JD_HEADINGS = {
     "岗位职责", "工作职责", "职位职责", "职责描述", "职位描述", "工作内容",
@@ -44,7 +44,8 @@ _JD_STOP_HEADINGS = {
 }
 _JD_NOISE = (
     "公司介绍", "企业介绍", "关于我们", "薪资", "薪酬", "福利", "五险一金",
-    "工作地点", "办公地点", "招聘人数", "立即申请", "投递简历", "职位类别",
+    "工作地点", "办公地点", "工作地址", "办公地址", "联系地址", "上班地点", "校区",
+    "招聘人数", "立即申请", "投递简历", "职位类别",
     "职位详情", "招聘官网", "联系我们", "company profile", "benefits",
     "salary", "location", "apply now", "about us",
 )
@@ -233,6 +234,16 @@ def extract_jd_requirements(jd_text: str, *, limit: int = _MAX_REQUIREMENTS) -> 
             for stop in _JD_STOP_HEADINGS
         ):
             in_relevant_section = False
+            continue
+        # Location and campus rows often follow the requirement section with
+        # no new heading.  They describe where the job is based, not evidence
+        # the candidate should claim on a resume.
+        if re.match(
+            r"^(?:校区(?:[一二三四五六七八九十\d]+)?|工作地点|办公地点|工作地址|"
+            r"办公地址|联系地址|上班地点|location)\s*[:：]",
+            text,
+            re.IGNORECASE,
+        ):
             continue
         # A short machine label before the first real JD section (for example
         # "design" or "product_pm") is a document title, not a candidate
@@ -925,6 +936,8 @@ def build_quality_report(
             "unit_id": unit["unit_id"],
             "source_type": unit["source_type"],
             "section_hint": unit["section_hint"] or None,
+            "record_id": unit["record_id"] or None,
+            "dimensions": unit["dimensions"],
             "excerpt": _safe_excerpt(unit["text"]),
         }
         for unit in missing_units[:_MAX_UNREPRESENTED_ITEMS]
