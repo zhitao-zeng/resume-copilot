@@ -18,9 +18,11 @@ from resume_common import _normalize_project_name
 from docx import Document as DocxDocument
 from docx.enum.table import WD_ALIGN_VERTICAL
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Inches, Mm, Pt, RGBColor
+from docx.text.paragraph import Paragraph
 from lxml import etree
 
 from template_layout import apply_template_style_profile, extract_template_style_profile
@@ -106,10 +108,46 @@ _TEMPLATE_SECTION_ALIASES = {
         "论文成果", "论文", "专利成果", "学术成果", "publications", "patents",
         "publications & patents",
     },
-    "荣誉与奖项": {"荣誉奖项", "奖项", "honors", "awards", "honors & awards"},
+    "荣誉与奖项": {
+        "荣誉奖项", "奖项", "证书", "证书与资质", "资格证书",
+        "honors", "awards", "honors & awards", "certifications", "certificates",
+    },
     "培训与进修": {"培训经历", "进修经历", "training", "professional development"},
     "教学经历": {"授课经历", "teaching experience", "teaching"},
 }
+_TEMPLATE_SECTION_TAGS = {
+    "basic": "基本信息",
+    "basic_info": "基本信息",
+    "contact": "基本信息",
+    "meta": "基本信息",
+    "summary": "个人总结",
+    "profile": "个人总结",
+    "education": "教育背景",
+    "experience": "工作/实习经历",
+    "work": "工作/实习经历",
+    "work_experience": "工作/实习经历",
+    "projects": "项目经历",
+    "project": "项目经历",
+    "research": "科研经历",
+    "activities": "校园与志愿经历",
+    "campus": "校园与志愿经历",
+    "skills": "专业技能",
+    "publications": "论文与专利成果",
+    "honors": "荣誉与奖项",
+    "awards": "荣誉与奖项",
+    "training": "培训与进修",
+    "teaching": "教学经历",
+}
+_TEMPLATE_SECTION_TAG_RE = re.compile(
+    r"^\s*\{\{\s*section\.([a-z][a-z0-9_]*)\s*\}\}\s*$",
+    re.IGNORECASE,
+)
+_TEMPLATE_SCALAR_TAG_RE = re.compile(
+    r"(?:\{\{\s*(?:name|phone|email|age|gender|work_experience|education_level|target_role|summary)\s*\}\}"
+    r"|\$\{(?:name|phone|email|age|gender|work_experience|education_level|target_role|summary)\}"
+    r"|\[\[(?:name|phone|email|age|gender|work_experience|education_level|target_role|summary)\]\])",
+    re.IGNORECASE,
+)
 _INTERNAL_ADDITIONAL_SECTION = re.compile(
     r"^(?:待整理(?:的)?原始(?:信息|经历)|教育经历补充)$"
 )
@@ -1893,6 +1931,489 @@ def _resume_data_without_header_fields(resume_data: dict[str, Any]) -> dict[str,
     return data
 
 
+def _all_template_paragraphs(doc: DocxDocument) -> list[Any]:
+    paragraphs: list[Any] = list(doc.paragraphs)
+    seen = {paragraph._element for paragraph in paragraphs}
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for paragraph in cell.paragraphs:
+                    if paragraph._element in seen:
+                        continue
+                    seen.add(paragraph._element)
+                    paragraphs.append(paragraph)
+    return paragraphs
+
+
+def _all_template_story_paragraphs(doc: DocxDocument) -> list[Any]:
+    """Return body, header and footer paragraphs once per XML node."""
+
+    paragraphs = _all_template_paragraphs(doc)
+    seen = {paragraph._element for paragraph in paragraphs}
+    # Accessing ``section.header.paragraphs`` creates a blank part when the
+    # source package has no header. Walk only relationships that already exist
+    # so reading a template is side-effect free.
+    for relationship in doc.part.rels.values():
+        if relationship.reltype not in {RT.HEADER, RT.FOOTER}:
+            continue
+        part = relationship.target_part
+        for element in part.element.iter(qn("w:p")):
+            if element in seen:
+                continue
+            seen.add(element)
+            paragraphs.append(Paragraph(element, doc))
+    return paragraphs
+
+
+def _template_mode(doc: DocxDocument) -> str:
+    body_paragraphs = _all_template_paragraphs(doc)
+    story_paragraphs = _all_template_story_paragraphs(doc)
+    if any(
+        _TEMPLATE_SECTION_TAG_RE.fullmatch(paragraph.text or "")
+        for paragraph in body_paragraphs
+    ) or any(
+        _TEMPLATE_SCALAR_TAG_RE.search(paragraph.text or "")
+        for paragraph in story_paragraphs
+    ):
+        return "tagged"
+    if any(
+        any(
+            _template_section_matches(paragraph.text.strip(), title)
+            for title in _TEMPLATE_SECTION_ALIASES
+        )
+        for paragraph in body_paragraphs
+    ):
+        return "anchored"
+    return "style_only"
+
+
+def detect_docx_template_mode(template: str | Path) -> str:
+    """Classify a user DOCX without mutating it."""
+
+    try:
+        path = Path(template)
+        if path.is_file() and path.suffix.lower() == ".docx":
+            return _template_mode(DocxDocument(str(path)))
+    except Exception as exc:
+        logger.warning("DOCX template mode detection failed | template=%s error=%s", template, exc)
+    return "style_only"
+
+
+def _xml_element_text(element: Any) -> str:
+    return "".join(str(node.text or "") for node in element.iter(qn("w:t"))).strip()
+
+
+def _set_xml_paragraph_text(
+    paragraph_element: Any,
+    value: str,
+    *,
+    bold: bool = False,
+) -> None:
+    """Replace a tagged prototype's text while retaining paragraph/run style."""
+
+    for existing_text in paragraph_element.iter(qn("w:t")):
+        existing_text.text = ""
+    runs = list(paragraph_element.findall(qn("w:r")))
+    if runs:
+        first_run = runs[0]
+    else:
+        first_run = OxmlElement("w:r")
+        paragraph_element.append(first_run)
+        runs = [first_run]
+    for run in runs:
+        for child in list(run):
+            if child.tag != qn("w:rPr"):
+                run.remove(child)
+    run_properties = first_run.find(qn("w:rPr"))
+    if bold:
+        if run_properties is None:
+            run_properties = OxmlElement("w:rPr")
+            first_run.insert(0, run_properties)
+        if run_properties.find(qn("w:b")) is None:
+            run_properties.append(OxmlElement("w:b"))
+    text_element = OxmlElement("w:t")
+    text = str(value or "")
+    if text.startswith(" ") or text.endswith(" "):
+        text_element.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+    text_element.text = text
+    first_run.append(text_element)
+
+
+def _section_item_records(items: list[Any]) -> list[list[tuple[str, bool]]]:
+    records: list[list[tuple[str, bool]]] = []
+    for item in items:
+        if isinstance(item, tuple) and len(item) == 2:
+            heading, values = item
+            lines = [(str(heading).strip(), True)] if str(heading).strip() else []
+            if isinstance(values, list):
+                lines.extend(
+                    (str(value).strip(), False)
+                    for value in values
+                    if str(value).strip()
+                )
+            if lines:
+                records.append(lines)
+        elif str(item).strip():
+            records.append([(str(item).strip(), False)])
+    return records
+
+
+def _paragraph_section_tag(paragraph_element: Any) -> Optional[str]:
+    match = _TEMPLATE_SECTION_TAG_RE.fullmatch(_xml_element_text(paragraph_element))
+    return match.group(1).casefold() if match else None
+
+
+def _fill_tagged_paragraph_prototype(
+    prototype: Any,
+    lines: list[tuple[str, bool]],
+) -> list[Any]:
+    output: list[Any] = []
+    for text, bold in lines:
+        paragraph = copy.deepcopy(prototype)
+        _set_xml_paragraph_text(paragraph, text, bold=bold)
+        output.append(paragraph)
+    return output
+
+
+def _apply_tagged_section_anchors(
+    doc: DocxDocument,
+    sections: list[tuple[str, list[Any]]],
+) -> set[str]:
+    """Expand explicit section anchors in place without changing the shell."""
+
+    section_values = {title: values for title, values in sections}
+    consumed: set[str] = set()
+    processed_rows: set[int] = set()
+    for paragraph in list(_all_template_paragraphs(doc)):
+        key = _paragraph_section_tag(paragraph._element)
+        if key is None:
+            continue
+        title = _TEMPLATE_SECTION_TAGS.get(key)
+        if title is None:
+            logger.warning("Unsupported DOCX section anchor removed | anchor=section.%s", key)
+            parent = paragraph._element.getparent()
+            if parent is not None:
+                parent.remove(paragraph._element)
+            continue
+        consumed.add(title)
+        records = _section_item_records(section_values.get(title, []))
+        parent = paragraph._element.getparent()
+        row = parent.getparent() if parent is not None and parent.tag == qn("w:tc") else None
+        if row is not None and row.tag == qn("w:tr"):
+            marker = id(row)
+            if marker in processed_rows:
+                continue
+            processed_rows.add(marker)
+            row_parent = row.getparent()
+            if row_parent is None:
+                continue
+            for record in records:
+                cloned_row = copy.deepcopy(row)
+                tagged_paragraphs = [
+                    candidate for candidate in cloned_row.iter(qn("w:p"))
+                    if _paragraph_section_tag(candidate) == key
+                ]
+                tagged_paragraph = tagged_paragraphs[0] if tagged_paragraphs else None
+                if tagged_paragraph is None:
+                    continue
+                # A repeating row is a formatting prototype, never a source of
+                # candidate facts. Clear sample text/portraits from every cell
+                # while retaining row, cell, paragraph and run properties.
+                for candidate in cloned_row.iter(qn("w:p")):
+                    if candidate is not tagged_paragraph:
+                        _set_xml_paragraph_text(candidate, "")
+                for tag in ("w:drawing", "w:pict", "w:object"):
+                    for node in list(cloned_row.iter(qn(tag))):
+                        node_parent = node.getparent()
+                        if node_parent is not None:
+                            node_parent.remove(node)
+                inserted = _fill_tagged_paragraph_prototype(tagged_paragraph, record)
+                for replacement in inserted:
+                    tagged_paragraph.addprevious(replacement)
+                tagged_paragraph.getparent().remove(tagged_paragraph)
+                row.addprevious(cloned_row)
+            row_parent.remove(row)
+            continue
+
+        if parent is None:
+            continue
+        flattened = [line for record in records for line in record]
+        for replacement in _fill_tagged_paragraph_prototype(paragraph._element, flattened):
+            paragraph._element.addprevious(replacement)
+        parent.remove(paragraph._element)
+    return consumed
+
+
+def _paragraphs_before_first_template_section(
+    doc: DocxDocument,
+    section_headings: list[str],
+) -> list[Any]:
+    wrappers = {
+        paragraph._element: paragraph
+        for paragraph in _all_template_paragraphs(doc)
+    }
+    recognized_headings = list(dict.fromkeys([
+        *section_headings,
+        *_TEMPLATE_SECTION_ALIASES.keys(),
+    ]))
+    result: list[Any] = []
+    for child in doc._element.body:
+        elements = [child] if child.tag == qn("w:p") else list(child.iter(qn("w:p")))
+        for element in elements:
+            text = _xml_element_text(element)
+            if _TEMPLATE_SECTION_TAG_RE.fullmatch(text) or any(
+                _template_section_matches(text, heading) for heading in recognized_headings
+            ):
+                return result
+            wrapper = wrappers.get(element)
+            if wrapper is not None:
+                result.append(wrapper)
+    return result
+
+
+def _sanitize_template_identity_block(
+    doc: DocxDocument,
+    resume_data: dict[str, Any],
+    section_headings: list[str],
+) -> None:
+    """Remove sample-person text and portraits before the first section."""
+
+    paragraphs = _paragraphs_before_first_template_section(doc, section_headings)
+    for paragraph in paragraphs:
+        for tag in ("w:drawing", "w:pict", "w:object"):
+            for node in list(paragraph._element.iter(qn(tag))):
+                parent = node.getparent()
+                if parent is not None:
+                    parent.remove(node)
+
+    decorative = {"个人简历", "求职简历", "resume", "cv", "curriculumvitae"}
+    candidates = [
+        paragraph for paragraph in paragraphs
+        if paragraph.text.strip()
+        and re.sub(r"\W+", "", paragraph.text).casefold() not in decorative
+    ]
+    meta = resume_data.get("meta", {}) if isinstance(resume_data, dict) else {}
+    if not isinstance(meta, dict):
+        meta = {}
+    name = str(meta.get("name", "") or "").strip()
+    contact = " | ".join(
+        str(meta.get(key, "") or "").strip()
+        for key in ("phone", "email", "wechat", "github", "linkedin", "website")
+        if str(meta.get(key, "") or "").strip()
+    )
+    target = str(meta.get("target_role", "") or "").strip()
+    values = [value for value in (name, contact, target) if value]
+    for index, paragraph in enumerate(candidates):
+        _set_paragraph_text_preserving_style(
+            paragraph,
+            values[index] if index < len(values) else "",
+            bold=(index == 0 and bool(name)),
+        )
+
+
+def _structured_template_allowed_fragments(
+    resume_data: dict[str, Any],
+    sections: list[tuple[str, list[Any]]],
+) -> set[str]:
+    fragments: set[str] = set()
+    meta = resume_data.get("meta", {}) if isinstance(resume_data, dict) else {}
+    if isinstance(meta, dict):
+        fragments.update(
+            str(value).strip() for value in meta.values()
+            if isinstance(value, (str, int, float)) and str(value).strip()
+        )
+    summary = str(resume_data.get("summary", "") or "").strip()
+    if summary:
+        fragments.add(summary)
+    for heading, items in sections:
+        fragments.add(str(heading).strip())
+        for record in _section_item_records(items):
+            fragments.update(text for text, _bold in record if text)
+    return fragments
+
+
+def _sanitize_structured_template_residuals(
+    doc: DocxDocument,
+    resume_data: dict[str, Any],
+    sections: list[tuple[str, list[Any]]],
+) -> None:
+    """Remove example-person body content left outside recognized anchors."""
+
+    allowed = _structured_template_allowed_fragments(resume_data, sections)
+    decorative = {"个人简历", "求职简历", "resume", "cv", "curriculumvitae"}
+    safe_label = re.compile(
+        r"^(?:姓名|电话|手机|邮箱|微信|联系方式|求职意向|目标岗位|时间|公司|岗位|职责|项目)\s*[:：]?$",
+        re.IGNORECASE,
+    )
+    for paragraph in list(_all_template_paragraphs(doc)):
+        element = paragraph._element
+        text = paragraph.text.strip()
+        compact = re.sub(r"\W+", "", text).casefold()
+        is_heading = any(
+            _template_section_matches(text, heading)
+            for heading in _TEMPLATE_SECTION_ALIASES
+        )
+        is_supported = any(
+            fragment and (fragment in text or text in fragment)
+            for fragment in allowed
+        )
+        keep = bool(
+            not text
+            or compact in decorative
+            or safe_label.fullmatch(text)
+            or is_heading
+            or is_supported
+        )
+
+        # Body drawings are commonly the sample candidate's portrait. Header
+        # and footer relationships are deliberately outside this traversal.
+        for tag in ("w:drawing", "w:pict", "w:object"):
+            for node in list(element.iter(qn(tag))):
+                node_parent = node.getparent()
+                if node_parent is not None:
+                    node_parent.remove(node)
+        if not text:
+            # Empty sample spacer paragraphs may still carry hard page breaks.
+            # Keep ordinary spacing but remove constructs that can create an
+            # otherwise blank page in the middle of the generated resume.
+            for node in list(element.iter(qn("w:br"))):
+                node_parent = node.getparent()
+                if node_parent is not None:
+                    node_parent.remove(node)
+            paragraph_properties = element.find(qn("w:pPr"))
+            if paragraph_properties is not None:
+                page_break = paragraph_properties.find(qn("w:pageBreakBefore"))
+                if page_break is not None:
+                    paragraph_properties.remove(page_break)
+        if keep:
+            continue
+        parent = element.getparent()
+        if parent is not None and parent.tag == qn("w:body"):
+            parent.remove(element)
+        else:
+            _set_xml_paragraph_text(element, "")
+
+
+def _is_known_template_heading(text: str) -> bool:
+    return any(
+        _template_section_matches(text, heading)
+        for heading in _TEMPLATE_SECTION_ALIASES
+    )
+
+
+def _remove_empty_structured_headings(doc: DocxDocument) -> None:
+    """Drop headings whose sample body was cleared and received no facts."""
+
+    body = doc._element.body
+    children = list(body)
+
+    def paragraph_elements(element: Any) -> list[Any]:
+        return [element] if element.tag == qn("w:p") else list(element.iter(qn("w:p")))
+
+    def has_heading(element: Any) -> bool:
+        return any(
+            _is_known_template_heading(_xml_element_text(paragraph))
+            for paragraph in paragraph_elements(element)
+        )
+
+    def has_non_heading_text(element: Any) -> bool:
+        return any(
+            bool(text := _xml_element_text(paragraph))
+            and not _is_known_template_heading(text)
+            for paragraph in paragraph_elements(element)
+        )
+
+    for index, child in enumerate(children):
+        if child.tag != qn("w:p") or not has_heading(child):
+            continue
+        populated = False
+        for sibling in children[index + 1:]:
+            if sibling.tag == qn("w:sectPr") or has_heading(sibling):
+                break
+            if has_non_heading_text(sibling):
+                populated = True
+                break
+        if not populated and child.getparent() is body:
+            body.remove(child)
+
+    # A section heading may live in one cell while its generated facts occupy
+    # a companion cell or following rows. Empty table headings are cleared but
+    # the row/grid shell remains intact.
+    for table in doc.tables:
+        rows = list(table.rows)
+        for index, row in enumerate(rows):
+            headings = [
+                paragraph
+                for cell in row.cells
+                for paragraph in cell.paragraphs
+                if _is_known_template_heading(paragraph.text.strip())
+            ]
+            if not headings:
+                continue
+            current_content = any(
+                paragraph.text.strip()
+                and paragraph not in headings
+                and not _is_known_template_heading(paragraph.text.strip())
+                for cell in row.cells
+                for paragraph in cell.paragraphs
+            )
+            populated = current_content
+            for following in rows[index + 1:]:
+                if any(
+                    _is_known_template_heading(paragraph.text.strip())
+                    for cell in following.cells
+                    for paragraph in cell.paragraphs
+                ):
+                    break
+                if any(
+                    paragraph.text.strip()
+                    for cell in following.cells
+                    for paragraph in cell.paragraphs
+                ):
+                    populated = True
+                    break
+            if not populated:
+                for heading in headings:
+                    _set_xml_paragraph_text(heading._element, "")
+
+
+_SECTION_GEOMETRY_TAGS = (
+    "w:pgSz",
+    "w:pgMar",
+    "w:cols",
+    "w:docGrid",
+    "w:mirrorMargins",
+    "w:gutterAtTop",
+    "w:paperSrc",
+)
+
+
+def _capture_section_geometry(doc: DocxDocument) -> list[dict[str, Any]]:
+    snapshots: list[dict[str, Any]] = []
+    for section in doc.sections:
+        snapshots.append({
+            tag: copy.deepcopy(node)
+            for tag in _SECTION_GEOMETRY_TAGS
+            if (node := section._sectPr.find(qn(tag))) is not None
+        })
+    return snapshots
+
+
+def _restore_section_geometry(
+    doc: DocxDocument,
+    snapshots: list[dict[str, Any]],
+) -> None:
+    for section, snapshot in zip(doc.sections, snapshots):
+        section_properties = section._sectPr
+        for tag in _SECTION_GEOMETRY_TAGS:
+            current = section_properties.find(qn(tag))
+            if current is not None:
+                section_properties.remove(current)
+            saved = snapshot.get(tag)
+            if saved is not None:
+                section_properties.append(copy.deepcopy(saved))
+
+
 def _template_supports_structured_injection(doc: DocxDocument) -> bool:
     """Return whether a DOCX exposes anchors that can be filled safely.
 
@@ -1902,24 +2423,7 @@ def _template_supports_structured_injection(doc: DocxDocument) -> bool:
     section heading in either normal paragraphs or table cells.
     """
 
-    paragraphs: list[Any] = list(doc.paragraphs)
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                paragraphs.extend(cell.paragraphs)
-    for paragraph in paragraphs:
-        text = paragraph.text.strip()
-        if re.search(
-            r"(?:\{\{[^{}]+\}\}|\$\{[^{}]+\}|\[\[[^\[\]]+\]\])",
-            text,
-        ):
-            return True
-        if any(
-            _template_section_matches(text, title)
-            for title in _TEMPLATE_SECTION_ALIASES
-        ):
-            return True
-    return False
+    return _template_mode(doc) != "style_only"
 
 
 def _initialize_docx_defaults(doc: DocxDocument, *, reset_geometry: bool) -> None:
@@ -2512,12 +3016,20 @@ def render_docx(
     template_path = Path(tpl) if Path(tpl).is_file() else None
     source_docx: Optional[DocxDocument] = None
     table_header_shell = None
+    section_geometry: list[dict[str, Any]] = []
 
     if template_path is not None and template_path.suffix.lower() == ".docx":
         source_docx = DocxDocument(str(template_path))
-        if not framework_mode and _template_supports_structured_injection(source_docx):
-            _apply_resume_data_to_template(source_docx, resume_data)
-            apply_template_style_profile(source_docx, resume_data, profile)
+        section_geometry = _capture_section_geometry(source_docx)
+        template_mode = _template_mode(source_docx)
+        if not framework_mode and template_mode != "style_only":
+            _apply_resume_data_to_template(
+                source_docx,
+                resume_data,
+                template_mode=template_mode,
+            )
+            # The anchored/tagged document is already the authoritative shell.
+            # Do not re-derive and rewrite its margins, theme or heading styles.
             if _layout_retry:
                 _apply_docx_compact_typography(source_docx)
             _apply_docx_pagination_guards(source_docx)
@@ -2531,6 +3043,7 @@ def render_docx(
                 actual_report.get("issues"),
                 profile.source_kind,
             )
+            logger.info("Rendered user DOCX template | mode=%s path=%s", template_mode, template_path)
             if _layout_needs_tightening(actual_report) and not _layout_retry:
                 render_docx(
                     _layout_retry_data(resume_data, actual_report),
@@ -2560,6 +3073,8 @@ def render_docx(
         render_data = _resume_data_without_header_fields(resume_data)
     _render_docx_with_preset(doc, render_data, profile.preset, framework_mode)
     apply_template_style_profile(doc, resume_data, profile)
+    if source_docx is not None:
+        _restore_section_geometry(doc, section_geometry)
 
     _apply_docx_pagination_guards(doc)
     if _layout_retry:
@@ -2589,11 +3104,23 @@ def render_docx(
         logger.warning("Generated DOCX estimated at %.1f pages (may affect visual score) | path=%s", estimated, output_path)
 
 
-def _apply_resume_data_to_template(doc: "DocxDocument", resume_data: dict[str, Any]) -> None:
+def _apply_resume_data_to_template(
+    doc: "DocxDocument",
+    resume_data: dict[str, Any],
+    *,
+    template_mode: Optional[str] = None,
+) -> None:
     """Apply resume data to a user-provided template by replacing placeholder runs."""
-    _replace_template_placeholders(doc, resume_data)
     # Collect resume sections as a flat list of (heading, items)
     sections = _build_renderable_sections(resume_data)
+    section_headings = [heading for heading, _items in sections]
+    _replace_template_placeholders(doc, resume_data)
+    _sanitize_template_identity_block(doc, resume_data, section_headings)
+    tagged_sections = (
+        _apply_tagged_section_anchors(doc, sections)
+        if (template_mode or _template_mode(doc)) == "tagged"
+        else set()
+    )
 
     def all_paragraphs() -> list[Any]:
         paragraphs: list[Any] = list(doc.paragraphs)
@@ -2606,8 +3133,6 @@ def _apply_resume_data_to_template(doc: "DocxDocument", resume_data: dict[str, A
                             seen.add(id(paragraph._element))
                             paragraphs.append(paragraph)
         return paragraphs
-
-    section_headings = [heading for heading, _items in sections]
 
     def element_text(element: Any) -> str:
         return "".join(
@@ -2702,44 +3227,9 @@ def _apply_resume_data_to_template(doc: "DocxDocument", resume_data: dict[str, A
         return anchor
 
     original_paragraphs = all_paragraphs()
-    # A real-world template often contains a sample person's name/contact text
-    # rather than explicit {{placeholders}}.  Replace only the bounded identity
-    # block before the first top-level section heading; section bodies are
-    # handled separately below. Decorative RESUME/CV labels remain intact.
-    top_level = list(doc.paragraphs)
-    first_heading_index = next((
-        index for index, paragraph in enumerate(top_level)
-        if is_section_heading(paragraph.text.strip())
-    ), len(top_level))
-    header_candidates = [
-        paragraph for paragraph in top_level[:first_heading_index]
-        if paragraph.text.strip()
-        and re.sub(r"\W+", "", paragraph.text).casefold()
-        not in {"个人简历", "resume", "curriculumvitae", "cv"}
-    ]
     meta = resume_data.get("meta", {}) if isinstance(resume_data, dict) else {}
     if not isinstance(meta, dict):
         meta = {}
-    candidate_name = str(meta.get("name", "") or "").strip()
-    contact_line = " | ".join(
-        str(meta.get(key, "") or "").strip()
-        for key in ("phone", "email", "wechat", "github", "linkedin")
-        if str(meta.get(key, "") or "").strip()
-    )
-    if candidate_name and not any(
-        paragraph.text.strip() == candidate_name for paragraph in original_paragraphs
-    ) and header_candidates:
-        _set_paragraph_text_preserving_style(
-            header_candidates[0], candidate_name, bold=True,
-        )
-        if contact_line and len(header_candidates) > 1:
-            _set_paragraph_text_preserving_style(header_candidates[1], contact_line)
-        for paragraph in header_candidates[2 if contact_line else 1:]:
-            if re.search(
-                r"(?:1[3-9]\d(?:[\s-]?\d){8}|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})",
-                paragraph.text,
-            ):
-                _set_paragraph_text_preserving_style(paragraph, "")
     heading_prototype = next(
         (
             paragraph._element
@@ -2785,6 +3275,8 @@ def _apply_resume_data_to_template(doc: "DocxDocument", resume_data: dict[str, A
     )
 
     for section_heading, items in sections:
+        if section_heading in tagged_sections:
+            continue
         matched = False
         for para in all_paragraphs():
             full_text = para.text.strip()
@@ -2855,15 +3347,18 @@ def _apply_resume_data_to_template(doc: "DocxDocument", resume_data: dict[str, A
             paragraph.text for paragraph in all_paragraphs()
         )
         if section_heading == "基本信息":
-            required_identity_values = [
-                str(meta.get(key, "") or "").strip()
-                for key in ("name", "phone", "email")
-                if str(meta.get(key, "") or "").strip()
-            ]
-            if required_identity_values and all(
-                value in current_document_text for value in required_identity_values
-            ):
+            missing_basic_items: list[Any] = []
+            for item in items:
+                text = str(item).strip()
+                # A rendered item such as ``目标岗位: 产品经理`` is already
+                # present when its factual value appears in a custom identity
+                # block, even if the template uses a different label.
+                factual_value = re.split(r"\s*[:：]\s*", text, maxsplit=1)[-1]
+                if factual_value and factual_value not in current_document_text:
+                    missing_basic_items.append(item)
+            if not missing_basic_items:
                 continue
+            items = missing_basic_items
         if section_heading == "个人总结":
             summary_value = str(resume_data.get("summary", "") or "").strip()
             if summary_value and summary_value in current_document_text:
@@ -2916,6 +3411,8 @@ def _apply_resume_data_to_template(doc: "DocxDocument", resume_data: dict[str, A
             items,
             template_element=body_prototype,
         )
+    _sanitize_structured_template_residuals(doc, resume_data, sections)
+    _remove_empty_structured_headings(doc)
 
 
 def _template_section_matches(text: str, section_heading: str) -> bool:
@@ -2960,20 +3457,10 @@ def _replace_template_placeholders(doc: "DocxDocument", resume_data: dict[str, A
         replaced = _replace_text(original)
         if replaced == original:
             return
-        for run in para.runs:
-            run.text = ""
-        if para.runs:
-            para.runs[0].text = replaced
-        else:
-            para.add_run(replaced)
+        _set_xml_paragraph_text(para._element, replaced)
 
-    for para in doc.paragraphs:
+    for para in _all_template_story_paragraphs(doc):
         _replace_para(para)
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                for para in cell.paragraphs:
-                    _replace_para(para)
 
 
 def _build_renderable_sections(resume_data: dict[str, Any]) -> list[tuple[str, list]]:

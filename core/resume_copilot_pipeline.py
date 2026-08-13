@@ -37,7 +37,7 @@ from resume_optimization import (
     apply_patches,
 )
 from resume_parsing import cleanup_ocr_text, _count_resume_bullets, resume_data_to_text, structured_resume_from_text
-from resume_renderer import export_resume_files
+from resume_renderer import detect_docx_template_mode, export_resume_files
 from resume_scoring import score_resume
 from resume_validator import (
     check_fabrication_heuristic,
@@ -1510,7 +1510,13 @@ async def stage_ingest(
     elif cv_template is not None and Path(effective_template).is_file():
         suffix = Path(effective_template).suffix.lower()
         if suffix == ".docx":
-            ctx.template_notes.append("已优先复用用户 DOCX 模板的结构、页边距与视觉样式。")
+            mode = detect_docx_template_mode(effective_template)
+            if mode == "tagged":
+                ctx.template_notes.append("已按用户 DOCX 的字段占位符和章节锚点原位填充，并保留表格、页边距与样式。")
+            elif mode == "anchored":
+                ctx.template_notes.append("已按用户 DOCX 的章节标题和表格锚点原位填充，并清除样例人物内容。")
+            else:
+                ctx.template_notes.append("用户 DOCX 缺少可靠锚点；已清除样例人物内容，仅复用页眉页脚、页边距、表格壳与安全样式。")
         else:
             ctx.template_notes.append("已从用户模板提取配色、对齐、间距与标题装饰，并生成可编辑 DOCX。")
     ctx.template_path = effective_template

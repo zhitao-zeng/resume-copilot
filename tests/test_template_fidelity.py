@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import copy
 from pathlib import Path
 from unittest.mock import patch
 import zipfile
@@ -8,11 +10,11 @@ import zipfile
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
-from docx.shared import Pt, RGBColor
+from docx.shared import Inches, Pt, RGBColor
 
 import resume_copilot_pipeline
 from resume_generate_api import _MockUpload
-from resume_renderer import render_docx
+from resume_renderer import detect_docx_template_mode, render_docx
 from template_layout import extract_template_style_profile
 
 
@@ -71,6 +73,27 @@ def _paragraph_shading(paragraph) -> str:
 def _paragraph_bottom_border(paragraph) -> str:
     border = paragraph._element.find("./w:pPr/w:pBdr/w:bottom", {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"})
     return border.get(qn("w:val"), "") if border is not None else ""
+
+
+def _all_document_text(doc: Document) -> str:
+    body = [paragraph.text for paragraph in doc.paragraphs]
+    tables = [
+        cell.text
+        for table in doc.tables
+        for row in table.rows
+        for cell in row.cells
+    ]
+    return "\n".join([*body, *tables])
+
+
+def _table_grid_widths(table) -> tuple[str, ...]:
+    grid = table._tbl.find(qn("w:tblGrid"))
+    if grid is None:
+        return ()
+    return tuple(
+        str(column.get(qn("w:w"), ""))
+        for column in grid.findall(qn("w:gridCol"))
+    )
 
 
 def test_compact_and_modern_docx_templates_produce_distinct_editable_layouts(tmp_path):
@@ -275,3 +298,214 @@ def test_template_upload_keeps_pdf_and_image_for_layout_analysis(tmp_path, monke
     assert pdf_path.suffix == ".pdf" and pdf_path.read_bytes() == b"%PDF-style"
     assert image_path.suffix == ".png" and image_path.read_bytes() == b"png-style"
     assert pdf_warnings == [] and image_warnings == []
+
+
+def test_docx_template_modes_are_deterministic(tmp_path):
+    tagged = tmp_path / "tagged.docx"
+    tagged_doc = Document()
+    tagged_doc.add_paragraph("{{name}}")
+    tagged_doc.add_paragraph("{{section.experience}}")
+    tagged_doc.save(tagged)
+
+    anchored = tmp_path / "anchored.docx"
+    anchored_doc = Document()
+    anchored_doc.add_paragraph("WORK EXPERIENCE")
+    anchored_doc.add_paragraph("Example work")
+    anchored_doc.save(anchored)
+
+    style_only = tmp_path / "style-only.docx"
+    style_doc = Document()
+    style_doc.add_paragraph("示例姓名和示例履历")
+    style_doc.add_table(rows=1, cols=2)
+    style_doc.save(style_only)
+
+    assert detect_docx_template_mode(tagged) == "tagged"
+    assert detect_docx_template_mode(anchored) == "anchored"
+    assert detect_docx_template_mode(style_only) == "style_only"
+
+
+def test_tagged_paragraph_anchors_preserve_shell_and_place_every_fact(tmp_path):
+    template = tmp_path / "tagged-shell.docx"
+    source = Document()
+    section = source.sections[0]
+    section.top_margin = Inches(0.43)
+    section.bottom_margin = Inches(0.57)
+    section.left_margin = Inches(0.71)
+    section.right_margin = Inches(0.83)
+    section.header.paragraphs[0].text = "CAREER PROFILE"
+    section.footer.paragraphs[0].text = "CONFIDENTIAL"
+    source.add_paragraph("{{name}}")
+    source.add_paragraph("{{phone}} | {{email}}")
+    source.add_paragraph("{{target_role}}")
+    source.add_paragraph("PROFILE")
+    source.add_paragraph("{{section.summary}}")
+    source.add_paragraph("WORK EXPERIENCE")
+    prototype = source.add_paragraph("{{section.experience}}")
+    prototype.runs[0].font.name = "Arial"
+    prototype.runs[0].font.size = Pt(9.5)
+    prototype.runs[0].font.italic = True
+    source.add_paragraph("PROJECTS")
+    source.add_paragraph("{{section.projects}}")
+    source.save(template)
+
+    output = tmp_path / "tagged-shell-output.docx"
+    rendered = _render(_payload(), output, template)
+    text = _all_document_text(rendered)
+    expected = (
+        "李明", "13800000000", "liming@example.com", "高级产品经理",
+        "具备五年B端产品经验", "星河科技有限公司", "产品经理",
+        "2021.03-2025.06", "访谈业务用户并梳理核心流程",
+        "协同研发、测试推进版本上线", "企业数据平台", "支持运营复盘",
+        "江南大学", "工业工程", "Axure", "SQL",
+    )
+    assert all(value in text for value in expected)
+    assert "{{" not in text and "示例" not in text
+    assert text.index("WORK EXPERIENCE") < text.index("星河科技有限公司")
+    assert text.index("PROJECTS") < text.index("企业数据平台")
+    injected = next(
+        paragraph for paragraph in rendered.paragraphs
+        if "访谈业务用户并梳理核心流程" in paragraph.text
+    )
+    assert injected.runs[0].font.name == "Arial"
+    assert round(injected.runs[0].font.size.pt, 1) == 9.5
+    assert injected.runs[0].font.italic is True
+    rendered_section = rendered.sections[0]
+    assert rendered_section.top_margin == section.top_margin
+    assert rendered_section.bottom_margin == section.bottom_margin
+    assert rendered_section.left_margin == section.left_margin
+    assert rendered_section.right_margin == section.right_margin
+    assert rendered_section.header.paragraphs[0].text == "CAREER PROFILE"
+    assert rendered_section.footer.paragraphs[0].text == "CONFIDENTIAL"
+
+
+def test_tagged_table_row_repeats_records_without_sample_leak(tmp_path):
+    template = tmp_path / "tagged-table.docx"
+    source = Document()
+    source.add_paragraph("WORK EXPERIENCE")
+    table = source.add_table(rows=1, cols=2)
+    table.style = "Table Grid"
+    table.columns[0].width = Inches(1.2)
+    table.columns[1].width = Inches(5.1)
+    table.cell(0, 0).text = "示例公司与示例头像"
+    anchor = table.cell(0, 1).paragraphs[0]
+    anchor.text = "{{section.experience}}"
+    anchor.runs[0].font.name = "Arial"
+    grid_before = _table_grid_widths(table)
+    source.save(template)
+
+    payload = copy.deepcopy(_payload())
+    payload["experience"].append({
+        "company": "远帆医疗中心",
+        "role": "运营专员",
+        "period": "2019.07-2021.02",
+        "bullets": ["整理患者服务流程并维护月度运营台账。"],
+    })
+    output = tmp_path / "tagged-table-output.docx"
+    rendered = _render(payload, output, template)
+    assert len(rendered.tables) == 1
+    rendered_table = rendered.tables[0]
+    assert len(rendered_table.rows) == 2
+    assert len(rendered_table.columns) == 2
+    assert _table_grid_widths(rendered_table) == grid_before
+    table_text = "\n".join(cell.text for row in rendered_table.rows for cell in row.cells)
+    assert "示例" not in table_text and "{{" not in table_text
+    assert "星河科技有限公司" in table_text
+    assert "远帆医疗中心" in table_text
+    assert "整理患者服务流程并维护月度运营台账" in table_text
+    assert all(row.cells[0].text.strip() == "" for row in rendered_table.rows)
+    with zipfile.ZipFile(output) as archive:
+        assert not any(
+            name.startswith(("word/header", "word/footer"))
+            for name in archive.namelist()
+        )
+
+
+def test_anchored_template_removes_sample_identity_portrait_and_absent_sections(tmp_path):
+    template = tmp_path / "anchored-sample.docx"
+    portrait = tmp_path / "sample.png"
+    portrait.write_bytes(base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    ))
+    source = Document()
+    identity = source.add_paragraph("王样例")
+    identity.add_run().add_picture(str(portrait), width=Inches(0.2))
+    source.add_paragraph("13911112222 | sample-person@example.com")
+    source.add_paragraph("WORK EXPERIENCE")
+    source.add_paragraph("旧公司 - 虚构岗位")
+    source.add_paragraph("负责旧模板中的示例经历，增长999%。")
+    source.add_paragraph("AWARDS")
+    source.add_paragraph("旧模板人物获得国家级示例奖项")
+    source.save(template)
+
+    output = tmp_path / "anchored-sample-output.docx"
+    rendered = _render(_payload(), output, template)
+    text = _all_document_text(rendered)
+    assert "王样例" not in text
+    assert "13911112222" not in text
+    assert "sample-person@example.com" not in text
+    assert "旧公司" not in text and "增长999%" not in text
+    assert "国家级示例奖项" not in text
+    assert "AWARDS" not in text
+    assert "李明" in text and "高级产品经理" in text
+    assert "星河科技有限公司" in text
+    assert len(rendered.inline_shapes) == 0
+
+
+def test_style_only_template_keeps_geometry_headers_footer_and_table_grid(tmp_path):
+    template = tmp_path / "style-shell.docx"
+    source = Document()
+    section = source.sections[0]
+    section.top_margin = Inches(0.27)
+    section.bottom_margin = Inches(1.31)
+    section.left_margin = Inches(0.41)
+    section.right_margin = Inches(1.47)
+    section.header.paragraphs[0].text = "简历模板页眉"
+    section.footer.paragraphs[0].text = "简历模板页脚"
+    table = source.add_table(rows=2, cols=2)
+    table.style = "Table Grid"
+    table.columns[0].width = Inches(1.4)
+    table.columns[1].width = Inches(4.8)
+    table.cell(0, 0).text = "示例姓名"
+    table.cell(0, 1).text = "sample@example.com"
+    table.cell(1, 0).text = "示例公司"
+    table.cell(1, 1).text = "旧模板工作经历"
+    grid_before = _table_grid_widths(table)
+    geometry_before = (
+        section.top_margin, section.bottom_margin,
+        section.left_margin, section.right_margin,
+    )
+    source.save(template)
+
+    output = tmp_path / "style-shell-output.docx"
+    rendered = _render(_payload(), output, template)
+    text = _all_document_text(rendered)
+    assert "示例" not in text and "sample@example.com" not in text
+    assert all(value in text for value in (
+        "李明", "星河科技有限公司", "企业数据平台", "江南大学", "Axure",
+    ))
+    rendered_section = rendered.sections[0]
+    assert (
+        rendered_section.top_margin, rendered_section.bottom_margin,
+        rendered_section.left_margin, rendered_section.right_margin,
+    ) == geometry_before
+    assert rendered_section.header.paragraphs[0].text == "简历模板页眉"
+    assert rendered_section.footer.paragraphs[0].text == "简历模板页脚"
+    assert len(rendered.tables) == 1
+    assert len(rendered.tables[0].columns) == 2
+    assert _table_grid_widths(rendered.tables[0]) == grid_before
+    assert rendered.tables[0].style.name == "Table Grid"
+
+
+def test_docx_rendering_never_drops_facts_to_enforce_a_page_budget(tmp_path):
+    payload = copy.deepcopy(_payload())
+    facts = [
+        f"唯一事实{i:03d}：完成第{i:03d}项验证并保留对应交付记录。"
+        for i in range(140)
+    ]
+    payload["experience"][0]["bullets"] = facts
+    output = tmp_path / "multi-page.docx"
+    with patch("resume_renderer.inspect_docx_layout", return_value={"available": False, "issues": []}):
+        render_docx(payload, output, template="classic")
+    rendered = Document(output)
+    text = _all_document_text(rendered)
+    assert all(fact in text for fact in facts)
