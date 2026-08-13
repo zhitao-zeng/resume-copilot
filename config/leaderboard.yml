@@ -8,4 +8,4 @@ inferenceVolumeMounts:
 
 inferenceImage:
   repository: "harbor-contest.4pd.io/zengzhitao/resume-copilot"
-  tag: "5ff1b7d-grounded-core"
+  tag: "26b8b1a-layout-template"
