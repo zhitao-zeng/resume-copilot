@@ -6,15 +6,84 @@ from __future__ import annotations
 
 import re
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from typing import Any, Literal, Optional
+
+
+SourceType = Literal["resume", "query", "jd"]
+FactType = Literal[
+    "identity",
+    "contact",
+    "organization",
+    "role",
+    "period",
+    "education",
+    "action",
+    "method",
+    "deliverable",
+    "result",
+    "skill",
+    "credential",
+    "metric",
+    "other",
+]
+
+
+class SourceDocument(BaseModel):
+    """One normalized text input whose offsets remain stable for this run."""
+
+    model_config = ConfigDict(extra="forbid")
+    source_id: str
+    source_type: SourceType
+    text: str
+
+
+class SourceSpan(BaseModel):
+    """Half-open character range into a :class:`SourceDocument`."""
+
+    model_config = ConfigDict(extra="forbid")
+    source_id: str
+    char_start: int = Field(ge=0)
+    char_end: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def end_must_follow_start(self) -> "SourceSpan":
+        if self.char_end < self.char_start:
+            raise ValueError("char_end must be greater than or equal to char_start")
+        return self
+
+
+class FactUnit(BaseModel):
+    """Domain-neutral, source-grounded fact used by audits and repairs."""
+
+    model_config = ConfigDict(extra="forbid")
+    fact_id: str
+    block_id: str
+    origin_block_id: str
+    source_type: SourceType
+    source_spans: list[SourceSpan] = Field(default_factory=list)
+    section_hint: Optional[str] = None
+    record_id: Optional[str] = None
+    fact_type: FactType = "other"
+    dimensions: list[FactType] = Field(default_factory=list)
+    verbatim_text: str
+    normalized_text: str = ""
+    fact_eligible: bool = True
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
 
 
 class SourceBlock(BaseModel):
     model_config = ConfigDict(extra="forbid")
     block_id: str
-    source_type: Literal["resume", "query", "jd"]
+    source_type: SourceType
     text: str
+    source_id: str = ""
+    # These fields are internal provenance.  Excluding them from ordinary
+    # model dumps prevents Composer chunks and diagnostic logs from duplicating
+    # the complete source text, while direct attribute access remains intact.
+    source_spans: list[SourceSpan] = Field(default_factory=list, exclude=True)
+    origin_block_ids: list[str] = Field(default_factory=list, exclude=True)
+    fact_ids: list[str] = Field(default_factory=list, exclude=True)
     section_hint: Optional[str] = None
     # Deterministic source-side record boundary.  Evidence binding uses this to
     # prevent an organization/role/bullet from different jobs or projects from
@@ -29,6 +98,8 @@ class SourceBlock(BaseModel):
 class SourceBundle(BaseModel):
     model_config = ConfigDict(extra="forbid")
     blocks: list[SourceBlock]
+    documents: list[SourceDocument] = Field(default_factory=list, exclude=True)
+    fact_units: list[FactUnit] = Field(default_factory=list, exclude=True)
 
 
 class EvidenceRef(BaseModel):
@@ -227,6 +298,10 @@ class EvidenceBinding(BaseModel):
     # binding for backward compatibility, while this list retains every
     # source block used by that one final claim.
     block_ids: list[str] = Field(default_factory=list)
+    # Exact fact/span provenance is additive; legacy traces containing only
+    # block IDs remain valid.
+    fact_ids: list[str] = Field(default_factory=list)
+    source_spans: list[SourceSpan] = Field(default_factory=list)
     quote: str
     # Final claim text is kept internally so reverse coverage can verify which
     # source fact units actually survived, rather than treating one binding as

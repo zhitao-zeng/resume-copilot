@@ -8,4 +8,4 @@ inferenceVolumeMounts:
 
 inferenceImage:
   repository: "harbor-contest.4pd.io/zengzhitao/resume-copilot"
-  tag: "eb48f1c-grounded-richness-reply"
+  tag: "f507820-post-guard-consistency"

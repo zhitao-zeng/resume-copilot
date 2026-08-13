@@ -6,7 +6,14 @@ from __future__ import annotations
 
 import re
 
-from v2_schemas import SourceBlock, SourceBundle
+from v2_schemas import (
+    FactType,
+    FactUnit,
+    SourceBlock,
+    SourceBundle,
+    SourceDocument,
+    SourceSpan,
+)
 
 
 _SECTION_ALIASES = {
@@ -146,6 +153,147 @@ _QUERY_FACT_CONTINUATION = re.compile(
     r"统计|分析|策划|撰写|组织|推动|跟进|处理|培训)",
     re.IGNORECASE,
 )
+
+_FACT_FIELD_LABEL = re.compile(
+    r"^(?:姓名|电话|手机|邮箱|学校|院校|学历|学位|专业|公司|单位|岗位|职位|"
+    r"项目名称|项目角色|技能|证书|奖项|任职时间|起止时间|个人总结|自我评价)\s*[:：]\s*",
+    re.IGNORECASE,
+)
+_FACT_SEGMENT_SPLIT = re.compile(
+    r"(?:[。；;]+|[|｜]+|(?<=[^\s])[,，、](?=[^\s]))"
+)
+_FACT_NON_CONTENT = re.compile(
+    r"^(?:个人简历|简历|resume|curriculum\s+vitae|cv)$",
+    re.IGNORECASE,
+)
+_FACT_CONTACT = re.compile(
+    r"(?:1[3-9]\d(?:[\s-]?\d){8}|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})"
+)
+_FACT_DATE = re.compile(
+    r"(?:19|20)\d{2}(?:[./年-]\d{1,2}月?)?|至今|现在|应届",
+    re.IGNORECASE,
+)
+_FACT_ORGANIZATION = re.compile(
+    r"(?:大学|学院|学校|医院|公司|企业|集团|研究院|实验室|中心|银行|"
+    r"事务所|律所|协会|基金会|工作室|团队|部门)$"
+)
+_FACT_ROLE = re.compile(r"(?:岗位|职位|角色|职务|担任|任职|作为)\s*[:：]?")
+_FACT_ACTION = re.compile(
+    r"(?:负责|参与|主导|协助|支持|配合|推动|推进|组织|协调|带领|执行|"
+    r"设计|开发|构建|实现|制定|管理|运营|分析|统计|策划|培训|处理|研究|"
+    r"撰写|输出|交付|维护|优化|搭建|建立|开展|承担|提供|跟进|编制|制作|"
+    r"诊断|治疗|授课|教学|复核|检索|调研)"
+)
+_FACT_METHOD = re.compile(
+    r"(?:通过|使用|采用|基于|借助|运用|利用|结合|按照|依托|围绕|经由)"
+)
+_FACT_DELIVERABLE = re.compile(
+    r"(?:输出|交付|完成|形成|上线|发布|落地|搭建|建立|制定|编制|制作|"
+    r"撰写|产出|提交|复核|验证|诊断|治疗|授课|培养)"
+)
+_FACT_RESULT = re.compile(
+    r"(?:提升|提高|降低|减少|增长|缩短|节省|达到|达成|获得|获奖|录用|"
+    r"成交|销售率|准确率|转化率|留存率|满意度)"
+)
+_FACT_METRIC = re.compile(
+    r"(?<![A-Za-z0-9])\d+(?:\.\d+)?\s*(?:%|万|亿|w|k|人|次|个|条|元|年|月|日)?",
+    re.IGNORECASE,
+)
+_FACT_CREDENTIAL = re.compile(
+    r"(?:证书|资格|资质|执照|认证|奖学金|一等奖|二等奖|三等奖|金奖|银奖|铜奖)"
+)
+_FACT_EDUCATION = re.compile(r"(?:本科|硕士|博士|大专|专科|学士|学校|大学|学院|专业)")
+_FACT_SKILL = re.compile(r"(?:熟悉|熟练|精通|掌握|会用|使用过|技能|工具|语言)")
+
+
+def _source_line_entries(text: str) -> list[tuple[str, int, int]]:
+    """Return stripped physical lines with offsets into the unchanged text."""
+
+    entries: list[tuple[str, int, int]] = []
+    for match in re.finditer(r"[^\r\n]+", text):
+        raw = match.group(0)
+        left = len(raw) - len(raw.lstrip())
+        right = len(raw.rstrip())
+        if right <= left:
+            continue
+        entries.append((raw[left:right], match.start() + left, match.start() + right))
+    return entries
+
+
+def _query_clause_entries(text: str) -> list[tuple[str, int, int]]:
+    """Segment mixed query prose while retaining offsets in the original query."""
+
+    separator = re.compile(
+        r"(?:[\r\n，；;。]+|(?<!不)(?:但是|但|不过|然而))",
+        re.IGNORECASE,
+    )
+    entries: list[tuple[str, int, int]] = []
+    cursor = 0
+    for match in separator.finditer(text):
+        raw = text[cursor:match.start()]
+        left = len(raw) - len(raw.lstrip())
+        right = len(raw.rstrip())
+        if right > left:
+            entries.append((raw[left:right], cursor + left, cursor + right))
+        cursor = match.end()
+    raw = text[cursor:]
+    left = len(raw) - len(raw.lstrip())
+    right = len(raw.rstrip())
+    if right > left:
+        entries.append((raw[left:right], cursor + left, cursor + right))
+    return entries
+
+
+def _trim_fact_range(value: str, start: int, end: int) -> tuple[int, int]:
+    while start < end and value[start].isspace():
+        start += 1
+    while start < end and value[end - 1].isspace():
+        end -= 1
+    bullet = re.match(r"(?:[-*•·▪◦]|\d{1,3}(?:[、)]|\.(?!\d)))\s*", value[start:end])
+    if bullet:
+        start += bullet.end()
+    return start, end
+
+
+def _fact_dimensions(value: str, section: str | None) -> list[FactType]:
+    dimensions: list[FactType] = []
+    if _FACT_CONTACT.search(value):
+        dimensions.append("contact")
+    if _FACT_DATE.search(value):
+        dimensions.append("period")
+    if _FACT_ORGANIZATION.search(value):
+        dimensions.append("organization")
+    if _FACT_ROLE.search(value):
+        dimensions.append("role")
+    if section == "education" or _FACT_EDUCATION.search(value):
+        dimensions.append("education")
+    if _FACT_ACTION.search(value):
+        dimensions.append("action")
+    if _FACT_METHOD.search(value):
+        dimensions.append("method")
+    if _FACT_DELIVERABLE.search(value):
+        dimensions.append("deliverable")
+    if _FACT_RESULT.search(value):
+        dimensions.append("result")
+    if section == "skills" or _FACT_SKILL.search(value):
+        dimensions.append("skill")
+    if section in {"certifications", "awards"} or _FACT_CREDENTIAL.search(value):
+        dimensions.append("credential")
+    if _FACT_METRIC.search(value):
+        dimensions.append("metric")
+    if section == "meta" and not dimensions:
+        dimensions.append("identity")
+    return list(dict.fromkeys(dimensions))
+
+
+def _primary_fact_type(dimensions: list[FactType]) -> FactType:
+    for value in (
+        "contact", "organization", "role", "period", "education", "credential",
+        "result", "deliverable", "method", "action", "skill", "metric", "identity",
+    ):
+        if value in dimensions:
+            return value  # type: ignore[return-value]
+    return "other"
 
 
 def _query_clause_continues_section(value: str, section: str) -> bool:
@@ -685,6 +833,10 @@ def _coalesce_wrapped_blocks(blocks: list[SourceBlock]) -> list[SourceBlock]:
         )
         if continuation and previous is not None:
             previous.text = previous_value + value
+            previous.source_spans.extend(block.source_spans)
+            previous.origin_block_ids.extend(
+                block.origin_block_ids or [block.block_id]
+            )
         else:
             merged.append(block)
     # A multi-column extractor can emit the tail of a sentence before the
@@ -754,6 +906,8 @@ def _coalesce_wrapped_blocks(blocks: list[SourceBlock]) -> list[SourceBlock]:
             if len(object_candidates) != 1 or tail.record_id != latest_record_id:
                 continue
         head.text = head_value.rstrip("。；; ") + tail.text.strip()
+        head.source_spans.extend(tail.source_spans)
+        head.origin_block_ids.extend(tail.origin_block_ids or [tail.block_id])
         # A non-numbered object continuation inherits the record provenance of
         # its consumed fragment. Numbered duties keep their own unscoped order
         # so the separate numbering matcher can associate the complete list.
@@ -769,21 +923,37 @@ def _coalesce_wrapped_blocks(blocks: list[SourceBlock]) -> list[SourceBlock]:
     return merged
 
 
-def _split_into_blocks(text: str, source_type: str) -> list[SourceBlock]:
+def _split_into_blocks(
+    text: str,
+    source_type: str,
+    *,
+    source_id: str | None = None,
+    entries: list[tuple[str, int, int]] | None = None,
+) -> list[SourceBlock]:
     """Split text into ordered blocks and retain deterministic section hints."""
     blocks: list[SourceBlock] = []
     current_section = ""
-    lines = [line.strip() for line in text.strip().split("\n") if line.strip()]
-    for line_index, line in enumerate(lines):
+    resolved_source_id = source_id or source_type
+    line_entries = entries if entries is not None else _source_line_entries(text)
+    lines = [line for line, _start, _end in line_entries]
+    for line_index, (line, char_start, char_end) in enumerate(line_entries):
         normalized_line = _normalize_section_heading(line)
         if re.fullmatch(r"[-*•·▪◦—–_]+", line):
             continue
         if normalized_line in _LAYOUT_RESET_HEADINGS:
             current_section = ""
+            block_id = f"{source_type}_{len(blocks)}"
             blocks.append(SourceBlock(
-                block_id=f"{source_type}_{len(blocks)}",
+                block_id=block_id,
                 source_type=source_type,  # type: ignore
                 text=line,
+                source_id=resolved_source_id,
+                source_spans=[SourceSpan(
+                    source_id=resolved_source_id,
+                    char_start=char_start,
+                    char_end=char_end,
+                )],
+                origin_block_ids=[block_id],
                 section_hint=None,
                 fact_eligible=False,
             ))
@@ -857,14 +1027,122 @@ def _split_into_blocks(text: str, source_type: str) -> list[SourceBlock]:
             )
         ):
             assigned_section = None
+        block_id = f"{source_type}_{len(blocks)}"
         blocks.append(SourceBlock(
-            block_id=f"{source_type}_{len(blocks)}",
+            block_id=block_id,
             source_type=source_type,  # type: ignore
             text=line,
+            source_id=resolved_source_id,
+            source_spans=[SourceSpan(
+                source_id=resolved_source_id,
+                char_start=char_start,
+                char_end=char_end,
+            )],
+            origin_block_ids=[block_id],
             section_hint=assigned_section,
         ))
     _assign_record_ids(blocks)
     return _coalesce_wrapped_blocks(blocks) if source_type == "resume" else blocks
+
+
+def _build_fact_units(
+    blocks: list[SourceBlock],
+    documents: list[SourceDocument],
+) -> list[FactUnit]:
+    """Build exact physical-source facts while retaining logical block owners."""
+
+    document_text = {document.source_id: document.text for document in documents}
+    facts: list[FactUnit] = []
+    for block in blocks:
+        origin_ids = block.origin_block_ids or [block.block_id]
+        spans = block.source_spans
+        if not spans:
+            continue
+        block_fact_ids: list[str] = []
+        for physical_index, span in enumerate(spans):
+            source_text = document_text.get(span.source_id, "")
+            if not (0 <= span.char_start <= span.char_end <= len(source_text)):
+                continue
+            physical_text = source_text[span.char_start:span.char_end]
+            if not physical_text.strip() or _is_section_heading(physical_text):
+                continue
+            if _FACT_NON_CONTENT.fullmatch(physical_text.strip()):
+                continue
+
+            content_start = 0
+            label = _FACT_FIELD_LABEL.match(physical_text)
+            if label:
+                content_start = label.end()
+            ranges: list[tuple[int, int]] = []
+            cursor = content_start
+            for delimiter in _FACT_SEGMENT_SPLIT.finditer(
+                physical_text, content_start,
+            ):
+                start, end = _trim_fact_range(
+                    physical_text, cursor, delimiter.start(),
+                )
+                if end > start:
+                    ranges.append((start, end))
+                cursor = delimiter.end()
+            start, end = _trim_fact_range(
+                physical_text, cursor, len(physical_text),
+            )
+            if end > start:
+                ranges.append((start, end))
+            ranges = [
+                (start, end) for start, end in ranges
+                if len(re.sub(r"\s+", "", physical_text[start:end])) >= 2
+            ]
+            if not ranges:
+                continue
+
+            origin_block_id = (
+                origin_ids[physical_index]
+                if physical_index < len(origin_ids)
+                else block.block_id
+            )
+            for fact_index, (start, end) in enumerate(ranges):
+                value = physical_text[start:end]
+                normalized = re.sub(
+                    r"[\s:：|｜/\\【】\[\]()（）]+", "", value,
+                ).casefold()
+                if not normalized:
+                    continue
+                dimensions = _fact_dimensions(value, block.section_hint)
+                fact_id = (
+                    origin_block_id
+                    if len(ranges) == 1
+                    else f"{origin_block_id}#u{fact_index}"
+                )
+                fact = FactUnit(
+                    fact_id=fact_id,
+                    block_id=block.block_id,
+                    origin_block_id=origin_block_id,
+                    source_type=block.source_type,
+                    source_spans=[SourceSpan(
+                        source_id=span.source_id,
+                        char_start=span.char_start + start,
+                        char_end=span.char_start + end,
+                    )],
+                    section_hint=block.section_hint,
+                    record_id=block.record_id,
+                    fact_type=_primary_fact_type(dimensions),
+                    dimensions=dimensions,
+                    verbatim_text=value,
+                    normalized_text=normalized,
+                    fact_eligible=(
+                        block.source_type == "resume"
+                        or (
+                            block.source_type == "query"
+                            and block.fact_eligible
+                        )
+                    ),
+                    confidence=1.0,
+                )
+                facts.append(fact)
+                block_fact_ids.append(fact_id)
+        block.fact_ids = list(dict.fromkeys(block_fact_ids))
+    return facts
 
 
 def build_source_bundle(
@@ -878,19 +1156,31 @@ def build_source_bundle(
     query_text and jd_text are each single blocks.
     """
     blocks: list[SourceBlock] = []
+    documents: list[SourceDocument] = []
 
     # Resume / CV text blocks
     if cv_text.strip():
-        blocks.extend(_split_into_blocks(cv_text, "resume"))
+        documents.append(SourceDocument(
+            source_id="resume", source_type="resume", text=cv_text,
+        ))
+        blocks.extend(_split_into_blocks(
+            cv_text, "resume", source_id="resume",
+        ))
 
     # A multiline query often contains the only candidate profile.  Segment it
     # with the same logic so headings survive in no-CV scenarios.
     if query_text.strip():
-        # Split mixed “fact + instruction” prose into clauses. This lets
-        # “我是做智能硬件产品的，帮我优化简历” retain only the first clause as
-        # evidence instead of legitimizing the instruction as a candidate fact.
-        segmented_query = re.sub(r"(?:[，；;。]+|(?<!不)(?:但是|但|不过|然而))", "\n", query_text)
-        query_blocks = _split_into_blocks(segmented_query, "query")
+        documents.append(SourceDocument(
+            source_id="query", source_type="query", text=query_text,
+        ))
+        # Split mixed “fact + instruction” prose into clauses while offsets
+        # continue to point into the original query string.
+        query_blocks = _split_into_blocks(
+            query_text,
+            "query",
+            source_id="query",
+            entries=_query_clause_entries(query_text),
+        )
         has_cv = bool(cv_text.strip())
         active_record_section = ""
         for block in query_blocks:
@@ -925,9 +1215,17 @@ def build_source_bundle(
     # JD is still target context only, but section hints help the model avoid
     # treating headings such as 任职要求 as a role title.
     if jd_text.strip():
-        blocks.extend(_split_into_blocks(jd_text, "jd"))
+        documents.append(SourceDocument(
+            source_id="jd", source_type="jd", text=jd_text,
+        ))
+        blocks.extend(_split_into_blocks(jd_text, "jd", source_id="jd"))
 
-    return SourceBundle(blocks=blocks)
+    facts = _build_fact_units(blocks, documents)
+    return SourceBundle(
+        blocks=blocks,
+        documents=documents,
+        fact_units=facts,
+    )
 
 
 def candidate_blocks(source: SourceBundle) -> list[SourceBlock]:

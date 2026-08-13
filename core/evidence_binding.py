@@ -161,6 +161,8 @@ def _bind(path: str, value: str, blocks: list[SourceBlock], *, minimum: float = 
         path=path,
         block_id=block.block_id,
         block_ids=[block.block_id],
+        fact_ids=list(block.fact_ids),
+        source_spans=list(block.source_spans),
         quote=quote,
         claim=str(value).strip(),
         mode=mode,
@@ -208,12 +210,28 @@ def _bind_with_provenance(
                 for item in resolved
                 for block_id in (item.block_ids or [item.block_id])
             ))
+            fact_ids = list(dict.fromkeys(
+                fact_id
+                for item in resolved
+                for fact_id in item.fact_ids
+            ))
+            source_spans = []
+            seen_spans: set[tuple[str, int, int]] = set()
+            for item in resolved:
+                for span in item.source_spans:
+                    key = (span.source_id, span.char_start, span.char_end)
+                    if key in seen_spans:
+                        continue
+                    seen_spans.add(key)
+                    source_spans.append(span)
             primary = resolved[0]
             return primary.model_copy(update={
                 "claim": str(value or "").strip(),
                 "source_claim": source_value,
                 "mode": "rewritten",
                 "block_ids": block_ids,
+                "fact_ids": fact_ids,
+                "source_spans": source_spans,
                 "similarity": round(min(item.similarity for item in resolved), 4),
             })
         return None
