@@ -19,6 +19,7 @@ import unicodedata
 from collections.abc import Iterable
 from typing import Any
 
+from atomic_fact_audit import audit_atomic_facts
 from evidence_binding import measure_source_coverage, source_fact_units
 from source_adapter import candidate_blocks
 from v2_schemas import CanonicalResume, EvidenceBinding, SourceBundle
@@ -986,12 +987,17 @@ def build_quality_report(
         source,
     )
     claim_gaps = _claim_improvement_items(canonical, source, bindings)
+    atomic_audit = audit_atomic_facts(
+        source=source,
+        resume=canonical,
+        evidence_bindings=bindings,
+    )
     follow_ups = list(job_alignment.get("follow_up_questions", []))
     follow_ups.extend(item["question"] for item in claim_gaps)
     follow_ups = list(dict.fromkeys(follow_ups))[:_MAX_FOLLOW_UP_QUESTIONS]
 
     return {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "document_mode": "framework" if framework_mode else "resume",
         "source_preservation": {
             "status": preservation_status,
@@ -1007,6 +1013,9 @@ def build_quality_report(
             "unsupported_items_removed": removed_items,
             "truncated": len(unsupported) > len(removed_items),
         },
+        "atomic_factuality": atomic_audit["atomic_factuality"],
+        "ownership_integrity": atomic_audit["ownership_integrity"],
+        "structural_invariants": atomic_audit["structural_invariants"],
         "missing_information": normalized_missing,
         "claim_improvement_opportunities": claim_gaps,
         "job_alignment": job_alignment,
