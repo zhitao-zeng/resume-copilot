@@ -19,6 +19,42 @@ def _is_empty_edu(edu: Education) -> bool:
     return not any([edu.school, edu.degree, edu.major])
 
 
+def _normalized_project_value(value: str) -> str:
+    """Normalize a project field for deterministic duplicate detection."""
+
+    return re.sub(r"\s+", "", str(value or "")).casefold()
+
+
+def _project_signature(project: Project) -> tuple[str, ...] | None:
+    """Return a safe dedupe signature, or ``None`` for an empty record.
+
+    A project name is optional in the public schema.  Previously the validator
+    used the name as both the duplicate key and the keep predicate, which
+    silently removed every unnamed project even when it contained an
+    organization, role, period, and supported bullets.  Named projects retain
+    the legacy name-based dedupe behavior; unnamed projects use their complete
+    record content so distinct source records cannot collapse together.
+    """
+
+    name = _normalized_project_value(project.name)
+    if name:
+        return ("named", name)
+
+    content = (
+        _normalized_project_value(project.organization),
+        _normalized_project_value(project.role),
+        _normalized_project_value(project.period),
+        *(
+            _normalized_project_value(bullet)
+            for bullet in project.bullets
+            if _normalized_project_value(bullet)
+        ),
+    )
+    if not any(content):
+        return None
+    return ("unnamed", *content)
+
+
 def _backfill_school_names(resume: CanonicalResume, source_text: str) -> int:
     """Fill empty education.school from summary/source when degree/major exist.
 
@@ -50,14 +86,15 @@ def validate_resume(resume: CanonicalResume, source_text: str = "") -> Canonical
     # Deterministic backfill: Composer may leave school empty on prose CVs
     _backfill_school_names(resume, source_text)
 
-    # Deduplicate projects by name
-    seen: set[str] = set()
+    # Deduplicate projects without treating the optional name as a keep gate.
+    seen: set[tuple[str, ...]] = set()
     deduped: list[Project] = []
     for p in resume.projects:
-        key = p.name.strip().lower()
-        if key and key not in seen:
-            seen.add(key)
-            deduped.append(p)
+        signature = _project_signature(p)
+        if signature is None or signature in seen:
+            continue
+        seen.add(signature)
+        deduped.append(p)
     resume.projects = deduped
 
     # Phone format (basic)

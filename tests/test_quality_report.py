@@ -7,6 +7,7 @@ import asyncio
 import pytest
 
 from evidence_binding import bind_resume_evidence
+from atomic_fact_audit import audit_atomic_facts
 from quality_report import (
     _requirement_aspects,
     assess_jd_requirements,
@@ -101,6 +102,53 @@ def test_quality_report_does_not_flag_headings_or_distributed_record_fields():
 
     assert report["source_preservation"]["status"] == "no_unrepresented_items_detected"
     assert report["source_preservation"]["unrepresented_items"] == []
+
+
+@pytest.mark.parametrize(
+    "credential",
+    ["医疗保健支持专员认证 (2009)", "医疗保健支持专员认证 2009"],
+)
+def test_detached_credential_year_binds_only_to_adjacent_source_row(credential):
+    source = build_source_bundle(
+        "认证和执照\n医疗保健支持专员认证\n2009\n其他说明\n2015",
+        "",
+        "",
+    )
+    resume = CanonicalResume.model_validate({
+        "certifications": [credential],
+    })
+
+    bindings = bind_resume_evidence(resume, source)
+    binding = next(item for item in bindings if item.path == "certifications[0]")
+    audit = audit_atomic_facts(
+        source=source,
+        resume=resume,
+        evidence_bindings=bindings,
+    )
+
+    assert len(binding.block_ids) == 2
+    assert "2009" in binding.source_claim
+    assert audit["structural_invariants"]["credential"]["added_count"] == 0
+
+
+def test_year_only_period_is_supported_by_more_precise_source_month():
+    source = build_source_bundle(
+        "工作经历\n销售总监（2002年11月至2015年12月）",
+        "",
+        "",
+    )
+    resume = CanonicalResume.model_validate({
+        "experience": [{"role": "销售总监", "period": "2015"}],
+    })
+    bindings = bind_resume_evidence(resume, source)
+
+    audit = audit_atomic_facts(
+        source=source,
+        resume=resume,
+        evidence_bindings=bindings,
+    )
+
+    assert audit["structural_invariants"]["period"]["added_count"] == 0
 
 
 def test_quality_report_lists_generated_items_removed_without_evidence():
@@ -543,6 +591,34 @@ def test_claim_improvement_names_exact_record_and_dimension_questions():
     assert "具体通过哪些步骤、工具或协作方式完成" in gap["question"]
     assert "最终产出了什么、如何验收" in gap["question"]
     assert "只填写真实发生且能够核验的信息" in gap["question"]
+
+
+def test_context_label_is_not_misreported_as_incomplete_star_claim():
+    source = build_source_bundle(
+        "工作经历\nBUILDTECH SUPPLIES INC.|财务经理|2015.06-2015.11\n"
+        "行业：建筑材料供应与销售\n建立库存管理制度",
+        "",
+        "",
+    )
+    resume = CanonicalResume.model_validate({
+        "experience": [{
+            "organization": "BUILDTECH SUPPLIES INC.",
+            "role": "财务经理",
+            "period": "2015.06-2015.11",
+            "bullets": ["行业：建筑材料供应与销售", "建立库存管理制度"],
+        }],
+    })
+
+    report = build_quality_report(
+        source=source,
+        resume=resume,
+        evidence_bindings=bind_resume_evidence(resume, source),
+    )
+
+    assert all(
+        item["excerpt"] != "行业：建筑材料供应与销售"
+        for item in report["claim_improvement_opportunities"]
+    )
 
 
 def test_custom_section_paths_and_duplicate_bindings_remain_stable():

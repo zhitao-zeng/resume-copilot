@@ -144,11 +144,33 @@ def _date_component_anchors(value: str) -> set[str]:
     return result
 
 
+def _date_signatures_covered(
+    claim_dates: set[tuple[str, str]],
+    source_dates: set[tuple[str, str]],
+) -> bool:
+    """Return whether every claimed date is entailed by a source date.
+
+    A year-only output is a safe, coarser rendering of a source year-month.
+    The reverse is not true: a generated month still requires the same source
+    month.  Keeping this direction explicit prevents ``2015`` from being
+    reported as fabricated when the source says ``2015年12月``.
+    """
+
+    return bool(claim_dates) and all(
+        any(
+            claim_year == source_year
+            and (not claim_month or claim_month == source_month)
+            for source_year, source_month in source_dates
+        )
+        for claim_year, claim_month in claim_dates
+    )
+
+
 def _unmatched_anchors(claim: str, source: str) -> tuple[str, ...]:
     unmatched = _anchors(claim) - _anchors(source)
     claim_dates = _date_signatures(claim)
     source_dates = _date_signatures(source)
-    if claim_dates and claim_dates.issubset(source_dates):
+    if _date_signatures_covered(claim_dates, source_dates):
         unmatched -= _date_component_anchors(claim)
     return tuple(sorted(unmatched))
 
@@ -289,7 +311,8 @@ def _claim_match_text(claim: AtomicClaim) -> str:
     if shell_removed:
         text = re.sub(r"^(?:包括|为)\s*", "", text, count=1).strip()
         section_wrapper = re.match(
-            r"^(?:工作|项目|校园|科研|教育)经历(?:[（(][^）)]{1,80}[）)])?\s*[:：]\s*(.+)$",
+            r"^(?:(?:工作|项目|校园|科研|教育)经历|校园或社会经历)"
+            r"(?:[（(][^）)]{1,80}[）)])?\s*[:：]\s*(.+)$",
             text,
         )
         if section_wrapper:
@@ -359,6 +382,15 @@ def _candidate_facts(
     eligible_facts: list[FactUnit],
     fact_by_id: dict[str, FactUnit],
 ) -> list[FactUnit]:
+    # One generated summary sentence routinely consolidates several source
+    # lines.  Legacy bindings select a representative block for that sentence,
+    # not an exhaustive allow-list.  Restricting summary audit to that single
+    # binding therefore reports exact source metrics from adjacent lines as
+    # fabricated.  Summary claims remain safe to compare against the complete
+    # candidate-only ledger; JD facts were already excluded above.
+    if claim.path.startswith("summary["):
+        return list(eligible_facts)
+
     result: list[FactUnit] = []
     seen: set[str] = set()
 
@@ -447,7 +479,10 @@ def _match_atom(
     if (
         _date_only(match_text)
         and _date_signatures(match_text)
-        and _date_signatures(match_text).issubset(_date_signatures(source_text))
+        and _date_signatures_covered(
+            _date_signatures(match_text),
+            _date_signatures(source_text),
+        )
     ):
         if not selected and scores:
             selected = (scores[0][1].fact_id,)
@@ -466,13 +501,30 @@ def _match_atom(
         and binding.source_claim
         and binding.similarity >= 0.75
     )
-    threshold = 0.55 if trusted_rewrite else 0.68
+    if trusted_rewrite:
+        # ``source_claim`` is emitted only for an optimizer rewrite that has
+        # already passed the deterministic ownership/number/tool gates and,
+        # for low lexical overlap, semantic entailment review.  Audit its
+        # clauses under that reviewed provenance after the hard-anchor check
+        # above instead of reclassifying harmless connective/paraphrase text
+        # as fabrication solely because one atom has low bigram overlap.
+        if not selected and scores:
+            selected = (scores[0][1].fact_id,)
+        return AtomicMatch(
+            "supported",
+            selected,
+            round(max(best_score, 0.75), 4),
+            "trusted_rewrite",
+        )
+    threshold = 0.68
     if direct_binding or precision >= threshold:
         if not selected and scores:
             selected = (scores[0][1].fact_id,)
-        reason = "trusted_rewrite" if trusted_rewrite and precision < 0.68 else "lexical_entailment"
         return AtomicMatch(
-            "supported", selected, round(max(precision, 0.75 if direct_binding else 0.0), 4), reason,
+            "supported",
+            selected,
+            round(max(precision, 0.75 if direct_binding else 0.0), 4),
+            "lexical_entailment",
         )
     return AtomicMatch(
         "unsupported", (), round(precision, 4), "insufficient_source_overlap",

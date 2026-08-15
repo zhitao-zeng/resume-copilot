@@ -27,6 +27,7 @@ FactType = Literal[
     "metric",
     "other",
 ]
+FactRouteStatus = Literal["resume", "reply_only", "rejected"]
 
 
 class SourceDocument(BaseModel):
@@ -70,6 +71,24 @@ class FactUnit(BaseModel):
     normalized_text: str = ""
     fact_eligible: bool = True
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+
+
+class FactRoute(BaseModel):
+    """One explicit destination decision for a source-grounded fact.
+
+    Routing is deliberately separate from wording generation.  A composer may
+    improve how a fact is expressed, but it must not silently decide whether
+    the fact survives or which source record owns it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    fact_id: str
+    status: FactRouteStatus
+    destination_section: str = ""
+    destination_record_id: Optional[str] = None
+    target_field: str = ""
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    reason: str = ""
 
 
 class SourceBlock(BaseModel):

@@ -27,6 +27,9 @@ from diagnostic_trace import trace_event
 logger = logging.getLogger(__name__)
 
 _MAX_OPTIMIZER_CONCURRENCY = 2
+_DEFAULT_NARRATIVE_MAX_RECORDS = 4
+_DEFAULT_NARRATIVE_MAX_BULLETS = 16
+_NARRATIVE_SECTIONS = ("experience", "research", "activities", "projects")
 
 
 @dataclass(frozen=True)
@@ -152,7 +155,9 @@ def _bullet_evidence_plan(bullets: list[str]) -> list[dict[str, Any]]:
         if _STAR_CONTEXT.search(text):
             dimensions.append("context")
         if _action_level(text) or re.search(
-            r"(?:开展|执行|处理|分析|研究|维护|跟进|诊疗|授课|复核|运营)", text,
+            r"^(?:开展|执行|处理|分析|研究|维护|跟进|诊疗|授课|复核|运营|"
+            r"完成|建立|带领|监控|安排|合作|改进|优化|交付|撰写|编制|协调)",
+            text,
         ):
             dimensions.append("action")
         if _STAR_METHOD.search(text):
@@ -170,6 +175,119 @@ def _bullet_evidence_plan(bullets: list[str]) -> list[dict[str, Any]]:
     return result
 
 
+def _bounded_narrative_limit(name: str, default: int, maximum: int) -> int:
+    try:
+        configured = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        configured = default
+    return max(1, min(maximum, configured))
+
+
+def select_narrative_record_keys(
+    resume: CanonicalResume,
+    *,
+    max_records: int | None = None,
+    max_bullets: int | None = None,
+) -> set[tuple[str, int]]:
+    """Select a bounded set of records that can benefit from fact grouping.
+
+    The audited compiler path intentionally preserves source clauses one by
+    one.  Only records with at least two clauses can gain coherence from a
+    plan/realize pass, and a record is never split across requests because the
+    optimizer's lossless ``source_indices`` contract covers the whole record.
+    The bounded selection keeps dense resumes within the end-to-end deadline.
+    """
+
+    record_limit = max_records or _bounded_narrative_limit(
+        "LLM_NARRATIVE_MAX_RECORDS",
+        _DEFAULT_NARRATIVE_MAX_RECORDS,
+        8,
+    )
+    bullet_limit = max_bullets or _bounded_narrative_limit(
+        "LLM_NARRATIVE_MAX_BULLETS",
+        _DEFAULT_NARRATIVE_MAX_BULLETS,
+        32,
+    )
+    record_limit = max(1, int(record_limit))
+    bullet_limit = max(2, int(bullet_limit))
+
+    candidates: list[tuple[int, int, str, int]] = []
+    source_order = 0
+    for section in _NARRATIVE_SECTIONS:
+        for record_index, record in enumerate(getattr(resume, section)):
+            bullets = [str(value or "").strip() for value in record.bullets]
+            bullets = [value for value in bullets if value]
+            bullet_count = len(bullets)
+            if bullet_count < 2 or bullet_count > bullet_limit:
+                source_order += 1
+                continue
+            plans = _bullet_evidence_plan(bullets)
+            dimensions = {
+                dimension
+                for plan in plans
+                for dimension in plan.get("source_dimensions", [])
+            }
+            short_count = sum(len(value.strip("。；; ")) < 18 for value in bullets)
+            action_needs_context = any(
+                "action" in plan.get("source_dimensions", [])
+                and not (
+                    set(plan.get("source_dimensions", []))
+                    & {"method", "result"}
+                )
+                for plan in plans
+            )
+            supporting_clause = any(
+                "action" not in plan.get("source_dimensions", [])
+                and (
+                    set(plan.get("source_dimensions", []))
+                    & {"method", "deliverable", "result"}
+                )
+                and not re.fullmatch(
+                    r"\d+(?:\.\d+)?\s*(?:年|个月|月|周|天)",
+                    str(plan.get("text", "")).strip("。；; "),
+                )
+                for plan in plans
+            )
+            complementary_action_fragments = (
+                short_count >= 2
+                and "action" in dimensions
+                and bool(dimensions & {"method", "deliverable", "result"})
+            )
+            if not (
+                (action_needs_context and supporting_clause)
+                or complementary_action_fragments
+            ):
+                source_order += 1
+                continue
+            # Prefer visibly fragmented records and records whose clauses carry
+            # complementary action/method/deliverable/result evidence.  This
+            # is industry-neutral and does not infer any absent STAR dimension.
+            score = (
+                short_count * 4
+                + min(bullet_count, 6) * 2
+                + len(dimensions)
+                + (3 if {"action", "method"} <= dimensions else 0)
+                + (3 if "action" in dimensions and dimensions & {"deliverable", "result"} else 0)
+            )
+            candidates.append((score, source_order, section, record_index))
+            source_order += 1
+
+    selected: set[tuple[str, int]] = set()
+    selected_bullets = 0
+    for _score, _order, section, record_index in sorted(
+        candidates,
+        key=lambda item: (-item[0], item[1]),
+    ):
+        bullet_count = len(getattr(resume, section)[record_index].bullets)
+        if selected_bullets + bullet_count > bullet_limit:
+            continue
+        selected.add((section, record_index))
+        selected_bullets += bullet_count
+        if len(selected) >= record_limit:
+            break
+    return selected
+
+
 def _introduces_unsupported_fact(original: str, rewritten: str) -> bool:
     """Detect newly introduced Chinese methods/tools/entities.
 
@@ -180,11 +298,25 @@ def _introduces_unsupported_fact(original: str, rewritten: str) -> bool:
     """
 
     original_compact = re.sub(r"[^\w\u4e00-\u9fff+.#/_-]+", "", original).casefold()
+
+    def connective_compact(value: str) -> str:
+        compact = re.sub(
+            r"[^\w\u4e00-\u9fff+.#/_-]+", "", value,
+        ).casefold()
+        # Surface realization commonly replaces a comma/newline with a
+        # conjunction. These closed-class connectors are not candidate facts.
+        return re.sub(r"(?:并且|以及|并|和|与|及)", "", compact)
+
+    original_without_connectors = connective_compact(original)
     for pattern in (_FACT_INTRODUCER, _NAMED_CHINESE_FACT):
         for match in pattern.finditer(rewritten):
             phrase = match.groupdict().get("fact") or match.group(0)
             compact = re.sub(r"[^\w\u4e00-\u9fff+.#/_-]+", "", phrase).casefold()
-            if len(compact) >= 2 and compact not in original_compact:
+            if (
+                len(compact) >= 2
+                and compact not in original_compact
+                and connective_compact(phrase) not in original_without_connectors
+            ):
                 return True
     return False
 
@@ -338,15 +470,16 @@ def _grouped_patch_proposals(
     for bullet_index, (after, indices) in enumerate(parsed):
         after = _normalize_grouped_surface(after)
         source_parts = [original[index] for index in indices]
+        rejection_reasons: list[str] = []
         source_action_levels = {
             level for level in (_action_level(item) for item in source_parts) if level
         }
         # A single surface verb cannot safely preserve conflicting ownership
         # levels. Keep those responsibilities as separate output bullets.
         if len(source_action_levels) > 1:
-            return None
+            rejection_reasons.append("conflicting_source_ownership_levels")
         candidate_action = _action_level(after)
-        if source_action_levels:
+        if source_action_levels and not rejection_reasons:
             expected_action = next(iter(source_action_levels))
             if not candidate_action:
                 # The model sometimes keeps the exact action and object but
@@ -357,9 +490,9 @@ def _grouped_patch_proposals(
                 after = f"{marker}{after}" if marker else after
                 candidate_action = _action_level(after)
             if candidate_action != expected_action:
-                return None
-        elif candidate_action:
-            return None
+                rejection_reasons.append("ownership_level_changed")
+        elif not source_action_levels and candidate_action:
+            rejection_reasons.append("ownership_level_introduced")
 
         before = "\n".join(source_parts)
         safe, reasons = _safe_rewrite_diagnostics(before, after)
@@ -376,7 +509,10 @@ def _grouped_patch_proposals(
         # Unchanged bullets are valid members of an otherwise regrouped
         # record. Rejecting one would roll back the genuinely improved sibling
         # bullets because grouped records are intentionally atomic.
-        accepted = not material_reasons and not missing_sources
+        rejection_reasons.extend(material_reasons)
+        if missing_sources:
+            rejection_reasons.append(f"missing_source_indices:{missing_sources}")
+        accepted = not rejection_reasons
         trace_event(
             "optimizer_grouped_hard_gate",
             path=f"{section}[{record_index}].bullets[{bullet_index}]",
@@ -384,12 +520,25 @@ def _grouped_patch_proposals(
             before=before,
             after=after,
             accepted=accepted,
-            reasons=material_reasons + (
-                [f"missing_source_indices:{missing_sources}"] if missing_sources else []
-            ),
+            reasons=rejection_reasons,
         )
         if not accepted:
-            return None
+            # One unsafe group must not erase independent safe groups from the
+            # same record. Keep every source clause in this group verbatim;
+            # the record-level source_indices contract still remains complete.
+            proposals.extend(
+                _RewriteProposal(
+                    section=section,
+                    record_index=record_index,
+                    bullet_index=bullet_index,
+                    before=original[source_index],
+                    after=original[source_index],
+                    grouped=True,
+                    source_indices=(source_index,),
+                )
+                for source_index in indices
+            )
+            continue
         proposals.append(_RewriteProposal(
             section=section,
             record_index=record_index,
@@ -518,6 +667,7 @@ def _apply_section_patches(
 def _build_optimizer_batches(
     resume: CanonicalResume,
     fact_ids_by_path: dict[str, list[str]] | None = None,
+    record_keys: set[tuple[str, int]] | None = None,
 ) -> list[dict[str, list[dict[str, Any]]]]:
     """Split long resumes into independently recoverable edit batches."""
 
@@ -527,6 +677,8 @@ def _build_optimizer_batches(
     current_chars = 0
     for section in current:
         for index, record in enumerate(getattr(resume, section)):
+            if record_keys is not None and (section, index) not in record_keys:
+                continue
             dumped = record.model_dump()
             dumped["index"] = index
             evidence_plan = _bullet_evidence_plan([
@@ -648,14 +800,16 @@ def optimize_resume_with_provenance(
     resume: CanonicalResume,
     jd_text: str = "",
     evidence_bindings: Iterable[EvidenceBinding] = (),
+    record_keys: set[tuple[str, int]] | None = None,
 ) -> OptimizationOutcome:
     if not llm_enabled():
         return OptimizationOutcome(resume=resume)
 
     total_bullets = sum(
-        len(item.bullets)
-        for section in (resume.experience, resume.research, resume.activities, resume.projects)
-        for item in section
+        len(record.bullets)
+        for section_name in _NARRATIVE_SECTIONS
+        for record_index, record in enumerate(getattr(resume, section_name))
+        if record_keys is None or (section_name, record_index) in record_keys
     )
     if total_bullets < 1:
         logger.info("Optimizer skipped: only %d bullets", total_bullets)
@@ -667,7 +821,14 @@ def optimize_resume_with_provenance(
         for binding in evidence_bindings
         if binding.fact_ids
     }
-    batches = _build_optimizer_batches(resume, fact_ids_by_path)
+    batches = _build_optimizer_batches(
+        resume,
+        fact_ids_by_path,
+        record_keys=record_keys,
+    )
+    if not batches:
+        logger.info("Optimizer skipped: selected records produced no batches")
+        return OptimizationOutcome(resume=resume)
     initial_batch_count = len(batches)
     pending: list[tuple[tuple[int, ...], dict[str, list[dict[str, Any]]]]] = [
         ((index,), payload) for index, payload in enumerate(batches)
@@ -834,9 +995,10 @@ def optimize_resume_with_provenance(
             if id(proposal) in accepted_proposal_ids:
                 new_index = len(rebuilt)
                 rebuilt.append(proposal.after)
-                trusted_rewrites[
-                    f"{section}[{record_index}].bullets[{new_index}]"
-                ] = proposal.before
+                if proposal.after != proposal.before:
+                    trusted_rewrites[
+                        f"{section}[{record_index}].bullets[{new_index}]"
+                    ] = proposal.before
                 continue
             # A rejected group falls back to its exact source clauses. Other
             # independently reviewed groups in the same record may still keep

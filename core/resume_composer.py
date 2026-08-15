@@ -22,7 +22,13 @@ from llm_gateway import (
     estimate_chat_tokens,
 )
 from prompts import RESUME_COMPOSER_SYSTEM_PROMPT, GEN_COMPOSER_SYSTEM_PROMPT
-from server_runtime import call_llm_typed, llm_enabled, remaining_request_seconds
+from server_runtime import (
+    call_llm_typed,
+    llm_enabled,
+    remaining_request_seconds,
+    reset_request_deadline,
+    set_request_deadline,
+)
 from source_adapter import build_source_bundle, candidate_blocks
 from v2_schemas import SourceBlock, SourceBundle, DraftResume, CanonicalResume
 from diagnostic_trace import trace_event
@@ -38,6 +44,7 @@ _MAX_COMPOSER_FACT_CHARS = 60_000
 _MAX_COMPOSER_CHUNKS = 16
 _DEFAULT_COMPOSER_MAX_FACT_BLOCKS = 36
 _DEFAULT_COMPOSER_MIN_REMAINING_SECONDS = 10
+_DEFAULT_COMPOSER_CALL_TIMEOUT_SECONDS = 120
 _MAX_COMPOSER_CONCURRENCY = 2
 
 
@@ -49,6 +56,10 @@ class ComposeOutcome:
     failed_chunks: list[SourceBundle] = field(default_factory=list)
     total_chunks: int = 0
     completed_chunks: int = 0
+
+
+class _ComposerChunkTimeout(RuntimeError):
+    """One Composer chunk exhausted its local budget, not the whole request."""
 
 
 def _safe_positive_env_int(name: str) -> int | None:
@@ -76,6 +87,22 @@ def _composer_min_remaining_seconds() -> int:
     return (
         _safe_positive_env_int("LLM_COMPOSER_MIN_REMAINING_SECONDS")
         or _DEFAULT_COMPOSER_MIN_REMAINING_SECONDS
+    )
+
+
+def _composer_call_timeout_seconds() -> int:
+    """Bound one extraction chunk while reserving time for verification.
+
+    The service-level LLM timeout is intentionally larger because verification
+    may need a long completion.  Applying that full timeout to each Composer
+    chunk lets one pathological JSON generation consume almost the entire
+    480-second request budget even though the remaining chunks can be restored
+    deterministically.
+    """
+
+    return (
+        _safe_positive_env_int("LLM_COMPOSER_CALL_TIMEOUT_SECONDS")
+        or _DEFAULT_COMPOSER_CALL_TIMEOUT_SECONDS
     )
 
 
@@ -538,13 +565,28 @@ def _compose_chunk(chunk: SourceBundle) -> DraftResume:
         user_prompt=user_prompt,
         max_tokens=output_tokens,
     )
-    parsed = call_llm_typed(
-        DraftResume,
-        RESUME_COMPOSER_SYSTEM_PROMPT,
-        user_prompt,
-        temperature=0.0,
-        max_tokens=output_tokens,
+    outer_remaining = remaining_request_seconds()
+    chunk_timeout = _composer_call_timeout_seconds()
+    chunk_deadline_is_stricter = (
+        outer_remaining is None or outer_remaining > chunk_timeout + 0.5
     )
+    deadline_token = set_request_deadline(timeout_seconds=chunk_timeout)
+    try:
+        parsed = call_llm_typed(
+            DraftResume,
+            RESUME_COMPOSER_SYSTEM_PROMPT,
+            user_prompt,
+            temperature=0.0,
+            max_tokens=output_tokens,
+        )
+    except LLMDeadlineExceeded as exc:
+        if chunk_deadline_is_stricter:
+            raise _ComposerChunkTimeout(
+                f"Composer chunk exceeded its {chunk_timeout}s local budget"
+            ) from exc
+        raise
+    finally:
+        reset_request_deadline(deadline_token)
     if not isinstance(parsed, dict) or not parsed:
         raise ValueError("Composer returned an empty or invalid chunk")
     parsed_draft = DraftResume(**parsed)
@@ -644,6 +686,12 @@ def compose_resume_with_outcome(source: SourceBundle) -> ComposeOutcome:
                         len(smaller_chunks),
                         exc,
                     )
+                except _ComposerChunkTimeout as exc:
+                    logger.warning(
+                        "%s; recovering this chunk deterministically and continuing",
+                        exc,
+                    )
+                    failed_chunks.append(chunk)
                 except LLMDeadlineExceeded as exc:
                     logger.warning(
                         "ResumeComposer stopped at request deadline: %s; retaining completed chunks",

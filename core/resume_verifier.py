@@ -204,7 +204,18 @@ def _reclassify_non_work(parsed: dict, evidence_text: str) -> None:
         org = str(item.get("organization", "") or "")
         role = str(item.get("role", "") or "")
         combined = f"{org} {role}"
-        if re.search(r"(?:学生会|志愿者|志愿服务|社团|协会|校园组织)", combined):
+        explicit_activity = bool(
+            re.search(r"(?:学生会|志愿者|志愿服务|义工|社团|校园组织)", combined)
+            or (
+                "协会" in org
+                and re.search(r"(?:志愿者?|义工|会员|成员|委员|干事)", role)
+            )
+        )
+        # An association can also be a real employer.  Preserve an explicitly
+        # professional title such as ``财务与行政主管`` instead of moving
+        # it to campus activities solely because the organization ends in
+        # ``协会``.
+        if explicit_activity:
             activities.append(item)
             continue
         if student_context and (

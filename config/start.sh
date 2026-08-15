@@ -40,6 +40,7 @@ export MALLOC_ARENA_MAX=2 OMP_NUM_THREADS=1
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-16384}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-2}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
+VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.74}"
 export MAX_MODEL_LEN
 export LLM_CONTEXT_WINDOW="$MAX_MODEL_LEN"
 export LLM_TOKENIZER_PATH="${LLM_TOKENIZER_PATH:-$MODEL_FOUND}"
@@ -48,12 +49,14 @@ export LLM_INFLIGHT_LIMIT="${LLM_INFLIGHT_LIMIT:-$MAX_NUM_SEQS}"
 # dates and duties together.  The 16k context/40 GiB profile can safely reserve
 # a larger completion than the portable 8k default used by unit tests.
 export LLM_COMPOSER_MAX_TOKENS="${LLM_COMPOSER_MAX_TOKENS:-6144}"
-export LLM_COMPOSER_MAX_FACT_BLOCKS="${LLM_COMPOSER_MAX_FACT_BLOCKS:-50}"
+export LLM_COMPOSER_MAX_FACT_BLOCKS="${LLM_COMPOSER_MAX_FACT_BLOCKS:-36}"
+export LLM_COMPOSER_CALL_TIMEOUT_SECONDS="${LLM_COMPOSER_CALL_TIMEOUT_SECONDS:-120}"
+log "GPU memory split: vLLM=${VLLM_GPU_MEMORY_UTILIZATION}, PP-StructureV3 reserve enabled"
 
 vllm serve "$MODEL_FOUND" \
     --host 0.0.0.0 --port 8000 \
     --quantization awq --dtype float16 \
-    --gpu-memory-utilization 0.88 \
+    --gpu-memory-utilization "$VLLM_GPU_MEMORY_UTILIZATION" \
     --max-model-len "$MAX_MODEL_LEN" \
     --max-num-seqs "$MAX_NUM_SEQS" \
     --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS" \
@@ -121,6 +124,10 @@ export LLM_TIMEOUT_SECONDS="${LLM_TIMEOUT_SECONDS:-300}"
 export DEFAULT_OUTPUT_FORMAT="${DEFAULT_OUTPUT_FORMAT:-docx}"
 export OUTPUT_DIR="${OUTPUT_DIR:-/root/app/output}"
 export RESUME_PIPELINE_VERSION="${RESUME_PIPELINE_VERSION:-v2}"
+# Production defaults to the locally validated reference content path. New
+# recovery/composer modules are opt-in profiles until their grouped ownership
+# and platform gates pass; current OCR, deadlines and rendering stay shared.
+export PIPELINE_PROFILE="${PIPELINE_PROFILE:-f507_compatible}"
 # This immutable diagnostic build records the complete fictional benchmark
 # payload and each factual transformation under one task ID. Credential-like
 # mapping keys remain suppressed by diagnostic_trace.py.

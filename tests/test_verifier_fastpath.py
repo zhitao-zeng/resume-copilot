@@ -61,7 +61,7 @@ def _product_draft() -> DraftResume:
     })
 
 
-def test_complete_split_fields_skip_llm_verifier_despite_imperfect_raw_coverage():
+def test_complete_split_fields_skip_llm_verifier_at_high_raw_coverage():
     source = build_source_bundle(
         PRODUCT_CV,
         "请根据目标JD优化我的简历，突出B端产品和数据分析能力。",
@@ -69,16 +69,15 @@ def test_complete_split_fields_skip_llm_verifier_despite_imperfect_raw_coverage(
     )
     draft = _product_draft()
 
-    # Exact name occurrences now bind to the contact row instead of the
-    # document title.  The strict per-claim metric is still imperfect because
-    # education/job header lines are split into multiple canonical fields, so
-    # the structure-aware fast path remains necessary.
+    # Coverage can reach 1.0 as compound-field binding improves.  The fast-path
+    # contract is structural completeness, not dependence on an intentionally
+    # imperfect coverage score.
     raw_resume = CanonicalResume.model_validate(draft.model_dump())
     raw_coverage, _ = measure_source_coverage(
         source,
         bind_resume_evidence(raw_resume, source),
     )
-    assert 0.80 <= raw_coverage < 1.0
+    assert 0.80 <= raw_coverage <= 1.0
 
     result = _deterministic_verify_draft(source, draft)
     assert result is not None

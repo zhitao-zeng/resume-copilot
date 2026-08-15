@@ -229,7 +229,32 @@ def _build_generation_direction(job_family: Optional[str], target_description: O
     }
     family = family_names.get(job_family, "") if job_family else ""
     if target_description:
-        return f"根据您提供的个人描述，建议投递{target_description[:20]}相关岗位"
+        target = str(target_description).strip()
+        if re.search(
+            r"(?:请|帮我|麻烦|需要|想要)?.{0,6}"
+            r"(?:优化|修改|改写|生成|调整|完善|整理).{0,8}"
+            r"(?:简历|CV|履历)|"
+            r"(?:下面|上述|以下)(?:是|的)?\s*(?:JD|岗位描述)",
+            target,
+            re.IGNORECASE,
+        ):
+            target = ""
+    else:
+        target = ""
+    if target:
+        if len(target) > 60:
+            clipped = target[:60].rstrip()
+            if (
+                clipped
+                and clipped[-1].isascii()
+                and clipped[-1].isalpha()
+                and target[60:61].isascii()
+                and target[60:61].isalpha()
+                and " " in clipped
+            ):
+                clipped = clipped.rsplit(" ", 1)[0].rstrip()
+            target = clipped + "…"
+        return f"根据您提供的个人描述，建议投递{target}相关岗位"
     elif family:
         return f"您的背景适合{family}类岗位，建议针对性优化简历"
     return "建议明确目标岗位方向以优化简历"

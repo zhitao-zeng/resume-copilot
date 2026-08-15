@@ -1,0 +1,25 @@
+{
+  "excluded_resume_ids": {
+    "01267": "conflicting source variants for one employment end date"
+  },
+  "homepage": "https://github.com/Avature/jobresqa-benchmark",
+  "license": "CC-BY-SA-2.0",
+  "name": "JobResQA Chinese split",
+  "revision": "1dbe6ffcf82cb06ec00f29bb0e4aeebde556addf",
+  "selection_seed": 20260813,
+  "source_bytes": 3111764,
+  "source_rows": 581,
+  "source_sha256": "a749770f4064e3723fb5f7a712f66b88f28a2b5545c589a8d3998f83c8852814",
+  "source_url": "https://raw.githubusercontent.com/Avature/jobresqa-benchmark/1dbe6ffcf82cb06ec00f29bb0e4aeebde556addf/data/jobresqa.zh.tsv",
+  "supplemental_source": {
+    "homepage": "https://huggingface.co/datasets/michaelozon/candidate-matching-synthetic",
+    "license": "MIT",
+    "name": "Candidate-Job Matching Synthetic Dataset",
+    "revision": "178ab864dcad9910c5670d43e4bdbbb901a11f18",
+    "selected_profile_file": "supplemental_profiles.json",
+    "selected_profile_sha256": "e66ac5fb13ef61762a9e3fdebec2b5b4c655f2927462015ec82519713152b847",
+    "selected_profiles": 18
+  },
+  "unique_jds": 101,
+  "unique_resumes": 104
+}

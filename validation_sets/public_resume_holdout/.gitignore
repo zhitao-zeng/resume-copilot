@@ -1,0 +1,5 @@
+# Generated validation data and evaluation output stay local. Rebuild them
+# from the pinned public sources and the small checked-in source manifest.
+/holdout_v2/
+/shadow_v3/
+/verification_report.json

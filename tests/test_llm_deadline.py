@@ -9,7 +9,7 @@ from pydantic import BaseModel
 
 import server_runtime
 from llm_gateway import LLMDeadlineExceeded, LLMGateway
-from resume_composer import compose_resume
+from resume_composer import compose_resume, compose_resume_with_outcome
 from server_runtime import (
     get_request_deadline,
     reset_request_deadline,
@@ -228,3 +228,64 @@ def test_composer_retains_partial_chunks_when_deadline_budget_runs_low():
 
     assert result.meta.name == "张三"
     assert llm_call.call_count == 1
+
+
+def test_composer_chunk_uses_local_deadline_and_restores_outer_budget(monkeypatch):
+    source = SourceBundle(blocks=[
+        SourceBlock(block_id="resume_0", source_type="resume", text="候选人事实"),
+    ])
+    observed_remaining = []
+
+    def fake_call(*_args, **_kwargs):
+        observed_remaining.append(server_runtime.remaining_request_seconds())
+        return DraftResume(meta=Meta(name="张三")).model_dump()
+
+    monkeypatch.setenv("LLM_COMPOSER_CALL_TIMEOUT_SECONDS", "7")
+    monkeypatch.setattr("resume_composer.llm_enabled", lambda: True)
+    monkeypatch.setattr("resume_composer.call_llm_typed", fake_call)
+    outer_token = set_request_deadline(timeout_seconds=60)
+    try:
+        result = compose_resume(source)
+        restored = server_runtime.remaining_request_seconds()
+    finally:
+        reset_request_deadline(outer_token)
+
+    assert result.meta.name == "张三"
+    assert observed_remaining and 0 < observed_remaining[0] <= 7
+    assert restored is not None and restored > 50
+
+
+def test_local_chunk_timeout_keeps_later_chunks_recoverable(monkeypatch):
+    chunks = [
+        SourceBundle(blocks=[
+            SourceBlock(
+                block_id=f"resume_{index}",
+                source_type="resume",
+                text=f"候选人事实{index}",
+            ),
+        ])
+        for index in range(2)
+    ]
+    calls = 0
+
+    def fake_call(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise LLMDeadlineExceeded("local chunk deadline")
+        return DraftResume(meta=Meta(name="李四")).model_dump()
+
+    monkeypatch.setenv("LLM_COMPOSER_CONCURRENCY", "1")
+    monkeypatch.setenv("LLM_COMPOSER_CALL_TIMEOUT_SECONDS", "5")
+    monkeypatch.setattr("resume_composer.llm_enabled", lambda: True)
+    monkeypatch.setattr("resume_composer._split_source_bundle", lambda _source: chunks)
+    monkeypatch.setattr("resume_composer.call_llm_typed", fake_call)
+
+    outcome = compose_resume_with_outcome(SourceBundle(
+        blocks=[block for chunk in chunks for block in chunk.blocks],
+    ))
+
+    assert calls == 2
+    assert outcome.draft.meta.name == "李四"
+    assert len(outcome.failed_chunks) == 1
+    assert outcome.completed_chunks == 1

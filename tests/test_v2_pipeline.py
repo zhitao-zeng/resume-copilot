@@ -61,3 +61,51 @@ def test_validator_deduplicates_projects():
     )
     result = validate_resume(resume)
     assert len(result.projects) == 2
+
+
+def test_validator_preserves_substantive_unnamed_projects():
+    from v2_validator import validate_resume
+    from v2_schemas import CanonicalResume, Project
+
+    resume = CanonicalResume(projects=[
+        Project(
+            organization="星河科技",
+            role="产品负责人",
+            period="2023.03-2023.08",
+            bullets=["完成10次用户访谈并输出需求优先级清单。"],
+        ),
+        Project(
+            organization="远山公益",
+            role="志愿者",
+            period="2022.07",
+            bullets=["组织社区数字技能培训。"],
+        ),
+    ])
+
+    result = validate_resume(resume)
+
+    assert len(result.projects) == 2
+    assert result.projects[0].organization == "星河科技"
+    assert result.projects[1].organization == "远山公益"
+
+
+def test_validator_deduplicates_identical_unnamed_projects_and_drops_empty():
+    from v2_validator import validate_resume
+    from v2_schemas import CanonicalResume, Project
+
+    project = Project(
+        organization="星河科技",
+        role="产品负责人",
+        period="2023.03-2023.08",
+        bullets=["完成10次用户访谈并输出需求优先级清单。"],
+    )
+    resume = CanonicalResume(projects=[
+        project,
+        project.model_copy(deep=True),
+        Project(),
+        Project(bullets=["   "]),
+    ])
+
+    result = validate_resume(resume)
+
+    assert result.projects == [project]

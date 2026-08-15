@@ -1,4 +1,4 @@
-# 最新平台提交配置。
+# 最新平台提交配置：PP-StructureV3 GPU 主路径。
 # 27B 是当前实测的单模型质量/延迟折中；平台仅读取
 # inferenceVolumeMounts 与 inferenceImage，勿在此添加无效 values 配置。
 inferenceVolumeMounts:
@@ -9,4 +9,4 @@ inferenceVolumeMounts:
 
 inferenceImage:
   repository: "harbor-contest.4pd.io/zengzhitao/resume-copilot"
-  tag: "26b8b1a-layout-template"
+  tag: "1d7fb06-ppstructure-gpu-primary"

@@ -25,6 +25,15 @@ for _native_thread_env in (
 from docx import Document as DocxDocument
 from docx.oxml.ns import qn
 from http_compat import HTTPException
+from experimental_model_candidates import (
+    cached_layout_regions,
+    region_aware_ocr_order,
+)
+from ppstructure_runtime import (
+    extract_ppstructure_text,
+    ppstructure_enabled,
+    release_ppstructure_runtime,
+)
 
 try:
     from PIL import Image
@@ -47,6 +56,46 @@ _RAPID_OCR_MODEL_TYPE = "unknown"
 _RAPID_OCR_PROVIDER = "unavailable"
 _RAPID_OCR_INIT_LOCK = threading.Lock()
 _RAPID_OCR_RUN_LOCK = threading.Lock()
+_RAPID_OCR_CONSENSUS_INITED = False
+_RAPID_OCR_SECONDARY_REC = None
+_RAPID_OCR_NUMERIC_REC = None
+
+
+def _tensorrt_ocr_candidate_dirs() -> list[Path]:
+    configured = os.getenv("PPOCRV6_TRT_MODEL_DIR", "").strip()
+    candidates = [
+        Path(__file__).parent / "models" / "ppocrv6-trt-a100",
+        Path(__file__).parent.parent / "models" / "ppocrv6-trt-a100",
+        Path("/mounted_model/ppocrv6-trt-a100"),
+        Path("/root/app/models/ppocrv6-trt-a100"),
+    ]
+    if configured:
+        candidates.insert(0, Path(configured))
+    return list(dict.fromkeys(candidates))
+
+
+def _select_tensorrt_ocr_bundle(
+    candidates: list[Path],
+    *,
+    recognition_only: bool = False,
+    medium_primary: bool = False,
+) -> Optional[Path]:
+    from tensorrt_ocr import (
+        is_complete_tensorrt_bundle,
+        is_complete_tensorrt_medium_primary_bundle,
+        is_complete_tensorrt_recognition_bundle,
+    )
+
+    for candidate in candidates:
+        if medium_primary:
+            complete = is_complete_tensorrt_medium_primary_bundle(candidate)
+        elif recognition_only:
+            complete = is_complete_tensorrt_recognition_bundle(candidate)
+        else:
+            complete = is_complete_tensorrt_bundle(candidate)
+        if complete:
+            return candidate
+    return None
 
 
 def _positive_int_env(name: str, default: int) -> int:
@@ -63,6 +112,14 @@ def _positive_float_env(name: str, default: float) -> float:
     except (TypeError, ValueError):
         return default
     return value if value > 0 else default
+
+
+def _nonnegative_int_env(name: str, default: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return value if value >= 0 else default
 
 
 def _cgroup_cpu_limit() -> Optional[int]:
@@ -180,8 +237,10 @@ def _select_rapid_ocr_bundle(
     *,
     prefer_server: bool,
     forced_model_type: str = "auto",
+    excluded_versions: Optional[set[str]] = None,
 ) -> Optional[dict[str, Any]]:
     """Select an explicit model bundle without reconstructing filenames later."""
+    excluded_versions = excluded_versions or set()
     if forced_model_type not in {"auto", "small", "server", "mobile"}:
         forced_model_type = "auto"
     if forced_model_type == "auto":
@@ -191,6 +250,8 @@ def _select_rapid_ocr_bundle(
 
     for model_type in type_order:
         for version in ("v6", "v5", "v4"):
+            if version in excluded_versions:
+                continue
             for model_dir in candidates:
                 files = _rapid_ocr_model_bundles(model_dir).get((version, model_type))
                 if files is None:
@@ -281,8 +342,122 @@ def _build_rapid_ocr(bundle: dict[str, Any], *, use_cuda: bool, cpu_threads: int
     return RapidOCR(params=params)
 
 
+def _build_rapid_recognizer_from_primary(model_path: Path):
+    """Load one alternate recognition head without duplicating detection.
+
+    The two consensus models share the primary detector, classifier, crops and
+    character dictionary.  Loading only ``TextRecognizer`` keeps the CPU/RAM
+    cost far below running three complete OCR pipelines.
+    """
+
+    import copy
+
+    from rapidocr.ch_ppocr_rec import TextRecognizer
+
+    if _RAPID_OCR is None:
+        raise RuntimeError("primary RapidOCR must be initialized first")
+    config = copy.deepcopy(_RAPID_OCR.cfg.Rec)
+    config.model_path = str(model_path)
+    return TextRecognizer(config)
+
+
+def _init_numeric_ocr_consensus() -> bool:
+    """Lazily initialize two recognition-only witnesses when bundled."""
+
+    global _RAPID_OCR_CONSENSUS_INITED
+    global _RAPID_OCR_SECONDARY_REC, _RAPID_OCR_NUMERIC_REC
+    if _RAPID_OCR_CONSENSUS_INITED:
+        return bool(_RAPID_OCR_SECONDARY_REC and _RAPID_OCR_NUMERIC_REC)
+    _RAPID_OCR_CONSENSUS_INITED = True
+
+    enabled = os.getenv("PPOCR_NUMERIC_CONSENSUS", "auto").strip().lower()
+    if enabled in {"0", "false", "no", "off"}:
+        return False
+    primary_dir = Path(_RAPID_OCR_PATH) if _RAPID_OCR_PATH else Path()
+    secondary_path = Path(os.getenv(
+        "PPOCRV6_SECONDARY_REC_MODEL_PATH",
+        str(primary_dir / "rec-base.onnx"),
+    ))
+    numeric_path = Path(os.getenv(
+        "PPOCRV6_NUMERIC_REC_MODEL_PATH",
+        str(primary_dir / "rec-medium.onnx"),
+    ))
+    if not secondary_path.is_file() or not numeric_path.is_file():
+        if enabled in {"1", "true", "yes", "on"}:
+            logger.warning(
+                "OCR numeric consensus requested but model heads are missing | secondary=%s numeric=%s",
+                secondary_path,
+                numeric_path,
+            )
+        return False
+    try:
+        started = time.perf_counter()
+        _RAPID_OCR_SECONDARY_REC = _build_rapid_recognizer_from_primary(secondary_path)
+        _RAPID_OCR_NUMERIC_REC = _build_rapid_recognizer_from_primary(numeric_path)
+        logger.info(
+            "OCR numeric consensus initialized | secondary=%s numeric=%s init_s=%.3f",
+            secondary_path,
+            numeric_path,
+            time.perf_counter() - started,
+        )
+        return True
+    except Exception as exc:
+        _RAPID_OCR_SECONDARY_REC = None
+        _RAPID_OCR_NUMERIC_REC = None
+        logger.warning("OCR numeric consensus initialization failed: %s", exc)
+        return False
+
+
+def _build_rapid_ocr_with_fallback(
+    bundle: dict[str, Any],
+    *,
+    candidates: list[Path],
+    prefer_server: bool,
+    forced_model_type: str,
+    use_cuda: bool,
+    cpu_threads: int,
+) -> tuple[Any, dict[str, Any]]:
+    """Build the selected engine, degrading to an older local bundle if needed.
+
+    A local evaluator can lag behind the production RapidOCR runtime.  In that
+    case selecting a complete PP-OCRv6 bundle used to abort OCR initialization
+    before the already-present v5/v4 models were considered.  Keep v6 as the
+    primary path, but make model-version fallback explicit and bounded.
+    """
+    try:
+        return (
+            _build_rapid_ocr(bundle, use_cuda=use_cuda, cpu_threads=cpu_threads),
+            bundle,
+        )
+    except Exception as primary_exc:
+        fallback_bundle = _select_rapid_ocr_bundle(
+            candidates,
+            prefer_server=prefer_server,
+            forced_model_type=forced_model_type,
+            excluded_versions={str(bundle["version"])},
+        )
+        if fallback_bundle is None:
+            raise
+        logger.warning(
+            "RapidOCR %s/%s initialization failed; falling back to %s/%s | error=%s",
+            bundle["version"],
+            bundle["model_type"],
+            fallback_bundle["version"],
+            fallback_bundle["model_type"],
+            primary_exc,
+        )
+        return (
+            _build_rapid_ocr(
+                fallback_bundle,
+                use_cuda=use_cuda,
+                cpu_threads=cpu_threads,
+            ),
+            fallback_bundle,
+        )
+
+
 def _switch_rapid_ocr_to_cpu_mobile(reason: str) -> bool:
-    """Replace a failed CUDA engine with the bounded CPU v6-small path."""
+    """Replace a failed CUDA engine with a bounded CPU OCR path."""
     global _RAPID_OCR, _RAPID_OCR_PATH, _RAPID_OCR_VERSION
     global _RAPID_OCR_MODEL_TYPE, _RAPID_OCR_PROVIDER
     with _RAPID_OCR_INIT_LOCK:
@@ -298,8 +473,11 @@ def _switch_rapid_ocr_to_cpu_mobile(reason: str) -> bool:
                 _positive_int_env("RAPID_OCR_CPU_THREADS", 4),
                 _available_cpu_count(),
             )
-            replacement = _build_rapid_ocr(
+            replacement, bundle = _build_rapid_ocr_with_fallback(
                 bundle,
+                candidates=_rapid_ocr_candidate_dirs(),
+                prefer_server=False,
+                forced_model_type="auto",
                 use_cuda=False,
                 cpu_threads=cpu_threads,
             )
@@ -321,6 +499,101 @@ def _switch_rapid_ocr_to_cpu_mobile(reason: str) -> bool:
             logger.warning("RapidOCR CPU failover could not initialize: %s", exc)
             return False
 
+
+def _build_tensorrt_consensus_ocr(model_dir: Path):
+    from tensorrt_ocr import TensorRTConsensusOCR
+
+    engine = TensorRTConsensusOCR(
+        model_dir,
+        device_id=_nonnegative_int_env("RAPID_OCR_GPU_DEVICE_ID", 0),
+        text_score=_positive_float_env("RAPID_OCR_TEXT_SCORE", 0.5),
+        det_thresh=_positive_float_env("RAPID_OCR_DET_THRESH", 0.3),
+        det_box_thresh=_positive_float_env("RAPID_OCR_DET_BOX_THRESH", 0.5),
+        det_unclip_ratio=_positive_float_env("RAPID_OCR_DET_UNCLIP_RATIO", 1.6),
+        cls_thresh=_positive_float_env("RAPID_OCR_CLS_THRESH", 0.9),
+        max_side_len=_positive_int_env("RAPID_OCR_ENGINE_MAX_SIDE", 1600),
+        numeric_signature=_ocr_numeric_signature,
+        suppress_numeric=_suppress_disputed_numeric_anchors,
+        repair_text=_repair_ocr_text_artifacts,
+    )
+    warmup = os.getenv("PPOCRV6_TRT_WARMUP", "1").strip().lower()
+    if warmup not in {"0", "false", "no", "off"}:
+        engine.warm_up()
+    return engine
+
+
+def _build_tensorrt_recognition_consensus(
+    model_dir: Path,
+    *,
+    primary_bundle: dict[str, Any],
+    cpu_threads: int,
+    recognition_mode: str,
+):
+    from tensorrt_ocr import (
+        TensorRTMediumRecognitionConsensus,
+        TensorRTRecognitionConsensus,
+    )
+
+    if (
+        primary_bundle.get("version") != "v6"
+        or primary_bundle.get("model_type") != "small"
+    ):
+        raise RuntimeError(
+            "TensorRT recognition consensus requires a PP-OCRv6 small primary"
+        )
+    primary_ocr = _build_rapid_ocr(
+        primary_bundle,
+        use_cuda=False,
+        cpu_threads=cpu_threads,
+    )
+    engine_class = (
+        TensorRTMediumRecognitionConsensus
+        if recognition_mode == "medium-primary"
+        else TensorRTRecognitionConsensus
+    )
+    recognition_preprocess = os.getenv(
+        "PPOCRV6_TRT_RECOGNITION_PREPROCESS", "standard-resize"
+    ).strip().lower()
+    if recognition_preprocess not in {
+        "standard-resize",
+        "native-height-pad",
+    }:
+        logger.warning(
+            "Unknown PPOCRV6_TRT_RECOGNITION_PREPROCESS=%s; using "
+            "standard-resize",
+            recognition_preprocess,
+        )
+        recognition_preprocess = "standard-resize"
+    engine_options = {
+        "primary_ocr": primary_ocr,
+        "device_id": _nonnegative_int_env("RAPID_OCR_GPU_DEVICE_ID", 0),
+        "recognition_preprocess": recognition_preprocess,
+        "numeric_signature": _ocr_numeric_signature,
+        "suppress_numeric": _suppress_disputed_numeric_anchors,
+        "repair_text": _repair_ocr_text_artifacts,
+    }
+    if recognition_mode == "medium-primary":
+        witness_preprocess = os.getenv(
+            "PPOCRV6_TRT_WITNESS_PREPROCESS", "standard-resize"
+        ).strip().lower()
+        if witness_preprocess not in {
+            "standard-resize",
+            "native-height-pad",
+        }:
+            logger.warning(
+                "Unknown PPOCRV6_TRT_WITNESS_PREPROCESS=%s; using "
+                "standard-resize",
+                witness_preprocess,
+            )
+            witness_preprocess = "standard-resize"
+        engine_options["witness_preprocess"] = witness_preprocess
+    engine = engine_class(model_dir, **engine_options)
+    warmup = os.getenv("PPOCRV6_TRT_WARMUP", "1").strip().lower()
+    if warmup not in {"0", "false", "no", "off"}:
+        engine.warm_up()
+    return engine
+
+
 def _init_rapid_ocr():
     global _RAPID_OCR, _RAPID_OCR_PATH, _RAPID_OCR_INITED, _RAPID_OCR_VERSION
     global _RAPID_OCR_MODEL_TYPE, _RAPID_OCR_PROVIDER
@@ -332,12 +605,106 @@ def _init_rapid_ocr():
         started = time.perf_counter()
         try:
             candidates = _rapid_ocr_candidate_dirs()
-            use_cuda = _rapid_ocr_cuda_available()
             requested_device = os.getenv("RAPID_OCR_DEVICE", "cpu").strip().lower()
+            requested_backend = os.getenv(
+                "RAPID_OCR_BACKEND", "onnxruntime"
+            ).strip().lower()
+            if requested_backend not in {
+                "auto", "onnxruntime", "tensorrt", "tensorrt-full",
+            }:
+                logger.warning(
+                    "Unknown RAPID_OCR_BACKEND=%s; using onnxruntime",
+                    requested_backend,
+                )
+                requested_backend = "onnxruntime"
+
+            forced_model = os.getenv("RAPID_OCR_MODEL", "auto").strip().lower()
+            recognition_mode = os.getenv(
+                "PPOCRV6_TRT_RECOGNITION_MODE", "medium-primary"
+            ).strip().lower()
+            if recognition_mode not in {"medium-primary", "small-primary"}:
+                logger.warning(
+                    "Unknown PPOCRV6_TRT_RECOGNITION_MODE=%s; using medium-primary",
+                    recognition_mode,
+                )
+                recognition_mode = "medium-primary"
+            cpu_threads = min(
+                _positive_int_env("RAPID_OCR_CPU_THREADS", 4),
+                _available_cpu_count(),
+            )
+            try_tensorrt = requested_backend in {"tensorrt", "tensorrt-full"} or (
+                requested_backend == "auto"
+                and requested_device in {"cuda", "gpu", "auto"}
+            )
+            if try_tensorrt:
+                tensorrt_bundle = _select_tensorrt_ocr_bundle(
+                    _tensorrt_ocr_candidate_dirs(),
+                    recognition_only=requested_backend != "tensorrt-full",
+                    medium_primary=(
+                        requested_backend != "tensorrt-full"
+                        and recognition_mode == "medium-primary"
+                    ),
+                )
+                if tensorrt_bundle is None:
+                    logger.warning(
+                        "TensorRT OCR requested but no complete engine bundle was found; "
+                        "falling back to RapidOCR"
+                    )
+                else:
+                    try:
+                        if requested_backend == "tensorrt-full":
+                            ocr_instance = _build_tensorrt_consensus_ocr(
+                                tensorrt_bundle
+                            )
+                            model_type = "small-small-medium-full-trt"
+                            provider = "TensorRTExecutionProvider"
+                        else:
+                            primary_bundle = _select_rapid_ocr_bundle(
+                                candidates,
+                                prefer_server=False,
+                                forced_model_type=forced_model,
+                            )
+                            if primary_bundle is None:
+                                raise FileNotFoundError(
+                                    "PP-OCRv6 small primary bundle was not found"
+                                )
+                            ocr_instance = _build_tensorrt_recognition_consensus(
+                                tensorrt_bundle,
+                                primary_bundle=primary_bundle,
+                                cpu_threads=cpu_threads,
+                                recognition_mode=recognition_mode,
+                            )
+                            if recognition_mode == "medium-primary":
+                                model_type = "medium+two-small-trt-fp32-consensus"
+                                provider = "TensorRTMediumRecognition+CPUDetection"
+                            else:
+                                model_type = "small+trt-fp32-consensus"
+                                provider = "TensorRTRecognition+CPUDetection"
+                        _RAPID_OCR = ocr_instance
+                        _RAPID_OCR_PATH = str(tensorrt_bundle)
+                        _RAPID_OCR_VERSION = "v6"
+                        _RAPID_OCR_MODEL_TYPE = model_type
+                        _RAPID_OCR_PROVIDER = provider
+                        logger.info(
+                            "RapidOCR initialized | version=v6 model=%s provider=%s "
+                            "init_s=%.3f path=%s",
+                            _RAPID_OCR_MODEL_TYPE,
+                            _RAPID_OCR_PROVIDER,
+                            time.perf_counter() - started,
+                            _RAPID_OCR_PATH,
+                        )
+                        return
+                    except Exception as exc:
+                        logger.warning(
+                            "TensorRT OCR initialization failed; falling back to "
+                            "RapidOCR: %s",
+                            exc,
+                        )
+
+            use_cuda = _rapid_ocr_cuda_available()
             if requested_device in {"cuda", "gpu"} and not use_cuda:
                 logger.warning("RapidOCR CUDA requested but CUDAExecutionProvider is unavailable; using CPU")
 
-            forced_model = os.getenv("RAPID_OCR_MODEL", "auto").strip().lower()
             bundle = _select_rapid_ocr_bundle(
                 candidates,
                 prefer_server=use_cuda,
@@ -347,11 +714,14 @@ def _init_rapid_ocr():
                 logger.warning("RapidOCR model files not found, falling back to pytesseract")
                 return
 
-            cpu_threads = min(
-                _positive_int_env("RAPID_OCR_CPU_THREADS", 4),
-                _available_cpu_count(),
+            ocr_instance, bundle = _build_rapid_ocr_with_fallback(
+                bundle,
+                candidates=candidates,
+                prefer_server=use_cuda,
+                forced_model_type=forced_model,
+                use_cuda=use_cuda,
+                cpu_threads=cpu_threads,
             )
-            ocr_instance = _build_rapid_ocr(bundle, use_cuda=use_cuda, cpu_threads=cpu_threads)
             providers = _rapid_ocr_session_providers(ocr_instance)
 
             # A registered CUDA provider can still fail to create a CUDA session
@@ -375,8 +745,11 @@ def _init_rapid_ocr():
                     )
                     bundle = fallback_bundle
                     use_cuda = False
-                    ocr_instance = _build_rapid_ocr(
+                    ocr_instance, bundle = _build_rapid_ocr_with_fallback(
                         bundle,
+                        candidates=candidates,
+                        prefer_server=False,
+                        forced_model_type=forced_model,
                         use_cuda=False,
                         cpu_threads=cpu_threads,
                     )
@@ -432,17 +805,37 @@ def _prepare_ocr_image(content: bytes):
     return pil_img, original_size
 
 
-def _rapid_result_to_text(result: Any, *, img_width: int, img_height: int) -> str:
+def _rapid_result_to_text(
+    result: Any,
+    *,
+    img_width: int,
+    img_height: int,
+    source_content: bytes = b"",
+) -> str:
     boxes = result.boxes if hasattr(result, "boxes") else (result[0] if isinstance(result, (tuple, list)) else None)
     txts = result.txts if hasattr(result, "txts") else (result[1] if isinstance(result, (tuple, list)) and len(result) > 1 else None)
     if boxes is None or len(boxes) == 0:
         return ""
-    ordered_texts = _reconstruct_ocr_reading_order(
+    regions = cached_layout_regions(
+        source_content,
+        width=img_width,
+        height=img_height,
+    )
+    ordered_texts = region_aware_ocr_order(
         boxes,
         txts,
-        img_width=img_width,
-        img_height=img_height,
-    )
+        width=img_width,
+        height=img_height,
+        regions=regions,
+        baseline_order=_reconstruct_ocr_reading_order,
+    ) if regions else None
+    if ordered_texts is None:
+        ordered_texts = _reconstruct_ocr_reading_order(
+            boxes,
+            txts,
+            img_width=img_width,
+            img_height=img_height,
+        )
     return "\n".join(ordered_texts) if ordered_texts else ""
 
 
@@ -452,6 +845,129 @@ def _run_rapid_ocr(np_img):
     # guaranteed to be re-entrant.
     with _RAPID_OCR_RUN_LOCK:
         return _RAPID_OCR(np_img)
+
+
+def _ocr_numeric_signature(text: object) -> tuple[str, ...]:
+    repaired = _repair_ocr_text_artifacts(str(text or ""))
+    return tuple(re.findall(r"\d+(?:\.\d+)?", repaired))
+
+
+def _suppress_disputed_numeric_anchors(text: object) -> str:
+    """Keep the readable clause while removing an unverified OCR number."""
+
+    value = _repair_ocr_text_artifacts(str(text or ""))
+    value = re.sub(r"\d+(?:[.,，]\d+)*", "", value)
+    value = re.sub(r"[（(]\s*[）)]", "", value)
+    value = re.sub(r"\s{2,}", " ", value)
+    return value.strip()
+
+
+def _apply_numeric_ocr_consensus(np_img, result: Any) -> Any:
+    """Suppress numeric anchors unless three recognition heads agree.
+
+    Detection and classification run only once.  A second small recognition
+    head reads all detected lines.  The larger head reads only numeric lines
+    where the first two heads already agree: when they disagree, three-way
+    agreement is mathematically impossible, so invoking the larger head cannot
+    change the decision.  We intentionally do not *choose* an alternate
+    number: any disagreement removes the digits while retaining the
+    surrounding factual clause.  That converts uncertain OCR into an explicit
+    omission instead of a fabricated metric or date.
+    """
+
+    if getattr(result, "numeric_consensus_applied", False):
+        return result
+    if (
+        result is None
+        or _RAPID_OCR is None
+        or getattr(result, "boxes", None) is None
+        or getattr(result, "txts", None) is None
+        or not _init_numeric_ocr_consensus()
+    ):
+        return result
+    try:
+        from rapidocr.ch_ppocr_rec import TextRecInput
+
+        consensus_started = time.perf_counter()
+        with _RAPID_OCR_RUN_LOCK:
+            crop_started = time.perf_counter()
+            crops = _RAPID_OCR.crop_text_regions(np_img, result.boxes)
+            crops, _classification = _RAPID_OCR.cls_and_rotate(crops)
+            crop_cls_s = time.perf_counter() - crop_started
+            secondary_started = time.perf_counter()
+            secondary = _RAPID_OCR_SECONDARY_REC(TextRecInput(
+                img=crops,
+                return_word_box=False,
+            ))
+            secondary_s = time.perf_counter() - secondary_started
+            if secondary.txts is None or len(secondary.txts) != len(result.txts):
+                return result
+            numeric_indexes = [
+                index
+                for index, (primary_text, secondary_text) in enumerate(
+                    zip(result.txts, secondary.txts)
+                )
+                if _ocr_numeric_signature(primary_text)
+                or _ocr_numeric_signature(secondary_text)
+            ]
+            if not numeric_indexes:
+                return result
+            medium_indexes = [
+                index
+                for index in numeric_indexes
+                if _ocr_numeric_signature(result.txts[index])
+                == _ocr_numeric_signature(secondary.txts[index])
+            ]
+            medium_started = time.perf_counter()
+            numeric = (
+                _RAPID_OCR_NUMERIC_REC(TextRecInput(
+                    img=[crops[index] for index in medium_indexes],
+                    return_word_box=False,
+                ))
+                if medium_indexes
+                else None
+            )
+            medium_s = time.perf_counter() - medium_started
+        if medium_indexes and (
+            numeric is None
+            or numeric.txts is None
+            or len(numeric.txts) != len(medium_indexes)
+        ):
+            return result
+
+        numeric_by_index = dict(zip(
+            medium_indexes,
+            numeric.txts if numeric is not None and numeric.txts is not None else (),
+        ))
+        reconciled = list(result.txts)
+        disputed = 0
+        for index in numeric_indexes:
+            primary_signature = _ocr_numeric_signature(result.txts[index])
+            secondary_signature = _ocr_numeric_signature(secondary.txts[index])
+            if primary_signature == secondary_signature and (
+                primary_signature == _ocr_numeric_signature(numeric_by_index[index])
+            ):
+                reconciled[index] = _repair_ocr_text_artifacts(result.txts[index])
+                continue
+            reconciled[index] = _suppress_disputed_numeric_anchors(result.txts[index])
+            disputed += 1
+        result.txts = tuple(reconciled)
+        logger.info(
+            "OCR numeric consensus finished | numeric_lines=%s medium_lines=%s "
+            "early_disputed_lines=%s disputed_lines=%s crop_cls_s=%.3f "
+            "secondary_s=%.3f medium_s=%.3f total_s=%.3f",
+            len(numeric_indexes),
+            len(medium_indexes),
+            len(numeric_indexes) - len(medium_indexes),
+            disputed,
+            crop_cls_s,
+            secondary_s,
+            medium_s,
+            time.perf_counter() - consensus_started,
+        )
+    except Exception as exc:
+        logger.warning("OCR numeric consensus failed; keeping primary OCR: %s", exc)
+    return result
 
 
 def _ocr_image_with_rapid(content: bytes, *, prepared_image=None) -> str:
@@ -482,7 +998,12 @@ def _ocr_image_with_rapid(content: bytes, *, prepared_image=None) -> str:
         result = _run_rapid_ocr(np_img)
     except Exception as exc:
         logger.warning("RapidOCR inference failed, falling back: %s", exc)
-        if _RAPID_OCR_PROVIDER == "CUDAExecutionProvider" and _switch_rapid_ocr_to_cpu_mobile(
+        if _RAPID_OCR_PROVIDER in {
+            "CUDAExecutionProvider",
+            "TensorRTExecutionProvider",
+            "TensorRTRecognition+CPUDetection",
+            "TensorRTMediumRecognition+CPUDetection",
+        } and _switch_rapid_ocr_to_cpu_mobile(
             type(exc).__name__
         ):
             try:
@@ -492,10 +1013,12 @@ def _ocr_image_with_rapid(content: bytes, *, prepared_image=None) -> str:
                 return ""
         else:
             return ""
+    result = _apply_numeric_ocr_consensus(np_img, result)
     return _rapid_result_to_text(
         result,
         img_width=np_img.shape[1],
         img_height=np_img.shape[0],
+        source_content=content,
     )
 
 
@@ -651,7 +1174,12 @@ def _reconstruct_ocr_reading_order(
         # Detector boxes tightly wrap glyphs, so an ordinary form can expose a
         # whitespace gap close to 10% of the page even when the visual label
         # and value cells are adjacent.
-        if normalized_gap < 0.11 and paired >= 0.75:
+        # Dense balanced resume columns often have a gutter below 11% of the
+        # page and nearly every line has a neighbour at the same y position.
+        # Treat that pattern as key/value rows only when one side is also
+        # materially narrower.  Otherwise the old rule interleaved the left
+        # and right columns one line at a time.
+        if normalized_gap < 0.11 and paired >= 0.75 and width_ratio < 0.65:
             return True
         # A narrow, smaller group aligned one-to-one with wider record headers
         # is normally a date/location annotation column. Read it in-row.
@@ -782,6 +1310,7 @@ def _ocr_image_multicandidate(content: bytes, *, prepared_image=None) -> str:
                 result,
                 img_width=np_img.shape[1],
                 img_height=np_img.shape[0],
+                source_content=content,
             )
         except Exception as exc:
             logger.warning("RapidOCR alternate preprocessing failed: %s", exc)
@@ -843,10 +1372,63 @@ def _looks_like_section_header(line: str, keywords: tuple[str, ...], max_len: in
     return False
 
 
-def _normalize_extracted_resume_text(text: str) -> str:
+_OCR_PLACEHOLDER_LABELS = (
+    "公司", "单位", "组织", "学校", "院校", "城市", "国家", "地区", "省份",
+    "姓名", "电话", "手机", "邮箱", "地址", "专业", "职位", "岗位", "项目",
+)
+
+
+def _repair_ocr_text_artifacts(text: str) -> str:
+    """Repair high-confidence OCR glyph errors without guessing resume facts.
+
+    Chinese OCR occasionally recognizes an internal zero as an opening round
+    bracket (``2((4`` / ``35(0``).  A bracket *between numeric glyphs* cannot
+    be resume punctuation, so replacing it is deterministic.  Likewise,
+    evaluation fixtures use bracketed anonymisation labels; OCR may turn
+    ``[公司]`` into ``【公司1``.  Canonicalising only the known structural label
+    prevents the trailing recognition noise from becoming a candidate fact.
+    """
+
+    repaired = str(text or "")
+    while re.search(r"(?<=\d)[(（](?=[\d(（])", repaired):
+        repaired = re.sub(r"(?<=\d)[(（](?=[\d(（])", "0", repaired)
+
+    label_alt = "|".join(
+        re.escape(value) for value in sorted(_OCR_PLACEHOLDER_LABELS, key=len, reverse=True)
+    )
+    # Complete brackets may contain a spurious numeric suffix.
+    repaired = re.sub(
+        rf"[\[【［][ \t]*(?:{label_alt})[ \t]*\d*[ \t]*[\]】］]",
+        lambda match: "[" + re.search(label_alt, match.group(0)).group(0) + "]",
+        repaired,
+    )
+    # A common missing-bracket form is ``【公司12012-2022``: one noisy
+    # placeholder index precedes a real four-digit date. Remove only that one
+    # index, never the adjoining date.
+    repaired = re.sub(
+        rf"[\[【［][ \t]*(?P<label>{label_alt})[1lI](?=(?:19|20)\d{{2}})",
+        lambda match: f"[{match.group('label')}]",
+        repaired,
+    )
+    # Missing closing bracket at a field boundary, e.g. ``【公司1｜``.
+    repaired = re.sub(
+        rf"[\[【［][ \t]*(?P<label>{label_alt})[ \t]*[1lI]?(?=[ \t]*(?:$|\n|[|｜,，;；:：-]))",
+        lambda match: f"[{match.group('label')}]",
+        repaired,
+    )
+    return repaired
+
+
+def _normalize_extracted_resume_text(
+    text: str,
+    *,
+    repair_ocr_artifacts: bool = False,
+) -> str:
     raw = str(text or "")
     if not raw:
         return ""
+    if repair_ocr_artifacts:
+        raw = _repair_ocr_text_artifacts(raw)
     if not ENABLE_TEXT_LAYOUT_NORMALIZATION:
         return raw.strip()
 
@@ -1489,12 +2071,32 @@ def extract_text_from_image_bytes(content: bytes, filename: str) -> str:
         prepared_image.size != original_size,
     )
 
-    # Prefer RapidOCR (CUDA server or CPU mobile), then bounded fallbacks.
-    if not _RAPID_OCR_INITED:
+    text = ""
+    if ppstructure_enabled():
+        stage_started = time.perf_counter()
+        try:
+            text = extract_ppstructure_text(content, filename=filename)
+        except Exception as exc:
+            # StructureV3 is an optional quality path.  Missing dependencies,
+            # incomplete offline models, GPU pressure, and inference errors all
+            # degrade to the already validated OCR+BBOX implementation.
+            logger.warning("PP-StructureV3 OCR failed; using OCR+BBOX: %s", exc)
+            release_ppstructure_runtime()
+        logger.info(
+            "PP-StructureV3 OCR finished | device=%s elapsed_s=%.3f chars=%s",
+            os.getenv("PPSTRUCTURE_DEVICE", "gpu:0"),
+            time.perf_counter() - stage_started,
+            len(text),
+        )
+        if not text.strip():
+            release_ppstructure_runtime()
+
+    # StructureV3 is the default raster parser. RapidOCR keeps its previous
+    # detection/recognition plus BBOX ordering role as the bounded fallback.
+    if not text.strip() and not _RAPID_OCR_INITED:
         _init_rapid_ocr()
 
-    text = ""
-    if _RAPID_OCR is not None:
+    if not text.strip() and _RAPID_OCR is not None:
         stage_started = time.perf_counter()
         text = _ocr_image_with_rapid(content, prepared_image=prepared_image)
         logger.info(
@@ -1541,7 +2143,10 @@ def extract_text_from_image_bytes(content: bytes, filename: str) -> str:
         )
         return ""
 
-    normalized = _normalize_extracted_resume_text(text)
+    normalized = _normalize_extracted_resume_text(
+        text,
+        repair_ocr_artifacts=True,
+    )
     logger.info(
         "OCR extraction finished | total_s=%.3f normalized_chars=%s",
         time.perf_counter() - total_started,

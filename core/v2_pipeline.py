@@ -5,10 +5,13 @@ Layers: SourceAdapter → Composer → Verifier → Optimizer → Validator
 from __future__ import annotations
 
 import logging
+import os
 import re
 import time
 import unicodedata
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import asdict, dataclass
+from datetime import date
 
 from v2_schemas import VerifiedResult, CanonicalResume, DraftResume, Meta, Change
 from source_adapter import (
@@ -23,6 +26,7 @@ from resume_verifier import verify_resume
 from resume_verifier import _ground_fixed_fields, _reclassify_non_work
 from resume_optimizer import (
     optimize_resume_with_provenance,
+    select_narrative_record_keys,
     _introduces_unsupported_fact,
     _safe_rewrite_diagnostics,
 )
@@ -33,10 +37,17 @@ from evidence_binding import (
     measure_source_coverage,
     source_fact_units,
 )
+from atomic_fact_audit import audit_atomic_facts
+from fact_compiler import compile_fact_coverage, sanitize_resume_placeholders
 import resume_product_logic as product_logic
 from diagnostic_trace import trace_event
+from pipeline_profiles import resolve_pipeline_profile
 
 logger = logging.getLogger(__name__)
+
+
+def _fact_compiler_mode() -> str:
+    return resolve_pipeline_profile().fact_compiler_mode
 
 
 def _is_empty_resume(resume: CanonicalResume) -> bool:
@@ -212,7 +223,7 @@ def _fact_clauses(text: str) -> list[str]:
 
     return [
         item.strip(" \t-•·▪◦，,。；;")
-        for item in re.split(r"[\n。；;,，]+", str(text or ""))
+        for item in re.split(r"[\n。；;,，•·▪◦]+", str(text or ""))
         if len(re.sub(r"\W+", "", item, flags=re.UNICODE)) >= 3
     ]
 
@@ -552,6 +563,12 @@ def _normalize_skill_category(name: str, category: str) -> str:
 def _normalize_skill_name(name: str) -> str:
     value = unicodedata.normalize("NFKC", str(name or "")).strip()
     value = re.sub(r"\s+", " ", value)
+    value = re.sub(
+        r"^\d+(?:\.\d+)?\s*(?:年|个月|月)\s*技术\s*[:：]\s*",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    )
     # Models vary between "DOE实验设计" and "DOE 实验设计".  This is
     # typographic normalization, not an industry dictionary.
     value = re.sub(r"(?<=[A-Za-z0-9])\s+(?=[\u4e00-\u9fff])", "", value)
@@ -561,6 +578,15 @@ def _normalize_skill_name(name: str) -> str:
         value,
         flags=re.IGNORECASE,
     ).strip()
+    # A skill token concatenated with a dated project/header is an OCR layout
+    # artifact, not one coherent skill claim. Keep the original token in its
+    # evidence-bound record rather than exposing the malformed composite.
+    if len(value) > 12 and re.search(
+        r"(?:19|20)\d{2}年(?:1[0-2]|0?[1-9])?月?\s*"
+        r"[-–—~至到]\s*(?:(?:19|20)\d{2}年)?(?:1[0-2]|0?[1-9])月?",
+        value,
+    ):
+        return ""
     return value
 
 
@@ -666,8 +692,65 @@ def _atomize_resume_bullets(
     return atomized, provenance
 
 
-def _needs_optimizer(resume: CanonicalResume) -> bool:
-    """Every factual bullet gets a dedicated evidence-preserving edit pass."""
+_QUALITY_DURATION_ONLY = re.compile(
+    r"^(?:[-*•·▪◦]\s*)?\d+(?:\.\d+)?\s*(?:年|个月|月)$"
+)
+_QUALITY_EMPTY_METRIC = re.compile(
+    r"(?:实现|提升|提高|增长|降低|减少|缩短|达到|达成)?了?\s*(?<!\d)[%％]"
+)
+
+
+def _quality_v2_presentation_cleanup(resume: CanonicalResume) -> CanonicalResume:
+    """Remove deterministic non-claims without using profession vocabulary.
+
+    A bare elapsed duration belongs in the structured period.  A result clause
+    containing an empty percentage placeholder is incomplete source data, so
+    only that clause is removed and the rest of the grounded sentence stays.
+    """
+
+    cleaned = resume.model_copy(deep=True)
+    for section_name in ("experience", "research", "activities", "projects"):
+        for record in getattr(cleaned, section_name):
+            bullets: list[str] = []
+            for raw in record.bullets:
+                value = re.sub(r"\s+", " ", str(raw or "")).strip()
+                if not value or _QUALITY_DURATION_ONLY.fullmatch(value):
+                    continue
+                clauses = [
+                    clause.strip(" \t，,。；;")
+                    for clause in re.split(
+                        r"[。；;]+|(?<=[^\d])[,，](?=\s*(?:实现|提升|提高|增长|降低|减少|缩短|达到|达成))",
+                        value,
+                    )
+                    if clause.strip(" \t，,。；;")
+                ]
+                retained = [
+                    clause for clause in clauses
+                    if not _QUALITY_EMPTY_METRIC.search(clause)
+                ]
+                repaired = "，".join(retained).strip(" \t，,。；;")
+                if repaired and repaired not in bullets:
+                    bullets.append(repaired)
+            record.bullets = bullets
+    return cleaned
+
+
+def _needs_optimizer(
+    resume: CanonicalResume,
+    *,
+    audited_source_scaffold: bool = False,
+    narrative_record_keys: set[tuple[str, int]] | None = None,
+) -> bool:
+    """Return whether another LLM wording pass can add useful information.
+
+    A compiler scaffold must not be sent through an unbounded whole-document
+    rewrite.  It may, however, receive a record-scoped pass when the planner
+    selected a bounded set of multi-clause records. Ordinary Composer output
+    continues to receive the existing evidence-preserving wording pass.
+    """
+
+    if audited_source_scaffold:
+        return bool(narrative_record_keys)
 
     bullets = [
         str(bullet).strip()
@@ -1087,7 +1170,16 @@ def _summary_fact_entries(
                 if section_name == "experience":
                     organization = record.organization.strip()
                     role = record.role.strip()
-                    if organization and role:
+                    # A source bullet may already contain its own temporal or
+                    # role context.  Prefixing the record identity again made
+                    # summaries read like “在银行担任经理期间，在银行做…”.
+                    already_contextual = bool(re.match(
+                        r"^(?:在|于|担任|任职)",
+                        bullet,
+                    ))
+                    if already_contextual:
+                        contextual = bullet
+                    elif organization and role:
                         contextual = f"在{organization}担任{role}期间，{bullet}"
                     elif organization:
                         contextual = f"在{organization}期间，{bullet}"
@@ -1322,12 +1414,18 @@ _NON_MAJOR_SENTENCE = re.compile(
     r"(?:准备找|求职|岗位|工作|简历|马上要毕业|已经毕业|毕业了|开始准备|"
     r"最近开始|具备|熟悉|掌握|负责|参与|经验|能力|环境|定位)"
 )
+_ORGANIZATION_NARRATIVE_VALUE = re.compile(
+    r"^(?:从|由).{1,60}(?:晋升|调任|转任)|"
+    r"[，,；;].{0,40}(?:晋升|取得|获得|实现|提升|增长|确保|负责|主导|管理|领导)"
+)
 
 
 def _clean_structured_organization(value: str) -> str:
     """Remove narrative wrappers from an otherwise explicit organization."""
 
     text = re.sub(r"\s+", " ", str(value or "")).strip(" ，,。；;")
+    if _ORGANIZATION_NARRATIVE_VALUE.search(text):
+        return ""
     candidate = re.sub(
         r"^(?:我)?(?:目前)?(?:就职于|任职于|供职于|就读于|就读|毕业于|来自|在)\s*",
         "",
@@ -1356,7 +1454,9 @@ _ROLE_PERIOD_SENTENCE = re.compile(
     re.IGNORECASE,
 )
 _ROLE_DUTY_SENTENCE = re.compile(
-    r"^(?:负责(?!人)|参与|主导|协助|配合|完成|推动|推进)\S+",
+    r"^(?:负责(?!人)|参与|主导|协助|配合|完成|推动|推进|确保|促进|取得|获得|实现)\S+|"
+    r"[，,；;][^，,；;]{0,48}(?:负责(?!人)|参与|主导|协助|配合|完成|推动|推进|"
+    r"确保|促进|取得|获得|实现)\S*",
     re.IGNORECASE,
 )
 
@@ -1376,6 +1476,15 @@ def _clean_role_title(value: str, *, explicit: bool = False) -> str:
     text = _ROLE_WRAPPER.sub("", text).strip(" ，,。；;|｜:：-–—")
     if _ROLE_PERIOD_SENTENCE.search(text) or _ROLE_DUTY_SENTENCE.search(text):
         return ""
+    # A percentage/currency/count is an achievement or duty fragment, never a
+    # standalone position title. Preserve it as a bullet through the caller's
+    # existing fallback instead of allowing it into the role field.
+    if re.search(
+        r"\d+(?:\.\d+)?\s*(?:%|％|万|亿|元|万元|人|次|项|个|条|台|套)",
+        text,
+        re.IGNORECASE,
+    ):
+        return ""
     if not explicit and _DUTY_ONLY_ROLE.fullmatch(text):
         return ""
     return text
@@ -1394,7 +1503,13 @@ def _clean_education_fields(item: dict) -> None:
     school_matches = list(_SCHOOL_SUFFIX.finditer(school))
     if school_matches:
         school = school[:max(match.end() for match in school_matches)].strip()
-    elif _NON_SCHOOL_SENTENCE.search(school) or len(school) > 50:
+    elif (
+        _NON_SCHOOL_SENTENCE.search(school)
+        or len(school) > 50
+        or bool(_FALLBACK_DEGREE.fullmatch(
+            re.sub(r"^\d{1,3}(?:[.、)]\s*)?", "", school).strip()
+        ))
+    ):
         school = ""
     item["school"] = school
 
@@ -1490,12 +1605,449 @@ def _coalesce_compatible_education(records: list[dict]) -> list[dict]:
     return merged
 
 
+def _coalesce_same_record_duplicates(
+    records: list[dict],
+    *,
+    section: str,
+) -> list[dict]:
+    """Merge duplicate render rows only under a strong same-record anchor.
+
+    Chunked LLM output and deterministic source recovery can emit the same
+    source record twice with a shortened title or punctuation-only date
+    variation.  An exact non-empty period plus compatible identity is enough;
+    otherwise require literal bullet overlap.  Distinct concurrent roles with
+    different identities and duties remain separate.
+    """
+
+    identity_fields = {
+        "experience": ("organization", "role"),
+        "research": ("institution", "topic"),
+        "activities": ("organization", "role"),
+        "projects": ("name", "organization", "role"),
+    }.get(section, ())
+
+    def normalized(value: object) -> str:
+        return re.sub(r"\W+", "", str(value or "")).casefold()
+
+    def period_key(record: dict) -> str:
+        return normalized(record.get("period", ""))
+
+    def compatible(left: str, right: str) -> bool:
+        return bool(
+            left == right
+            or (min(len(left), len(right)) >= 3 and (left in right or right in left))
+        )
+
+    def bullet_overlap(left: dict, right: dict) -> bool:
+        left_values = [normalized(value) for value in left.get("bullets", [])]
+        right_values = [normalized(value) for value in right.get("bullets", [])]
+        return any(
+            min(len(first), len(second)) >= 8
+            and (first in second or second in first)
+            for first in left_values
+            for second in right_values
+            if first and second
+        )
+
+    def same_record(left: dict, right: dict) -> bool:
+        left_period = period_key(left)
+        if not left_period or left_period != period_key(right):
+            return False
+        if bullet_overlap(left, right):
+            return True
+        pairs = [
+            (normalized(left.get(field)), normalized(right.get(field)))
+            for field in identity_fields
+            if normalized(left.get(field)) and normalized(right.get(field))
+        ]
+        return bool(pairs) and all(compatible(first, second) for first, second in pairs)
+
+    def merge_bullets(target: dict, source: dict) -> None:
+        for value in source.get("bullets", []):
+            candidate = str(value or "").strip()
+            candidate_norm = normalized(candidate)
+            if not candidate_norm:
+                continue
+            replacement = None
+            represented = False
+            for index, current in enumerate(target.setdefault("bullets", [])):
+                current_norm = normalized(current)
+                if candidate_norm == current_norm or candidate_norm in current_norm:
+                    represented = True
+                    break
+                if len(current_norm) >= 8 and current_norm in candidate_norm:
+                    replacement = index
+                    break
+            if represented:
+                continue
+            if replacement is None:
+                target["bullets"].append(candidate)
+            else:
+                target["bullets"][replacement] = candidate
+
+    merged: list[dict] = []
+    for record in records:
+        destination = next(
+            (candidate for candidate in merged if same_record(candidate, record)),
+            None,
+        )
+        if destination is None:
+            merged.append(record)
+            continue
+        for field in identity_fields:
+            current = str(destination.get(field, "") or "").strip()
+            value = str(record.get(field, "") or "").strip()
+            if not current and value:
+                destination[field] = value
+            elif current and value and compatible(normalized(current), normalized(value)):
+                if len(normalized(value)) > len(normalized(current)):
+                    destination[field] = value
+        merge_bullets(destination, record)
+    return merged
+
+
+def _clean_certification_fragments(values: list[str]) -> list[str]:
+    """Prefer complete source credentials over model-created fragments."""
+
+    def normalized(value: object) -> str:
+        text = re.sub(r"^(?:[-*•·▪◦]\s*)", "", str(value or "").strip())
+        return re.sub(r"\W+", "", text).casefold()
+
+    values = [
+        str(value or "").strip() for value in values
+        if str(value or "").strip()
+        if not re.fullmatch(
+            r"[-*•·▪◦\s()（）]*(?:\d{2,5})[-*•·▪◦\s()（）]*",
+            str(value or ""),
+        )
+    ]
+
+    def without_trailing_year(value: str) -> str:
+        return re.sub(
+            r"(?:\s*[-–—]\s*(?:19|20)\d{2}|\s*[（(](?:19|20)\d{2}[)）])\s*$",
+            "",
+            re.sub(r"^(?:[-*•·▪◦]\s*)", "", value).strip(),
+        ).strip()
+
+    # If both ``证书名`` and ``证书名 (2009)`` exist, the year attachment is
+    # an inferred cross-line relationship.  Keep the explicit undated item;
+    # a dated credential remains untouched when it is the only source form.
+    undated = {
+        normalized(value)
+        for value in values
+        if normalized(without_trailing_year(value)) == normalized(value)
+    }
+    values = [
+        value for value in values
+        if not (
+            normalized(without_trailing_year(value)) != normalized(value)
+            and normalized(without_trailing_year(value)) in undated
+        )
+    ]
+    complete = [
+        normalized(value) for value in values
+        if _CERTIFICATION_SKILL.search(value)
+    ]
+    result: list[str] = []
+    for value in values:
+        value_norm = normalized(value)
+        if (
+            value_norm
+            and not _CERTIFICATION_SKILL.search(value)
+            and any(
+                value_norm != candidate
+                and len(value_norm) >= 3
+                and value_norm in candidate
+                for candidate in complete
+            )
+        ):
+            continue
+        if value_norm and value_norm not in {normalized(item) for item in result}:
+            result.append(value)
+    return result
+
+
+def _clean_record_period(value: object, *, section: str) -> str:
+    """Reject impossible non-education dates introduced by OCR or generation.
+
+    Education may legitimately contain a future expected-graduation date, so
+    its period is left to the existing evidence gate.  Employment-like rows
+    accept only four-digit calendar years and real months.  This is a syntax
+    invariant, not an attempt to infer or correct a candidate's date.
+    """
+
+    period = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not period or section == "education":
+        return period
+
+    maximum_year = date.today().year + 1
+    year_tokens = re.findall(r"(?<!\d)(\d{2,5})(?=\s*年)", period)
+    year_month_dates = re.findall(
+        r"(?<!\d)((?:19|20)\d{2})[./-](\d{1,2})(?!\d)",
+        period,
+    )
+    month_year_dates = re.findall(
+        r"(?<!\d)(\d{1,2})[./-]((?:19|20)\d{2})(?!\d)",
+        period,
+    )
+    month_tokens = re.findall(r"(?:\d{4}\s*年\s*)(\d{1,2})(?=\s*月)", period)
+
+    # Standalone years cover ranges such as ``2025 – 至今``.  Keeping this
+    # separate from the formatted-date matches also lets us accept both the
+    # Chinese/common YYYY/MM form and the international MM/YYYY form without
+    # interpreting ``05/2025`` as year 05, month 2025.
+    standalone_years = re.findall(r"(?<!\d)((?:19|20)\d{2})(?!\d)", period)
+    years = (
+        list(year_tokens)
+        + list(standalone_years)
+        + [year for year, _month in year_month_dates]
+        + [year for _month, year in month_year_dates]
+    )
+    months = (
+        list(month_tokens)
+        + [month for _year, month in year_month_dates]
+        + [month for month, _year in month_year_dates]
+    )
+    if not years and re.search(r"(?:年|月|至今|现在|present)", period, re.IGNORECASE):
+        return ""
+    if any(
+        len(year) != 4 or not (1900 <= int(year) <= maximum_year)
+        for year in years
+    ):
+        return ""
+    if any(not (1 <= int(month) <= 12) for month in months):
+        return ""
+    return period
+
+
+def _prune_redundant_highlights(data: dict) -> None:
+    """Keep genuine standalone highlights, not parser recovery duplicates.
+
+    OCR recovery may temporarily route an unowned clause to ``经历亮点`` and
+    later recover the same clause into its proper record.  Retaining both
+    creates a duplicated, fragmented tail section.  Compare against the union
+    of already-structured claims so a fact represented across two bullets is
+    also recognized; a genuinely unique highlight remains untouched.
+    """
+
+    additional = data.get("additional_sections")
+    if not isinstance(additional, dict) or not isinstance(additional.get("经历亮点"), list):
+        return
+
+    structured: list[str] = [str(data.get("summary", "") or "")]
+    record_fields = {
+        "education": ("school", "degree", "major", "period"),
+        "experience": ("organization", "role", "period"),
+        "research": ("institution", "topic", "period"),
+        "activities": ("organization", "role", "period"),
+        "projects": ("name", "organization", "role", "period"),
+    }
+    for section, fields in record_fields.items():
+        for record in data.get(section, []) or []:
+            if not isinstance(record, dict):
+                continue
+            structured.extend(str(record.get(field, "") or "") for field in fields)
+            structured.extend(str(value or "") for value in record.get("bullets", []) or [])
+    for section in (
+        "awards", "publications", "patents", "certifications", "training", "teaching",
+    ):
+        structured.extend(str(value or "") for value in data.get(section, []) or [])
+    skills = data.get("skills") or {}
+    if isinstance(skills, dict):
+        structured.extend(
+            str(item.get("name", "") or "")
+            for item in skills.get("items", []) or []
+            if isinstance(item, dict)
+        )
+
+    claim_bigrams: set[str] = set()
+    normalized_claims: list[str] = []
+    for claim in structured:
+        normalized = re.sub(r"\W+", "", claim).casefold()
+        if not normalized:
+            continue
+        normalized_claims.append(normalized)
+        claim_bigrams.update(_coverage_bigrams(claim))
+
+    retained: list[str] = []
+    for raw in additional.get("经历亮点", []):
+        value = str(raw or "").strip()
+        for heading in sorted(_LAYOUT_RESET_HEADINGS, key=len, reverse=True):
+            if len(value) > len(heading) + 4 and value.endswith(heading):
+                value = value[:-len(heading)].rstrip(" ：:；;，,。|｜-—")
+                break
+        normalized = re.sub(r"\W+", "", value).casefold()
+        if not normalized:
+            continue
+        represented = any(
+            normalized == claim
+            or (len(normalized) >= 6 and normalized in claim)
+            for claim in normalized_claims
+        )
+        if not represented:
+            source_bigrams = _coverage_bigrams(value)
+            represented = bool(
+                source_bigrams
+                and len(source_bigrams & claim_bigrams) / len(source_bigrams) >= 0.82
+            )
+        if not represented and value not in retained:
+            retained.append(value)
+
+    if retained:
+        additional["经历亮点"] = retained
+    else:
+        additional.pop("经历亮点", None)
+
+
+def _is_recovery_layout_fragment(value: object) -> bool:
+    """Identify parser seams that are not publishable resume claims.
+
+    OCR column recovery can concatenate the end of one record with the
+    identity/date row of the next.  These strings may still overlap the OCR
+    transcript strongly enough to pass an evidence check, but they are layout
+    artifacts rather than candidate statements.  Keep the invariant narrow:
+    reject only explicit empty date skeletons, dangling ``负责：`` headings,
+    and ``此前担任`` record headers joined by a non-numeric ``>`` seam.
+    """
+
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not text:
+        return False
+    if re.search(r"年\s*月\s*[-–—~至到]\s*年\s*月", text):
+        return True
+    if re.search(r"(?:^|[。；;])\s*负责\s*[:：]\s*$", text):
+        return True
+    if re.search(r"(?:此前|曾经?)担任", text) and re.search(
+        r"[>＞](?=[^\d\s])", text,
+    ):
+        return True
+    return False
+
+
+def _prune_recovery_layout_fragments(data: dict) -> None:
+    """Remove explicit OCR record seams without rewriting valid prose."""
+
+    for section in ("experience", "research", "activities", "projects"):
+        for record in data.get(section, []) or []:
+            if not isinstance(record, dict):
+                continue
+            record["bullets"] = [
+                str(value).strip()
+                for value in record.get("bullets", []) or []
+                if str(value).strip() and not _is_recovery_layout_fragment(value)
+            ]
+    additional = data.get("additional_sections")
+    if not isinstance(additional, dict):
+        return
+    highlights = additional.get("经历亮点")
+    if isinstance(highlights, list):
+        kept = [
+            str(value).strip()
+            for value in highlights
+            if str(value).strip() and not _is_recovery_layout_fragment(value)
+        ]
+        if kept:
+            additional["经历亮点"] = kept
+        else:
+            additional.pop("经历亮点", None)
+
+
+_UNOWNED_HIGHLIGHT_HARD_ANCHOR = re.compile(
+    r"(?<!\d)\d+(?:\.\d+)?\s*(?:%|％|万|亿|千|人|次|项|个|条|篇|例|台|套|"
+    r"元|万元|美元|小时|天|个月|月|年)(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+
+
+def _prune_unowned_compiler_highlight_metrics(
+    data: dict,
+    *,
+    source,
+    routes: list,
+) -> None:
+    """Require provenance for hard anchors routed to a loose highlight.
+
+    A numeric claim attached to a structured record is protected by record
+    ownership.  ``经历亮点`` has no such owner, so a newly recovered hard
+    anchor is publishable only when the source explicitly labels it as a
+    highlight, or when it came directly from the user's query.  This blocks a
+    unanimous-but-wrong OCR number without discarding ordinary prose.
+    """
+
+    additional = data.get("additional_sections")
+    if not isinstance(additional, dict) or not isinstance(additional.get("经历亮点"), list):
+        return
+    facts = {fact.fact_id: fact for fact in source.fact_units}
+    trusted_source_values = [
+        facts[route.fact_id].verbatim_text
+        for route in routes
+        if route.fact_id in facts
+        and route.destination_section == "additional_sections.经历亮点"
+        and (
+            route.reason == "typed_long_tail_section"
+            or facts[route.fact_id].source_type == "query"
+        )
+    ]
+
+    def explicitly_supported(value: str) -> bool:
+        value_norm = re.sub(r"\W+", "", value).casefold()
+        value_bigrams = _coverage_bigrams(value)
+        for source_value in trusted_source_values:
+            source_norm = re.sub(r"\W+", "", str(source_value)).casefold()
+            if value_norm and (value_norm in source_norm or source_norm in value_norm):
+                return True
+            source_bigrams = _coverage_bigrams(str(source_value))
+            if value_bigrams and (
+                len(value_bigrams & source_bigrams) / len(value_bigrams)
+            ) >= 0.82:
+                return True
+        return False
+
+    retained = []
+    for raw in additional.get("经历亮点", []):
+        value = str(raw or "").strip()
+        if not value:
+            continue
+        if _UNOWNED_HIGHLIGHT_HARD_ANCHOR.search(value) and not explicitly_supported(value):
+            continue
+        retained.append(value)
+    if retained:
+        additional["经历亮点"] = retained
+    else:
+        additional.pop("经历亮点", None)
+
+
+def _clean_compiler_presentation_data(data: dict, *, source, routes: list) -> None:
+    """Apply compaction invariants without rebuilding summary prose."""
+
+    for section in ("experience", "research", "activities", "projects"):
+        records = [item for item in data.get(section, []) or [] if isinstance(item, dict)]
+        data[section] = _coalesce_same_record_duplicates(records, section=section)
+    data["certifications"] = _clean_certification_fragments([
+        str(value or "").strip()
+        for value in data.get("certifications", []) or []
+        if str(value or "").strip()
+    ])
+    _prune_recovery_layout_fragments(data)
+    _prune_redundant_highlights(data)
+    _prune_unowned_compiler_highlight_metrics(
+        data,
+        source=source,
+        routes=routes,
+    )
+
+
 def _compact_canonical(resume: CanonicalResume) -> CanonicalResume:
     """Remove blank records/items left by model repair or leakage cleanup."""
 
     data = resume.model_dump()
     meta = data.get("meta") or {}
     if isinstance(meta, dict):
+        raw_name = re.sub(r"\s+", "", str(meta.get("name", "") or ""))
+        if raw_name.casefold() in {
+            "个人", "个人简历", "简历", "姓名", "候选人", "candidate", "resume", "cv",
+        }:
+            meta["name"] = ""
         phone = re.search(r"1[3-9]\d{9}", re.sub(r"[\s-]+", "", str(meta.get("phone", ""))))
         meta["phone"] = phone.group(0) if phone else ""
         raw_email = re.sub(r"\s+", "", str(meta.get("email", "")))
@@ -1513,6 +2065,9 @@ def _compact_canonical(resume: CanonicalResume) -> CanonicalResume:
                 if local_value:
                     cleaned_email = f"{local_value}@{domain.group(0)}"
         meta["email"] = cleaned_email
+        meta["target_role"] = _clean_target_role(
+            str(meta.get("target_role", "") or "")
+        )
     for section in ("awards", "publications", "patents", "certifications", "training", "teaching"):
         values = [str(v).strip() for v in data.get(section, []) if str(v).strip()]
         if section == "certifications":
@@ -1524,6 +2079,7 @@ def _compact_canonical(resume: CanonicalResume) -> CanonicalResume:
                     value,
                 )
             ]
+            values = _clean_certification_fragments(values)
         data[section] = list(dict.fromkeys(values))
     additional = data.get("additional_sections") or {}
     if isinstance(additional, dict):
@@ -1564,6 +2120,7 @@ def _compact_canonical(resume: CanonicalResume) -> CanonicalResume:
         for item in data.get(section, []) or []:
             if not isinstance(item, dict):
                 continue
+            item["period"] = _clean_record_period(item.get("period", ""), section=section)
             if section == "education":
                 _clean_education_fields(item)
                 major = str(item.get("major", "") or "").strip()
@@ -1657,6 +2214,18 @@ def _compact_canonical(resume: CanonicalResume) -> CanonicalResume:
                     )
                 ]
             bullets = item.get("bullets", []) if section != "education" else []
+            if (
+                section != "education"
+                and not bullets
+                and not any(
+                    str(item.get(field, "") or "").strip()
+                    for field in fixed_fields
+                    if field != "period"
+                )
+            ):
+                # A date without an employer/title/project is not a readable
+                # record and often comes from a split compact source header.
+                continue
             if any(str(item.get(field, "")).strip() for field in fixed_fields) or bullets:
                 identity = tuple(
                     re.sub(r"\s+", "", str(item.get(field, "")).strip()).casefold()
@@ -1696,7 +2265,34 @@ def _compact_canonical(resume: CanonicalResume) -> CanonicalResume:
         if section == "education":
             cleaned = _coalesce_compatible_education(cleaned)
             cleaned = _drop_subsumed_education(cleaned)
+        else:
+            cleaned = _coalesce_same_record_duplicates(cleaned, section=section)
         data[section] = cleaned
+
+    # Exact standalone skill tokens occasionally survive OCR routing as both a
+    # skill and an experience bullet (for example a bullet containing only
+    # ``HTML5``). The skill section already preserves the same grounded fact;
+    # keeping the duplicate in a narrative record creates a visible fragment
+    # without adding information.
+    skill_norms = {
+        re.sub(r"[^\w\u4e00-\u9fff+.#/_-]+", "", str(item.get("name", ""))).casefold()
+        for item in (data.get("skills") or {}).get("items", [])
+        if isinstance(item, dict) and str(item.get("name", "")).strip()
+    }
+    if skill_norms:
+        for section in ("experience", "research", "activities", "projects"):
+            for item in data.get(section, []) or []:
+                if not isinstance(item, dict):
+                    continue
+                item["bullets"] = [
+                    bullet
+                    for bullet in item.get("bullets", []) or []
+                    if re.sub(
+                        r"[^\w\u4e00-\u9fff+.#/_-]+",
+                        "",
+                        str(bullet or ""),
+                    ).casefold() not in skill_norms
+                ]
 
     bullet_entries = [
         (section, item, bullet, re.sub(
@@ -1734,16 +2330,34 @@ def _compact_canonical(resume: CanonicalResume) -> CanonicalResume:
                 seen_bullets.add(normalized)
                 unique.append(bullet)
             item["bullets"] = unique
+
+    _prune_recovery_layout_fragments(data)
+    _prune_redundant_highlights(data)
     data["summary"] = str(data.get("summary", "") or "").strip()
     compacted = CanonicalResume.model_validate(data)
     compacted.summary = _build_evidence_summary(compacted)
     return compacted
 
 
+_FALLBACK_YEAR_MONTH = (
+    r"(?:19|20)\d{2}(?:(?:[./-](?:1[0-2]|0?[1-9]))|"
+    r"(?:年(?:1[0-2]|0?[1-9])月?)|年)?(?!\d)"
+)
+_FALLBACK_MONTH_YEAR = r"(?:1[0-2]|0?[1-9])[-/](?:19|20)\d{2}(?!\d)"
+_FALLBACK_SAME_YEAR_MONTH_RANGE = (
+    r"(?:19|20)\d{2}年(?:1[0-2]|0?[1-9])月?\s*"
+    r"[-–—~至到]\s*(?:1[0-2]|0?[1-9])月"
+)
 _FALLBACK_PERIOD = re.compile(
-    r"(?:(?:19|20)\d{2}(?:(?:[./-]\d{1,2})|(?:年\d{1,2}月?))?|(?:0?[1-9]|1[0-2])[-/](?:19|20)\d{2})"
-    r"\s*(?:[-–—~至到]\s*(?:(?:19|20)\d{2}(?:(?:[./-]\d{1,2})|(?:年\d{1,2}月?))?|"
-    r"(?:0?[1-9]|1[0-2])[-/](?:19|20)\d{2}|今|至今|现在))?"
+    rf"(?:{_FALLBACK_SAME_YEAR_MONTH_RANGE}|"
+    rf"(?:{_FALLBACK_YEAR_MONTH}|{_FALLBACK_MONTH_YEAR})"
+    rf"\s*(?:[-–—~至到]\s*(?:{_FALLBACK_YEAR_MONTH}|{_FALLBACK_MONTH_YEAR}|今|至今|现在))?)"
+)
+_FALLBACK_DURATION_SUFFIX = re.compile(
+    r"\s*[•·|｜]\s*\d+(?:\.\d+)?\s*(?:年|个月|月)(?![\u4e00-\u9fff])"
+)
+_FALLBACK_DURATION_LINE = re.compile(
+    r"^(?:[-*•·▪◦]\s*)?(?P<duration>\d+(?:\.\d+)?\s*(?:年|个月|月))$"
 )
 _FALLBACK_ORGANIZATION = re.compile(
     r"[\u4e00-\u9fffA-Za-z0-9·.&（）()_-]{0,40}?(?:大学|学院|学校|医院|公司|企业|集团|"
@@ -1770,7 +2384,18 @@ _FALLBACK_ROLE = re.compile(
     r"护士|经理|主管|总监|主任|顾问|研究员|专员|助理|助教|负责人|组长|队长|主席|"
     r"部长|干事|部员|成员|委员|志愿者|实习生|实习|见习|分析师|架构师|运营|产品|开发|测试|销售|讲师|管理岗|岗位|岗)"
 )
-_FALLBACK_DEGREE = re.compile(r"(?:博士研究生|硕士研究生|本科|学士|硕士|博士|大专|专科|高中)(?:在读|毕业)?")
+_FALLBACK_DEGREE = re.compile(
+    r"(?:(?:通识研究)?(?:文科|理科|哲学|经济学|法学|教育学|文学|历史学|"
+    r"理学|工学|农学|医学|管理学|艺术学)?(?:副学士|学士|硕士|博士)(?:学位|研究生)?|"
+    r"博士研究生|硕士研究生|本科|大专|专科)(?:在读|毕业|毕业证书)?|"
+    r"(?:高中|中学|初中)(?:在读|毕业(?:证书)?)?(?![\u4e00-\u9fff])"
+)
+_FALLBACK_PLACEHOLDER_TOKEN = re.compile(
+    r"\[(?:姓名|姓氏|电话|手机|邮箱|地址|城市|州|国家|公司|学校|大学|组织|奖项|"
+    r"linkedin[_\s-]*档案|github[_\s-]*链接)(?:[^\]\n]{0,24})?\]?|"
+    r"<[^>\n]{1,48}>|\{\{[^}\n]{1,80}\}\}",
+    re.IGNORECASE,
+)
 _FALLBACK_DATE_TOKEN = re.compile(
     r"^(?:19|20)\d{2}(?:(?:[./-]\d{1,2})|(?:年\d{1,2}月?))?\s*(?:至)?\s*$"
 )
@@ -1844,6 +2469,19 @@ def _organization_from_text(value: str) -> str:
     organization = ""
     if organization_matches:
         organization_end = max(match.end() for match in organization_matches)
+        # Legal names often include a parenthetical qualifier whose closing
+        # bracket immediately follows the organization suffix.  The suffix
+        # matcher stops at ``集团/公司``; retain the literal closing bracket so
+        # the public identity is not visibly truncated.
+        if (
+            organization_end < len(identity)
+            and identity[organization_end] in ")）"
+            and (
+                (identity[organization_end] == ")" and "(" in identity[:organization_end])
+                or (identity[organization_end] == "）" and "（" in identity[:organization_end])
+            )
+        ):
+            organization_end += 1
         organization = identity[:organization_end].strip(" \t,，|｜:：-–—")
         organization = _FALLBACK_PERIOD.sub(" ", organization)
         organization = re.sub(r"^[\s\-–—~至到]+", "", organization).strip()
@@ -1955,7 +2593,27 @@ def _fallback_period_from_lines(
             end = standalone_date.fullmatch(str(later or "").strip())
             if end:
                 return f"{start.group(1)} 至 {end.group(1)}"
-    return labeled or _first_match(_FALLBACK_PERIOD, joined)
+    period = labeled or _first_match(_FALLBACK_PERIOD, joined)
+    if not period:
+        return ""
+    # Portfolio headers often carry both a range and its literal elapsed
+    # duration (``2023年3-4月 • 1个月``).  Keep both in the structured period so
+    # the duration is neither lost nor left attached to the project name.
+    for line_index, line in enumerate(lines):
+        position = str(line or "").find(period)
+        if position < 0:
+            continue
+        tail = str(line or "")[position + len(period):]
+        duration = _FALLBACK_DURATION_SUFFIX.match(tail)
+        if duration:
+            return period + duration.group(0)
+        if line_index + 1 < len(lines):
+            duration_line = _FALLBACK_DURATION_LINE.fullmatch(
+                str(lines[line_index + 1] or "").strip()
+            )
+            if duration_line:
+                return f"{period} • {duration_line.group('duration')}"
+    return period
 
 
 def _role_from_text(value: str, organization: str = "") -> str:
@@ -2017,14 +2675,31 @@ def _role_from_text(value: str, organization: str = "") -> str:
 
 
 def _clean_target_role(value: str) -> str:
-    value = re.sub(r"^(?:(?:更)?适合|转向?|偏)\s*", "", str(value or "")).strip()
+    value = str(value or "").strip()
+    instruction_like = bool(
+        re.search(
+            r"(?:请|帮我|麻烦|需要|想要)?.{0,6}"
+            r"(?:优化|修改|改写|生成|调整|完善|整理).{0,8}"
+            r"(?:简历|CV|履历)|"
+            r"(?:下面|上述|以下)(?:是|的)?\s*(?:JD|岗位描述)|"
+            r"(?:根据|按照|结合).{0,8}(?:JD|岗位描述).{0,8}(?:优化|修改|生成)",
+            value,
+            re.IGNORECASE,
+        )
+    )
+    if instruction_like:
+        return ""
+    value = re.sub(r"^(?:(?:更)?适合|转向?|偏)\s*", "", value).strip()
     value = re.sub(r"(?:相关)?(?:岗位|方向|工作)$", "", value).strip()
     # Normalize internal taxonomy tokens before they can be copied into the
     # user-facing summary (the outer service normalizes meta later, which was
     # too late for strings such as ``Product PM`` or ``operations``).
     from resume_classifier import normalize_target_role
 
-    return normalize_target_role(value)
+    normalized = normalize_target_role(value)
+    if any(token in normalized.casefold() for token in ("下面jd", "上述jd", "这份简历")):
+        return ""
+    return normalized
 
 
 def _fallback_target_role(query_text: str, jd_text: str) -> str:
@@ -2122,6 +2797,7 @@ def _coalesce_ocr_record_lines(lines: list[str]) -> list[str]:
             previous
             and not re.search(r"[。；;!?！？]$", previous)
             and _looks_like_record_body(previous)
+            and not _FALLBACK_DURATION_LINE.fullmatch(previous)
             and not re.match(r"^(?:\d{1,3}(?:[、)]|\.(?!\d))|[-*•·▪◦])\s*", line)
             and not _looks_like_record_body(line)
             and not _FALLBACK_PERIOD.fullmatch(line)
@@ -2166,7 +2842,13 @@ def _fallback_record(section: str, lines: list[str]) -> tuple[dict, list[str]]:
 
     lines = _coalesce_ocr_record_lines(lines)
     joined = " ｜ ".join(line for line in lines if line)
-    header_lines = [line for line in lines if line and not _looks_like_record_body(line)]
+    header_lines = [
+        line for line in lines
+        if line and (
+            not _looks_like_record_body(line)
+            or bool(_FALLBACK_PERIOD.search(line))
+        )
+    ]
     identity_header_lines = list(dict.fromkeys(
         prefix
         for line in header_lines
@@ -2193,13 +2875,41 @@ def _fallback_record(section: str, lines: list[str]) -> tuple[dict, list[str]]:
             and not _FALLBACK_PERIOD.fullmatch(line.strip())
         ]
         for line_index, line in enumerate(structural_identity_lines):
-            if line_index == 0 or not _FALLBACK_ROLE.fullmatch(line):
+            if line_index == 0:
                 continue
             preceding = structural_identity_lines[line_index - 1]
+            # If the dated header already contains a structurally parsed role,
+            # let the compact-header parser below keep it.  A later method
+            # sentence such as ``采用图论方法，...`` must not replace
+            # ``研究助理`` merely because OCR put both on separate rows.
+            _, preceding_role = _compact_identity_parts(preceding)
+            if preceding_role:
+                continue
+            if re.match(
+                r"^(?:采用|使用|通过|基于|利用|借助|按照|结合)\S+",
+                line,
+            ):
+                continue
+            structurally_positioned_role = bool(
+                _FALLBACK_PERIOD.search(preceding)
+                and 2 <= len(line) <= 48
+                and not re.search(r"[:：]", line)
+                and not _looks_like_record_body(line)
+            )
+            if not (_FALLBACK_ROLE.fullmatch(line) or structurally_positioned_role):
+                continue
             if _FALLBACK_ROLE.fullmatch(preceding) or _looks_like_record_body(preceding):
                 continue
             role = role or _clean_role_title(line, explicit=True)
-            organization = organization or _organization_from_text(preceding) or preceding
+            organization_source = _FALLBACK_PERIOD.sub(" ", preceding)
+            organization_source = re.sub(
+                r"[\s|｜,，;；:：\-–—~至到]+$", "", organization_source,
+            ).strip()
+            organization = (
+                organization
+                or _organization_from_text(organization_source)
+                or organization_source
+            )
             break
     if section != "projects" and (not organization or not role):
         for line in identity_header_lines:
@@ -2221,6 +2931,38 @@ def _fallback_record(section: str, lines: list[str]) -> tuple[dict, list[str]]:
                 organization = _clean_structured_organization(activity_identity.group(1))
                 role = activity_identity.group(2)
                 break
+    if not role and section != "projects":
+        # A dated identity row is explicit structure even when its profession
+        # is absent from the generic title suffix grammar.  Remove only the
+        # already parsed period/organization and keep the literal remainder as
+        # the role; this handles titles across industries without a role
+        # dictionary (for example pharmacy technician or laboratory analyst).
+        for line in identity_header_lines:
+            if not _FALLBACK_PERIOD.search(line):
+                continue
+            candidate = line
+            for value in (period, organization):
+                if value:
+                    candidate = candidate.replace(value, " ")
+            candidate = re.sub(
+                r"(?:时间|任职时间|起止时间|期间|持续时间)\s*[:：]",
+                " ",
+                candidate,
+            )
+            candidate = re.sub(r"[\s|｜,，;；:：\-–—~至到]+", " ", candidate).strip()
+            if (
+                2 <= len(candidate) <= 48
+                and not re.match(
+                    r"^(?:负责|参与|主导|协助|支持|配合|完成|推动|推进|组织|协调|"
+                    r"执行|开发|构建|实现|制定|分析|撰写|输出|交付|维护|优化|搭建|"
+                    r"建立|开展|承担|提供|跟进|带领)\S{3,}",
+                    candidate,
+                )
+                and not _FALLBACK_RELATION_LABEL.match(candidate)
+            ):
+                role = _clean_role_title(candidate, explicit=True)
+                if role:
+                    break
     if not role and section != "projects":
         for line in identity_header_lines:
             role = _role_from_text(line, organization)
@@ -2261,6 +3003,13 @@ def _fallback_record(section: str, lines: list[str]) -> tuple[dict, list[str]]:
         role = _clean_role_title(identity_lines[0], explicit=True)
 
     consumed = {value for value in (period, organization, role) if value}
+    if period:
+        literal_period = _first_match(_FALLBACK_PERIOD, period)
+        if literal_period:
+            consumed.add(literal_period)
+        duration_in_period = _FALLBACK_DURATION_SUFFIX.search(period)
+        if duration_in_period:
+            consumed.add(duration_in_period.group(0).strip(" •·|｜"))
     bullets: list[str] = []
     for line in lines:
         residual = line
@@ -2271,13 +3020,20 @@ def _fallback_record(section: str, lines: list[str]) -> tuple[dict, list[str]]:
             " ",
             residual,
         )
-        residual = re.sub(
-            r"^(?:我|本人)?(?:目前|曾经|曾)?(?:在|于|就职于|任职于|供职于|担任|任职为|作为)\s*",
-            "",
-            residual,
-        )
-        residual = re.sub(r"^(?:我|本人)?(?:在|于|担任|任职|作为)+\s*$", "", residual)
+        if section != "projects":
+            residual = re.sub(
+                r"^(?:我|本人)?(?:目前|曾经|曾)?(?:在|于|就职于|任职于|供职于|担任|任职为|作为)\s*",
+                "",
+                residual,
+            )
+            residual = re.sub(r"^(?:我|本人)?(?:在|于|担任|任职|作为)+\s*$", "", residual)
         residual = re.sub(r"^[\s|｜,，;；:：\-–—~至到]+|[\s|｜,，;；:：\-–—~至到]+$", "", residual)
+        residual = re.sub(r"\s+([，,。；;])", r"\1", residual)
+        residual = re.sub(r"([，,。；;])(?:\s*[，,。；;])+", r"\1", residual)
+        # Keep a source-provided sentence terminator.  Removing ``。`` made
+        # coalesced OCR sentences visibly abrupt and regressed expression
+        # quality, while commas/semicolons at field boundaries remain debris.
+        residual = residual.strip(" \t,，；;")
         if re.fullmatch(
             r"(?:之前|过去|目前|现在|毕业后)?(?:一直|曾经|曾)?(?:做过?|从事)?"
             r"(?:(?:\d+|[一二两三四五六七八九十]+)\s*段)?",
@@ -2292,7 +3048,8 @@ def _fallback_record(section: str, lines: list[str]) -> tuple[dict, list[str]]:
             and not (
                 section == "activities"
                 and len(re.sub(r"\W+", "", residual)) >= 6
-                and re.search(r"[。；;!?！？]$", residual)
+                and _FALLBACK_PERIOD.search(line)
+                and re.search(r"[，,]", line)
             )
         ):
             # Remaining compact header tokens are departments/locations or
@@ -2378,6 +3135,8 @@ def _fallback_record(section: str, lines: list[str]) -> tuple[dict, list[str]]:
         if header_candidates:
             candidate = header_candidates[0]
             candidate = candidate.replace(period, " ") if period else candidate
+            candidate = _FALLBACK_PERIOD.sub(" ", candidate)
+            candidate = _FALLBACK_DURATION_SUFFIX.sub(" ", candidate)
             candidate = candidate.replace(organization, " ") if organization else candidate
             candidate = candidate.replace(role, " ") if role else candidate
             name = re.sub(r"^[\s|｜,，;；:：\-]+|[\s|｜,，;；:：\-]+$", "", candidate)
@@ -2448,6 +3207,31 @@ def _fallback_record(section: str, lines: list[str]) -> tuple[dict, list[str]]:
             if len(re.sub(r"\W+", "", residual)) >= 2:
                 cleaned_project_bullets.append(residual)
         bullets = list(dict.fromkeys(cleaned_project_bullets))
+    if section == "projects" and bullets:
+        # DOCX table extraction can split one technology row into a labeled
+        # head followed by several bullet cells.  Rejoin only this explicit
+        # structural list; do not turn arbitrary short prose into skills.
+        merged_project_bullets: list[str] = []
+        technology_index: int | None = None
+        for bullet in bullets:
+            value = str(bullet or "").strip()
+            if re.match(r"^(?:技术栈|技术)\s*[:：]\s*\S", value):
+                merged_project_bullets.append(value)
+                technology_index = len(merged_project_bullets) - 1
+                continue
+            technology_tail = bool(
+                technology_index is not None
+                and 1 <= len(value) <= 50
+                and not _looks_like_record_body(value)
+                and not _FALLBACK_PERIOD.search(value)
+                and not re.search(r"[。；;!?！？]", value)
+            )
+            if technology_tail:
+                merged_project_bullets[technology_index] += f" • {value}"
+                continue
+            merged_project_bullets.append(value)
+            technology_index = None
+        bullets = merged_project_bullets
     return {
         "name": name,
         "organization": organization,
@@ -2458,15 +3242,42 @@ def _fallback_record(section: str, lines: list[str]) -> tuple[dict, list[str]]:
 
 
 def _fallback_education(lines: list[str]) -> tuple[dict, list[str]]:
+    source_lines = list(lines)
+    anonymized_school = any(
+        re.search(r"\[(?:学校|大学|院校)\]", str(line or ""), re.IGNORECASE)
+        for line in source_lines
+    )
+    cleaned_lines = []
+    for line in lines:
+        cleaned = _FALLBACK_PLACEHOLDER_TOKEN.sub(" ", str(line or ""))
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(" \t,，、:：;；|｜/\\-—_•·")
+        if cleaned:
+            cleaned_lines.append(cleaned)
+    lines = cleaned_lines
     joined = re.sub(
         r"^(?:教育经历|教育背景|学历信息)\s*[:：]\s*",
         "",
         " ｜ ".join(lines),
     )
     school = _labeled_value(joined, ("学校", "院校")) or _organization_from_text(joined)
+    if anonymized_school:
+        # A later credential issuer (for example ``MBA协会认证``) is not a
+        # replacement for an explicitly anonymized school field.
+        school = ""
     degree = _labeled_value(joined, ("学历", "学位")) or _first_match(_FALLBACK_DEGREE, joined)
+    if school and degree:
+        normalized_school = re.sub(
+            r"^\d{1,3}(?:[.、)]\s*)?", "", school,
+        ).strip(" \t,，|｜:：-–—")
+        if normalized_school and normalized_school in degree:
+            school = ""
     major = _labeled_value(joined, ("专业",))
     if not major:
+        degree_major_match = re.search(
+            r"(?:^|[|｜，,。；;\s])([^|｜，,。；;]{2,30}?)"
+            r"(?=(?:副?学士|硕士|博士)(?:学位|研究生)?(?:毕业|在读)?(?:$|[，,。；;|｜\s]))",
+            joined,
+        )
         major_match = re.search(
             r"(?:我是|就读于?|毕业于?|攻读)?\s*([^|｜，,。；;]{2,40}?)\s*专业(?:毕业|在读|学生)?",
             joined,
@@ -2475,7 +3286,9 @@ def _fallback_education(lines: list[str]) -> tuple[dict, list[str]]:
             r"(?:方向偏|研究方向(?:是|为)?|专业方向(?:是|为)?)\s*([^|｜，,。；;]{2,40})",
             joined,
         )
-        if major_match:
+        if degree_major_match:
+            major = degree_major_match.group(1).strip(" \t,，、:：;；|｜/\\-—_•·.")
+        elif major_match:
             major = major_match.group(1).strip()
         elif direction_match:
             major = direction_match.group(1).strip()
@@ -2541,6 +3354,13 @@ def _fallback_education(lines: list[str]) -> tuple[dict, list[str]]:
         residual = re.sub(r"[\s|｜,，;；:：\-—~至到]+", "", residual)
         if 2 <= len(residual) <= 40:
             major = residual
+    if (
+        re.fullmatch(r"\d+(?:\.\d+)?", major)
+        or
+        re.fullmatch(r"\d+(?:\.\d+)?\s*(?:%|/\s*\d+(?:\.\d+)?)", major)
+        or re.fullmatch(r"[\s.,，。;；:：|｜/\\\-—_年月日]+", major)
+    ):
+        major = ""
     leftovers = []
     for line in lines:
         if line.strip(" \t-•·") in {"", "其他", "其它", "补充信息"}:
@@ -2623,8 +3443,20 @@ def _deterministic_fallback(cv_text: str, query_text: str, jd_text: str) -> Cano
             value for value in leftovers
             if not _FALLBACK_LABELED_SKILL.fullmatch(value.strip())
         ]
-        if education_extras:
-            additional.setdefault("补充信息", []).extend(education_extras)
+        education_scores = [
+            value for value in education_extras
+            if re.fullmatch(
+                r"\d+(?:\.\d+)?\s*(?:%|/\s*\d+(?:\.\d+)?)",
+                value.strip(),
+            )
+        ]
+        if education_scores:
+            additional.setdefault("教育成绩", []).extend(education_scores)
+        education_other = [
+            value for value in education_extras if value not in education_scores
+        ]
+        if education_other:
+            additional.setdefault("补充信息", []).extend(education_other)
 
     records: dict[str, list[dict]] = {name: [] for name in ("experience", "research", "activities", "projects")}
     for section in records:
@@ -2671,11 +3503,48 @@ def _deterministic_fallback(cv_text: str, query_text: str, jd_text: str) -> Cano
             raw_values,
         )
         raw_values = re.sub(r"^转行(?:做|从事)?\s*", "", raw_values)
-        for item in re.split(
-            r"[、，,；;|｜]+|\s+/\s+|"
-            r"(?<=[A-Za-z0-9\u4e00-\u9fff])(?:和|及|与)(?=[A-Za-z0-9\u4e00-\u9fff])",
-            raw_values,
-        ):
+        raw_values = re.sub(r"^(?:包括|例如|如)\s*", "", raw_values).strip()
+
+        # A language proficiency statement is one semantic item, not a
+        # comma-separated tool list. Keep e.g. ``西班牙语：流利，书面和口语``
+        # intact instead of producing three fragments.
+        natural_language_statement = bool(
+            re.match(
+                r"^[^:：]{1,24}[:：]\s*(?:母语|精通|流利|熟练|中级|初级|"
+                r"日常会话|工作交流|书面|口语|native|fluent|advanced|"
+                r"intermediate|basic|conversational)",
+                raw_values,
+                re.IGNORECASE,
+            )
+        )
+        values = (
+            [raw_values]
+            if natural_language_statement
+            else re.split(r"[、，,；;|｜]+|\s+/\s+", raw_values)
+        )
+        expanded_values: list[str] = []
+        for value in values:
+            value = re.sub(r"^(?:包括|例如|如)\s*", "", value.strip())
+            # Chinese conjunctions are ordinary grammar in phrases such as
+            # ``战略规划和实施``. Split only around a nearby ASCII
+            # product/tool token, as in ``SAP和JD Edwards`` or
+            # ``北大法宝和Alpha系统``.
+            conjunctions = list(re.finditer(r"\s*(?:和|及|与)\s*", value))
+            split_cursor = 0
+            for index, conjunction in enumerate(conjunctions):
+                left_start = conjunctions[index - 1].end() if index else 0
+                right_end = (
+                    conjunctions[index + 1].start()
+                    if index + 1 < len(conjunctions) else len(value)
+                )
+                left = value[left_start:conjunction.start()]
+                right = value[conjunction.end():right_end]
+                if re.search(r"[A-Za-z0-9.+#]", left + right):
+                    expanded_values.append(value[split_cursor:conjunction.start()])
+                    split_cursor = conjunction.end()
+            expanded_values.append(value[split_cursor:])
+
+        for item in expanded_values:
             item = item.strip(" \t-•·")
             if re.match(r"^(?:能|能够|可以|具备|善于)", item):
                 continue
@@ -2713,7 +3582,13 @@ def _deterministic_fallback(cv_text: str, query_text: str, jd_text: str) -> Cano
                 )
                 and not re.search(r"[。；;]", item)
             ):
-                skill_items.append({"name": item, "category": category})
+                skill_items.append({
+                    "name": item,
+                    "category": (
+                        "natural_language"
+                        if natural_language_statement else category
+                    ),
+                })
 
     source_candidates = candidate_blocks(source)
     summary_open = False
@@ -2805,11 +3680,47 @@ def _deterministic_fallback(cv_text: str, query_text: str, jd_text: str) -> Cano
             add_skill_values(value, "other")
             unstructured_current = None
             unstructured_last_number = None
-        elif section in {"hobbies", "coursework"}:
-            title = "兴趣爱好" if section == "hobbies" else "相关课程"
-            cleaned = re.sub(r"^[^:：]{1,12}[:：]\s*", "", value).strip()
+        elif section in {
+            "hobbies", "coursework", "products", "highlights", "target", "profile",
+        }:
+            title = {
+                "hobbies": "兴趣爱好",
+                "coursework": "相关课程",
+                "products": "产品与解决方案",
+                "highlights": "经历亮点",
+                "target": "求职目标",
+                "profile": "个人概况",
+            }[section]
+            cleaned = value.strip()
+            cleaned = re.sub(r"^[-*•·▪◦]\s*", "", cleaned)
+            label_aliases = {
+                "hobbies": ("兴趣爱好", "个人爱好"),
+                "coursework": ("相关课程", "主修课程"),
+                "products": ("产品", "产品与解决方案", "产品专业知识"),
+                "highlights": ("经历亮点",),
+                "target": (
+                    "职业目标", "求职目标", "期望职位", "professional direction",
+                    "career objective",
+                ),
+                "profile": (
+                    "职业级别", "工作年限", "就业类型", "工作时间", "行业",
+                    "career level", "years of experience", "employment type",
+                    "work schedule", "industry",
+                ),
+            }[section]
+            cleaned = re.sub(
+                rf"^(?:{'|'.join(re.escape(item) for item in label_aliases)})\s*[:：]\s*",
+                "",
+                cleaned,
+                flags=re.IGNORECASE,
+            ).strip()
             if cleaned and not re.fullmatch(r"[-•·]?\s*[A-Za-z0-9._-]{3,}", cleaned):
                 additional.setdefault(title, []).append(cleaned)
+            unstructured_current = None
+            unstructured_last_number = None
+        elif section == "references":
+            # Availability of references belongs in the explanatory response,
+            # not as a candidate accomplishment or an anonymous work record.
             unstructured_current = None
             unstructured_last_number = None
         elif section in scalar_sections:
@@ -3015,17 +3926,25 @@ def _deterministic_fallback(cv_text: str, query_text: str, jd_text: str) -> Cano
                     else:
                         current_record["bullets"].append(value)
                 else:
-                    target_section = "activities" if activity_hint else "experience"
-                    records[target_section].append({
-                        "organization": "",
-                        "role": "",
-                        "period": "",
-                        "bullets": [value],
-                    })
-                    unstructured_current = (
-                        target_section,
-                        len(records[target_section]) - 1,
-                    )
+                    if not activity_hint and item_number is None:
+                        # An action with no source-side record owner is useful
+                        # evidence, but calling it a separate job manufactures
+                        # employment structure.  Keep it in a neutral public
+                        # highlights section; numbered OCR lists retain the
+                        # existing reattachment path below.
+                        additional.setdefault("经历亮点", []).append(value)
+                    else:
+                        target_section = "activities" if activity_hint else "experience"
+                        records[target_section].append({
+                            "organization": "",
+                            "role": "",
+                            "period": "",
+                            "bullets": [value],
+                        })
+                        unstructured_current = (
+                            target_section,
+                            len(records[target_section]) - 1,
+                        )
                 unstructured_last_number = item_number or unstructured_last_number
                 continue
             if unstructured_current is not None:
@@ -3177,6 +4096,22 @@ def _deterministic_fallback(cv_text: str, query_text: str, jd_text: str) -> Cano
         # parser label or pretending that their semantic type is known.
         additional["补充信息"] = list(dict.fromkeys(unclassified))
 
+    # A credential can be embedded in an education row (for example an MBA
+    # accreditation after the degree).  Education has no bullet field, so
+    # retain the exact credential atom in the public certification section
+    # instead of dropping it with parser scratch text.
+    for fact in source.fact_units:
+        value = str(fact.verbatim_text or "").strip(" \t-•·，,。；;")
+        if (
+            fact.fact_eligible
+            and fact.source_type != "jd"
+            and fact.section_hint == "education"
+            and "credential" in fact.dimensions
+            and value
+            and value not in scalars["certifications"]
+        ):
+            scalars["certifications"].append(value)
+
     return CanonicalResume.model_validate({
         "meta": {
             "name": (name_match.group(1) if name_match else meta.get("name", "")),
@@ -3292,12 +4227,18 @@ def _empty_profile_framework(target_role: str = "") -> dict:
 
 
 _SOURCE_FALLBACK_FASTPATH_MIN_COVERAGE = 0.90
+_FACT_COMPILER_FASTPATH_MIN_BLOCKS = 72
+_FACT_COMPILER_FASTPATH_MIN_ATOMIC_RECALL = 0.88
+_QUERY_FACT_COMPILER_FASTPATH_MIN_BLOCKS = 24
+_QUERY_FACT_COMPILER_FASTPATH_MIN_ATOMIC_RECALL = 0.88
 
 
 def _fallback_is_structurally_safe(
     resume: CanonicalResume,
     *,
     allow_period_only_experience: bool = False,
+    allow_missing_education_school: bool = False,
+    allow_partial_record_identity: bool = False,
 ) -> bool:
     """Reject high-coverage fallbacks whose fields are only lexical matches."""
 
@@ -3308,7 +4249,10 @@ def _fallback_is_structurally_safe(
         "projects": ("name",),
     }
     for education in resume.education:
-        if not str(education.school or "").strip():
+        if (
+            not str(education.school or "").strip()
+            and not allow_missing_education_school
+        ):
             return False
         if not any(str(value or "").strip() for value in (education.degree, education.major)):
             return False
@@ -3332,7 +4276,22 @@ def _fallback_is_structurally_safe(
                     and str(record.period or "").strip()
                     and record.bullets
                 )
-                if not period_only_experience:
+                source_partial_identity = bool(
+                    allow_partial_record_identity
+                    and any(identities)
+                    and str(record.period or "").strip()
+                    and record.bullets
+                )
+                anonymous_source_project = bool(
+                    section == "projects"
+                    and not any(identities)
+                    and record.bullets
+                )
+                if not (
+                    period_only_experience
+                    or source_partial_identity
+                    or anonymous_source_project
+                ):
                     return False
             if any(_looks_like_record_body(value) for value in identities if value):
                 return False
@@ -3425,6 +4384,421 @@ def _resume_claims_are_preserved(
         any(value in candidate for candidate in after_by_section.get(section, []))
         for section, value in _resume_claim_fingerprints(before)
     )
+
+
+def _critical_structural_additions(audit: dict) -> int:
+    invariants = audit.get("structural_invariants") or {}
+    return sum(
+        int((invariants.get(section) or {}).get("added_count") or 0)
+        for section in (
+            "organization", "role", "period", "education", "credential", "metric",
+        )
+    )
+
+
+def _audit_existing_scaffold(
+    resume: CanonicalResume,
+    source,
+    evidence_bindings: list,
+) -> dict:
+    """Audit an already evidence-gated scaffold without recompiling it.
+
+    ``enforce_resume_evidence`` has already bound and repaired every public
+    claim in this candidate.  Dense query-only profiles used to feed that same
+    scaffold through ``compile_fact_coverage`` and then bind/audit it several
+    more times merely to decide whether Composer could be skipped.  On a long
+    profile that CPU-only repetition could consume most of the request budget.
+
+    This fast-path keeps the exact same promotion invariants: no unsupported
+    atom, no ownership error, and no critical structural addition.  It only
+    reuses the final binding set and performs the independent atomic audit
+    once.  A scaffold below the recall threshold still follows the normal
+    Composer/compiler path.
+    """
+
+    audit = audit_atomic_facts(
+        source=source,
+        resume=resume,
+        evidence_bindings=evidence_bindings,
+    )
+    atomic = audit["atomic_factuality"]
+    ownership = audit["ownership_integrity"]
+    safe = bool(
+        int(atomic["generated_atom_count"]) > 0
+        and int(atomic["unsupported_atom_count"]) == 0
+        and int(ownership["incorrect_assignment_count"]) == 0
+        and _critical_structural_additions(audit) == 0
+    )
+    return {
+        "mode": _fact_compiler_mode(),
+        "accepted": _fact_compiler_mode() == "on" and safe,
+        "safe": safe,
+        "after_atomic_recall": float(atomic["recall"]),
+        "after_atomic_precision": float(atomic["precision"]),
+        "after_unsupported": int(atomic["unsupported_atom_count"]),
+        "after_ownership_errors": int(ownership["incorrect_assignment_count"]),
+        "critical_structural_additions": _critical_structural_additions(audit),
+        "audit_reused_existing_bindings": True,
+    }
+
+
+_COMPILER_RECORD_PATH = re.compile(
+    r"^(education|experience|research|activities|projects)\[(\d+)](?:\.(\w+)(?:\[(\d+)])?)?$"
+)
+_COMPILER_LIST_PATH = re.compile(
+    r"^(awards|publications|patents|certifications|training|teaching)\[(\d+)]$"
+)
+_COMPILER_SKILL_PATH = re.compile(r"^skills\.items\[(\d+)]\.name$")
+_COMPILER_ADDITIONAL_PATH = re.compile(r"^additional_sections\.(.+)\[(\d+)]$")
+
+
+def _compiler_path_was_added(path: str, added_paths: list[str]) -> bool:
+    """Whether an audited atom belongs to a compiler-created value/record."""
+
+    return any(
+        path == added
+        or path.startswith(f"{added}.")
+        or path.startswith(f"{added}[")
+        for added in added_paths
+    )
+
+
+def _drop_compiler_path(resume: CanonicalResume, path: str) -> bool:
+    """Remove one newly unsafe compiler value without deleting sibling facts."""
+
+    if path.startswith("summary[") or path == "summary":
+        resume.summary = ""
+        return True
+    if path.startswith("meta."):
+        field_name = path.split(".", 1)[1]
+        if hasattr(resume.meta, field_name):
+            setattr(resume.meta, field_name, "")
+            return True
+        return False
+    if match := _COMPILER_RECORD_PATH.fullmatch(path):
+        section, index_text, field_name, child_index = match.groups()
+        records = getattr(resume, section)
+        index = int(index_text)
+        if index >= len(records):
+            return False
+        if field_name is None:
+            records.pop(index)
+            return True
+        record = records[index]
+        if field_name == "bullets" and child_index is not None:
+            bullet_index = int(child_index)
+            if bullet_index < len(record.bullets):
+                record.bullets.pop(bullet_index)
+                return True
+            return False
+        if hasattr(record, field_name):
+            setattr(record, field_name, "")
+            return True
+        return False
+    if match := _COMPILER_SKILL_PATH.fullmatch(path):
+        index = int(match.group(1))
+        if index < len(resume.skills.items):
+            resume.skills.items.pop(index)
+            return True
+        return False
+    if match := _COMPILER_LIST_PATH.fullmatch(path):
+        section, index_text = match.groups()
+        values = getattr(resume, section)
+        index = int(index_text)
+        if index < len(values):
+            values.pop(index)
+            return True
+        return False
+    if match := _COMPILER_ADDITIONAL_PATH.fullmatch(path):
+        title, index_text = match.groups()
+        values = resume.additional_sections.get(title, [])
+        index = int(index_text)
+        if index < len(values):
+            values.pop(index)
+            if not values:
+                resume.additional_sections.pop(title, None)
+            return True
+    return False
+
+
+def _drop_empty_compiler_records(resume: CanonicalResume) -> None:
+    fields = {
+        "education": ("school", "degree", "major", "period"),
+        "experience": ("organization", "role", "period"),
+        "research": ("institution", "topic", "period"),
+        "activities": ("organization", "role", "period"),
+        "projects": ("name", "organization", "role", "period"),
+    }
+    for section, names in fields.items():
+        kept = []
+        for record in getattr(resume, section):
+            values = [str(getattr(record, name, "") or "").strip() for name in names]
+            values.extend(
+                str(value or "").strip()
+                for value in getattr(record, "bullets", [])
+            )
+            if any(values):
+                kept.append(record)
+        setattr(resume, section, kept)
+
+
+def _prune_unsafe_compiler_additions(
+    candidate: CanonicalResume,
+    report,
+    after_audit: dict,
+) -> tuple[CanonicalResume, list[str]]:
+    """Apply the plan's minimum-edit rule to a partially unsafe candidate.
+
+    The safety audit can reject one malformed fallback field while dozens of
+    exact source facts are valid.  Reverting the whole transaction recreates
+    the old recall problem.  Remove only compiler-created atoms that the audit
+    marks unsupported or incorrectly owned, then let the caller re-audit the
+    remaining candidate.
+    """
+
+    unsafe_paths = {
+        str(item.get("canonical_field_path") or "")
+        for item in (after_audit.get("atomic_factuality") or {}).get(
+            "unsupported_output", []
+        )
+    }
+    unsafe_paths.update(
+        str(item.get("canonical_field_path") or "")
+        for item in (after_audit.get("ownership_integrity") or {}).get(
+            "issues", []
+        )
+    )
+    unsafe_paths = {
+        path for path in unsafe_paths
+        if path and _compiler_path_was_added(path, report.added_paths)
+    }
+    if not unsafe_paths:
+        return candidate, []
+
+    pruned = candidate.model_copy(deep=True)
+    removed: list[str] = []
+    # Remove list indexes from right to left so earlier paths stay stable.
+    for path in sorted(unsafe_paths, reverse=True):
+        if _drop_compiler_path(pruned, path):
+            removed.append(path)
+    _drop_empty_compiler_records(pruned)
+    return pruned, sorted(removed)
+
+
+def _apply_fact_compiler_candidate(
+    resume: CanonicalResume,
+    source,
+    *,
+    scaffold: CanonicalResume | None,
+    trusted_rewrites: dict[str, str] | None = None,
+    allow_reordered_record_bullets: bool = False,
+    mode_override: str | None = None,
+    merge_scaffold: bool = True,
+    allowed_destinations: frozenset[str] | None = None,
+    cleanup_presentation: bool = True,
+    require_identity_owner: bool = False,
+) -> tuple[CanonicalResume, list, list[str], dict]:
+    """Apply the compiler transactionally under factual and ownership gates."""
+
+    mode = mode_override or _fact_compiler_mode()
+    before_bindings = bind_resume_evidence(
+        resume,
+        source,
+        trusted_rewrites=trusted_rewrites,
+    )
+    if mode == "legacy":
+        return resume, before_bindings, [], {
+            "mode": mode,
+            "accepted": False,
+            "reason": "disabled",
+        }
+
+    if cleanup_presentation:
+        working_resume, placeholder_paths = sanitize_resume_placeholders(resume)
+    else:
+        working_resume = resume
+        placeholder_paths = []
+    before_bindings = bind_resume_evidence(
+        working_resume,
+        source,
+        trusted_rewrites=trusted_rewrites,
+    )
+
+    candidate, report, routes = compile_fact_coverage(
+        working_resume,
+        source,
+        scaffold=scaffold,
+        merge_scaffold=merge_scaffold,
+        allowed_destinations=allowed_destinations,
+        require_identity_owner=require_identity_owner,
+    )
+    if cleanup_presentation:
+        candidate, compiler_placeholder_paths = sanitize_resume_placeholders(candidate)
+        placeholder_paths = list(dict.fromkeys(
+            [*placeholder_paths, *compiler_placeholder_paths]
+        ))
+    # ``resume`` has already passed the normal evidence gate, while the
+    # compiler adds only verbatim facts or a separately grounded scaffold.
+    # Re-running the destructive legacy gate over the entire merged document
+    # can delete old claims when newly improved record IDs differ from those
+    # used during the earlier pass.  Audit the append-only candidate directly
+    # and prune only its unsafe additions below.
+    removed: list[str] = []
+    # The caller has already compacted and grounded the base resume.  Running
+    # ``_compact_canonical`` here would rebuild the complete summary and turn a
+    # local fact-recovery transaction into an unrelated prose rewrite.  Keep
+    # the compiler append-only; normal pipeline finalization remains
+    # responsible for presentation cleanup.
+    candidate_bindings = bind_resume_evidence(
+        candidate,
+        source,
+        trusted_rewrites=trusted_rewrites,
+    )
+    before_audit = audit_atomic_facts(
+        source=source,
+        resume=working_resume,
+        evidence_bindings=before_bindings,
+    )
+    after_audit = audit_atomic_facts(
+        source=source,
+        resume=candidate,
+        evidence_bindings=candidate_bindings,
+    )
+    candidate, pruned_paths = _prune_unsafe_compiler_additions(
+        candidate,
+        report,
+        after_audit,
+    )
+    uncleaned_before_audit = before_audit
+    # The compiler runs after normal compaction and may merge a grounded
+    # scaffold containing duplicate records, credential fragments or OCR
+    # recovery tails.  Apply the same local presentation invariants to both
+    # sides of the transaction, then re-audit the exact candidate that may be
+    # committed.  Summary prose is deliberately left untouched.
+    base_presentation_pruned = False
+    candidate_presentation_pruned = False
+    if cleanup_presentation:
+        working_data = working_resume.model_dump()
+        _clean_compiler_presentation_data(
+            working_data,
+            source=source,
+            routes=routes,
+        )
+        cleaned_working_resume = CanonicalResume.model_validate(working_data)
+        base_presentation_pruned = cleaned_working_resume != working_resume
+        if base_presentation_pruned:
+            working_resume = cleaned_working_resume
+
+        candidate_data = candidate.model_dump()
+        _clean_compiler_presentation_data(
+            candidate_data,
+            source=source,
+            routes=routes,
+        )
+        cleaned_candidate = CanonicalResume.model_validate(candidate_data)
+        candidate_presentation_pruned = cleaned_candidate != candidate
+        if candidate_presentation_pruned:
+            candidate = cleaned_candidate
+    presentation_pruned = base_presentation_pruned or candidate_presentation_pruned
+    if pruned_paths or presentation_pruned:
+        before_bindings = bind_resume_evidence(
+            working_resume,
+            source,
+            trusted_rewrites=trusted_rewrites,
+        )
+        before_audit = audit_atomic_facts(
+            source=source,
+            resume=working_resume,
+            evidence_bindings=before_bindings,
+        )
+        candidate_bindings = bind_resume_evidence(
+            candidate,
+            source,
+            trusted_rewrites=trusted_rewrites,
+        )
+        after_audit = audit_atomic_facts(
+            source=source,
+            resume=candidate,
+            evidence_bindings=candidate_bindings,
+        )
+    before_atomic = before_audit["atomic_factuality"]
+    after_atomic = after_audit["atomic_factuality"]
+    before_ownership = before_audit["ownership_integrity"]
+    after_ownership = after_audit["ownership_integrity"]
+    recall_gain = (
+        int(after_atomic["represented_source_fact_count"])
+        - int(before_atomic["represented_source_fact_count"])
+    )
+    candidate_safe = bool(
+        recall_gain >= 0
+        and bool(recall_gain > 0 or placeholder_paths or presentation_pruned)
+        and int(after_atomic["unsupported_atom_count"])
+        <= int(before_atomic["unsupported_atom_count"])
+        and int(after_ownership["incorrect_assignment_count"])
+        <= int(before_ownership["incorrect_assignment_count"])
+        and _critical_structural_additions(after_audit)
+        <= _critical_structural_additions(before_audit)
+        and _resume_claims_are_preserved(working_resume, candidate)
+    )
+    uncleaned_atomic = uncleaned_before_audit["atomic_factuality"]
+    uncleaned_ownership = uncleaned_before_audit["ownership_integrity"]
+    cleanup_only_safe = bool(
+        base_presentation_pruned
+        and int(before_atomic["unsupported_atom_count"])
+        <= int(uncleaned_atomic["unsupported_atom_count"])
+        and int(before_ownership["incorrect_assignment_count"])
+        <= int(uncleaned_ownership["incorrect_assignment_count"])
+        and _critical_structural_additions(before_audit)
+        <= _critical_structural_additions(uncleaned_before_audit)
+    )
+    safe = candidate_safe or cleanup_only_safe
+    accepted = mode == "on" and safe
+    selected = "candidate" if candidate_safe else "cleanup_only" if cleanup_only_safe else "original"
+    diagnostics = {
+        "mode": mode,
+        "accepted": accepted,
+        "safe": safe,
+        "recall_gain": recall_gain,
+        "before_atomic_recall": before_atomic["recall"],
+        "after_atomic_recall": after_atomic["recall"],
+        "before_unsupported": before_atomic["unsupported_atom_count"],
+        "after_unsupported": after_atomic["unsupported_atom_count"],
+        "before_ownership_errors": before_ownership["incorrect_assignment_count"],
+        "after_ownership_errors": after_ownership["incorrect_assignment_count"],
+        "placeholder_cleanup_paths": placeholder_paths,
+        "presentation_cleanup": presentation_pruned,
+        "selected": selected,
+        "route_statuses": dict(Counter(route.status for route in routes)),
+        "pruned_unsafe_paths": pruned_paths,
+        "report": asdict(report),
+    }
+    trace_event("fact_compiler", **diagnostics)
+    if accepted:
+        if not candidate_safe:
+            logger.warning(
+                "V2 | Fact compiler accepted presentation-only cleanup; "
+                "unsupported=%d ownership_errors=%d",
+                int(before_atomic["unsupported_atom_count"]),
+                int(before_ownership["incorrect_assignment_count"]),
+            )
+            return working_resume, before_bindings, removed, diagnostics
+        logger.warning(
+            "V2 | Fact compiler accepted: atomic recall %.1f%% -> %.1f%%; "
+            "recovered=%d paths=%d",
+            float(before_atomic["recall"]) * 100,
+            float(after_atomic["recall"]) * 100,
+            recall_gain,
+            len(report.added_paths),
+        )
+        return candidate, candidate_bindings, removed, diagnostics
+    logger.info(
+        "V2 | Fact compiler %s: safe=%s atomic recall %.1f%% -> %.1f%%",
+        "shadowed" if mode == "shadow" else "rejected",
+        safe,
+        float(before_atomic["recall"]) * 100,
+        float(after_atomic["recall"]) * 100,
+    )
+    return resume, before_bindings, [], diagnostics
 
 
 def _record_identity_keys(section: str, record) -> set[tuple[str, ...]]:
@@ -3620,6 +4994,9 @@ def _recover_missing_record_facts(
     record.  The recovered wording is copied from candidate evidence, never JD.
     """
 
+    if not resolve_pipeline_profile().record_fact_recovery:
+        return resume, _RecoveryStats(), set()
+
     units = source_fact_units(source)
     if not units:
         return resume, _RecoveryStats(), set()
@@ -3763,6 +5140,9 @@ def _restore_attested_source_summary(
     source-adapter disclaimer filtering has already removed instructions such
     as "不得编造" or "以真实信息为准".
     """
+
+    if not resolve_pipeline_profile().attested_summary_recovery:
+        return resume, []
 
     candidates = [
         fact.verbatim_text.strip(" \t。；;！!？?")
@@ -4040,6 +5420,11 @@ def _recover_grounded_source_structure(
     evidence.  Ambiguous or incomplete rows remain absent.
     """
 
+    pipeline_profile = resolve_pipeline_profile()
+    if not pipeline_profile.source_structure_recovery:
+        return resume, _RecoveryStats()
+    fields_only = pipeline_profile.structure_fields_only
+
     merged = resume.model_copy(deep=True)
     fallback_bindings = bind_resume_evidence(fallback, source)
     bound_paths = {str(binding.path or "") for binding in fallback_bindings}
@@ -4077,7 +5462,8 @@ def _recover_grounded_source_structure(
 
             if match_index is None:
                 if (
-                    owner
+                    not fields_only
+                    and owner
                     and not owner_matches
                     and _record_is_complete_for_recovery(section, fallback_record)
                 ):
@@ -4101,6 +5487,8 @@ def _recover_grounded_source_structure(
                     filled_fields += 1
             if not hasattr(record, "bullets"):
                 continue
+            if fields_only:
+                continue
             claims = list(record.bullets)
             for bullet_index, bullet in enumerate(fallback_record.bullets):
                 fallback_path = f"{section}[{fallback_index}].bullets[{bullet_index}]"
@@ -4111,6 +5499,9 @@ def _recover_grounded_source_structure(
                     record.bullets.append(bullet)
                     claims.append(bullet)
                     appended_bullets += 1
+
+    if fields_only:
+        return merged, _RecoveryStats(filled_fields=filled_fields)
 
     for field in (
         "awards", "publications", "patents", "certifications", "training", "teaching",
@@ -4381,9 +5772,28 @@ def run_v2_pipeline(
     cv_text: str,
     query_text: str,
     jd_text: str,
+    *,
+    record_recovery_allowed: bool = True,
 ) -> VerifiedResult:
     """Run the V2 5-layer pipeline. Returns VerifiedResult or fallback."""
     t_start = time.perf_counter()
+    pipeline_profile = resolve_pipeline_profile()
+    logger.info(
+        "V2 | Pipeline profile=%s compiler=%s structure_recovery=%s "
+        "record_recovery=%s query_narrative=%s cv_narrative=%s",
+        pipeline_profile.name,
+        pipeline_profile.fact_compiler_mode,
+        pipeline_profile.source_structure_recovery,
+        pipeline_profile.record_fact_recovery,
+        pipeline_profile.query_narrative,
+        pipeline_profile.cv_narrative,
+    )
+    trace_event("pipeline_profile", profile=pipeline_profile.trace_payload())
+    trace_event(
+        "record_recovery_policy",
+        allowed=record_recovery_allowed,
+        reason=("stable_text_layout" if record_recovery_allowed else "ocr_layout_unstable"),
+    )
     trace_event(
         "v2_input",
         cv_text=cv_text,
@@ -4397,13 +5807,14 @@ def run_v2_pipeline(
         t_gen = time.perf_counter()
         evidence_source = build_source_bundle("", query_text, jd_text)
         trace_event("source_bundle", source=evidence_source)
+        candidate_source_blocks = candidate_blocks(evidence_source)
         candidate_evidence = "\n".join(
-            block.text for block in candidate_blocks(evidence_source)
+            block.text for block in candidate_source_blocks
         )
-        resume = compose_from_query(query_text, jd_text)
-        trace_event("generate_composer_assembled", resume=resume)
         used_fallback = False
         grounded_fallback = CanonicalResume()
+        grounded_fallback_bindings: list = []
+        grounded_fallback_removed: list[str] = []
         if candidate_evidence:
             raw_fallback = _deterministic_fallback("", query_text, jd_text)
             fallback_data = raw_fallback.model_dump()
@@ -4414,7 +5825,7 @@ def run_v2_pipeline(
                 grounded_fallback,
                 candidate_evidence,
             )
-            grounded_fallback, _, _ = enforce_resume_evidence(
+            grounded_fallback, _, grounded_fallback_removed = enforce_resume_evidence(
                 grounded_fallback,
                 evidence_source,
             )
@@ -4423,6 +5834,254 @@ def run_v2_pipeline(
             # classify one from the same source.
             grounded_fallback.additional_sections.pop("补充信息", None)
             grounded_fallback = _compact_canonical(grounded_fallback)
+            grounded_fallback, fallback_placeholder_paths = sanitize_resume_placeholders(
+                grounded_fallback,
+            )
+            # Compaction rebuilds the summary, so retain one binding set that
+            # exactly matches the candidate inspected by the fast-path audit.
+            grounded_fallback_bindings = bind_resume_evidence(
+                grounded_fallback,
+                evidence_source,
+            )
+            if fallback_placeholder_paths:
+                trace_event(
+                    "query_fallback_placeholder_cleanup",
+                    paths=fallback_placeholder_paths,
+                )
+
+        query_compiler_fastpath = False
+        resume = CanonicalResume()
+        if (
+            candidate_evidence
+            and _fact_compiler_mode() == "on"
+            and len(candidate_source_blocks)
+            >= _QUERY_FACT_COMPILER_FASTPATH_MIN_BLOCKS
+            and not _is_empty_resume(grounded_fallback)
+        ):
+            try:
+                query_fastpath_resume = grounded_fallback
+                query_fastpath_bindings = grounded_fallback_bindings
+                query_fastpath_diagnostics = _audit_existing_scaffold(
+                    query_fastpath_resume,
+                    evidence_source,
+                    query_fastpath_bindings,
+                )
+                direct_fastpath_recall = float(
+                    query_fastpath_diagnostics.get("after_atomic_recall") or 0.0
+                )
+                if (
+                    query_fastpath_diagnostics.get("accepted")
+                    and direct_fastpath_recall < 1.0
+                ):
+                    (
+                        compiled_query_resume,
+                        compiled_query_bindings,
+                        _compiled_query_removed,
+                        compiled_query_diagnostics,
+                    ) = _apply_fact_compiler_candidate(
+                        query_fastpath_resume,
+                        evidence_source,
+                        scaffold=query_fastpath_resume,
+                        allow_reordered_record_bullets=True,
+                    )
+                    compiled_recall = float(
+                        compiled_query_diagnostics.get("after_atomic_recall") or 0.0
+                    )
+                    if (
+                        compiled_query_diagnostics.get("accepted")
+                        and compiled_recall > direct_fastpath_recall
+                        and int(compiled_query_diagnostics.get("after_unsupported") or 0) == 0
+                        and int(compiled_query_diagnostics.get("after_ownership_errors") or 0) == 0
+                    ):
+                        query_fastpath_resume = compiled_query_resume
+                        query_fastpath_bindings = compiled_query_bindings
+                        query_fastpath_diagnostics = compiled_query_diagnostics
+                query_fastpath_recall = float(
+                    query_fastpath_diagnostics.get("after_atomic_recall") or 0.0
+                )
+                query_allows_missing_school = not any(
+                    fact.fact_eligible
+                    and fact.section_hint == "education"
+                    and _SCHOOL_SUFFIX.search(fact.verbatim_text)
+                    and not _FALLBACK_PLACEHOLDER_TOKEN.search(fact.verbatim_text)
+                    for fact in evidence_source.fact_units
+                )
+                query_fastpath_structure_safe = _fallback_is_structurally_safe(
+                    query_fastpath_resume,
+                    allow_period_only_experience=True,
+                    allow_missing_education_school=query_allows_missing_school,
+                    allow_partial_record_identity=True,
+                )
+                if (
+                    query_fastpath_diagnostics.get("accepted")
+                    and query_fastpath_recall
+                    >= _QUERY_FACT_COMPILER_FASTPATH_MIN_ATOMIC_RECALL
+                    and _has_candidate_profile(query_fastpath_resume)
+                    and query_fastpath_structure_safe
+                ):
+                    resume = query_fastpath_resume
+                    query_compiler_fastpath = True
+                    used_fallback = True
+                    trace_event(
+                        "query_composer_skipped_for_fact_compiler",
+                        candidate_blocks=len(candidate_source_blocks),
+                        diagnostics=query_fastpath_diagnostics,
+                    )
+                    logger.warning(
+                        "V2 | Dense query Composer skipped: audited scaffold "
+                        "atomic recall %.1f%% across %d candidate blocks",
+                        query_fastpath_recall * 100,
+                        len(candidate_source_blocks),
+                    )
+                else:
+                    logger.info(
+                        "V2 | Dense query scaffold not promoted: accepted=%s "
+                        "recall=%.1f%% structure_safe=%s",
+                        bool(query_fastpath_diagnostics.get("accepted")),
+                        query_fastpath_recall * 100,
+                        query_fastpath_structure_safe,
+                    )
+            except Exception as exc:
+                logger.warning("V2 | Dense query fact-compiler scaffold failed: %s", exc)
+
+        if query_compiler_fastpath:
+            # The scaffold was already compacted, evidence-gated, rebound and
+            # independently audited above.  Optimize only a bounded set of
+            # multi-clause records, then re-run the same independent audit.
+            # This keeps the fast path cheap while allowing source fragments
+            # from one record to become coherent accomplishment sentences.
+            optimizer_changes: list[Change] = []
+            optimizer_removed: list[str] = []
+            narrative_record_keys = select_narrative_record_keys(resume)
+            query_narrative_enabled = pipeline_profile.query_narrative
+            if narrative_record_keys and query_narrative_enabled:
+                before_optimizer = _rank_resume_content(
+                    resume,
+                    jd_text or resume.meta.target_role,
+                )
+                optimizer_bindings = bind_resume_evidence(
+                    before_optimizer,
+                    evidence_source,
+                )
+                optimization = optimize_resume_with_provenance(
+                    before_optimizer,
+                    jd_text,
+                    evidence_bindings=optimizer_bindings,
+                    record_keys=narrative_record_keys,
+                )
+                if optimization.accepted:
+                    trusted_rewrites = dict(optimization.trusted_rewrites)
+                    optimized_resume = _ground_optimizer_output(
+                        before_optimizer,
+                        optimization.resume,
+                        query_text,
+                        trusted_rewrites=trusted_rewrites,
+                    )
+                    optimized_resume = _ground_bullets(
+                        optimized_resume,
+                        query_text,
+                        trusted_rewrites=trusted_rewrites,
+                    )
+                    optimized_resume = validate_resume(
+                        optimized_resume,
+                        source_text=query_text,
+                    )
+                    (
+                        optimized_resume,
+                        optimized_bindings,
+                        optimized_removed,
+                    ) = enforce_resume_evidence(
+                        optimized_resume,
+                        evidence_source,
+                        trusted_rewrites=trusted_rewrites,
+                        allow_reordered_record_bullets=True,
+                    )
+                    optimized_resume = _compact_canonical(optimized_resume)
+                    optimized_bindings = bind_resume_evidence(
+                        optimized_resume,
+                        evidence_source,
+                        trusted_rewrites=trusted_rewrites,
+                    )
+                    optimized_diagnostics = _audit_existing_scaffold(
+                        optimized_resume,
+                        evidence_source,
+                        optimized_bindings,
+                    )
+                    baseline_recall = float(
+                        query_fastpath_diagnostics.get("after_atomic_recall") or 0.0
+                    )
+                    if (
+                        optimized_diagnostics.get("accepted")
+                        and float(optimized_diagnostics.get("after_atomic_recall") or 0.0)
+                        >= baseline_recall
+                    ):
+                        resume = optimized_resume
+                        query_fastpath_bindings = optimized_bindings
+                        optimizer_removed = optimized_removed
+                        optimizer_changes = _bullet_rewrite_changes(
+                            before_optimizer,
+                            optimized_resume,
+                        )
+                        logger.info(
+                            "V2 | Dense-query narrative pass accepted: records=%d "
+                            "rewrites=%d recall=%.1f%%",
+                            len(narrative_record_keys),
+                            len(optimizer_changes),
+                            float(optimized_diagnostics["after_atomic_recall"]) * 100,
+                        )
+                    else:
+                        logger.warning(
+                            "V2 | Dense-query narrative pass reverted: accepted=%s "
+                            "recall=%.1f%% baseline=%.1f%%",
+                            bool(optimized_diagnostics.get("accepted")),
+                            float(optimized_diagnostics.get("after_atomic_recall") or 0.0) * 100,
+                            baseline_recall * 100,
+                        )
+            elif narrative_record_keys:
+                logger.info(
+                    "V2 | Dense-query narrative pass disabled after no-gain "
+                    "validation; retained audited source wording"
+                )
+            # Returning here prevents the normal no-CV recovery tail from
+            # rebinding the same long profile and invoking the compiler again.
+            resume_dict = _canonical_to_v1_format(resume)
+            final_result = VerifiedResult(
+                resume=resume,
+                changes=[Change(
+                    path="*",
+                    action="replace",
+                    reason=(
+                        "Generated from an evidence-gated query fact scaffold; "
+                        "free-form Composer was unnecessary"
+                    ),
+                )] + optimizer_changes + [
+                    Change(
+                        path=path,
+                        action="remove",
+                        reason="No candidate evidence binding",
+                    )
+                    for path in grounded_fallback_removed + optimizer_removed
+                ],
+                resume_dict=resume_dict,
+                evidence_bindings=query_fastpath_bindings,
+            )
+            trace_event(
+                "v2_final",
+                result=final_result,
+                evidence_removed=grounded_fallback_removed,
+                query_scaffold_fastpath=True,
+            )
+            logger.info(
+                "V2 | Total: %.1fs (audited dense-query scaffold)",
+                time.perf_counter() - t_start,
+            )
+            return final_result
+
+        if not query_compiler_fastpath:
+            resume = compose_from_query(query_text, jd_text)
+            trace_event("generate_composer_assembled", resume=resume)
+
+        if candidate_evidence:
             before_recovery = resume.model_dump()
             resume = _merge_query_fallback_sections(resume, grounded_fallback)
             resume, structure_recovery = _recover_grounded_source_structure(
@@ -4477,7 +6136,10 @@ def run_v2_pipeline(
             if (value := _bullet_path_value(resume, path)) is not None
         }
         optimizer_changes: list[Change] = []
-        if _needs_optimizer(resume):
+        if _needs_optimizer(
+            resume,
+            audited_source_scaffold=query_compiler_fastpath,
+        ):
             before_optimizer = resume.model_copy(deep=True)
             optimization = optimize_resume_with_provenance(resume, jd_text)
             resume = optimization.resume
@@ -4502,7 +6164,13 @@ def run_v2_pipeline(
             )
             optimizer_changes = _bullet_rewrite_changes(before_optimizer, resume)
         else:
-            logger.info("V2 | Optimizer skipped: no factual bullets")
+            if query_compiler_fastpath:
+                logger.info(
+                    "V2 | Optimizer skipped: audited dense-query scaffold "
+                    "already preserves complete source clauses"
+                )
+            else:
+                logger.info("V2 | Optimizer skipped: no factual bullets")
         resume = _ground_bullets(
             resume,
             query_text,
@@ -4567,10 +6235,28 @@ def run_v2_pipeline(
                     ledger_recovery.appended_bullets,
                     ledger_recovery.expanded_bullets,
                 )
+        # Finalize legacy structure and its evidence-derived summary before
+        # the append-only compiler.  Compacting afterwards would rewrite the
+        # accepted candidate and bypass the compiler's atomic safety audit.
         resume = _compact_canonical(resume)
         trusted_rewrites = _filter_trusted_rewrites(
             resume, trusted_rewrites, trusted_outputs,
         )
+        compiler_resume, compiler_bindings, compiler_removed, compiler_diagnostics = (
+            _apply_fact_compiler_candidate(
+                resume,
+                evidence_source,
+                scaffold=(grounded_fallback if not _is_empty_resume(grounded_fallback) else None),
+                trusted_rewrites=trusted_rewrites,
+            )
+        )
+        if compiler_diagnostics.get("accepted"):
+            resume = compiler_resume
+            evidence_bindings = compiler_bindings
+            evidence_removed.extend(compiler_removed)
+            trusted_rewrites = _filter_trusted_rewrites(
+                resume, trusted_rewrites, trusted_outputs,
+            )
         # Recompute only after unsupported JD-derived records have been
         # removed. Otherwise temporary model output suppresses the framework
         # and produces an almost blank document.
@@ -4613,55 +6299,155 @@ def run_v2_pipeline(
     logger.info("V2 | SourceBundle: %d blocks (%.1fs)",
                 len(source.blocks), time.perf_counter() - t_start)
 
-    t_composer = time.perf_counter()
-    draft = compose_resume(source)
-    trace_event("composer_assembled_draft", draft=draft)
-    logger.info("V2 | Composer done: %d edu, %d exp, %d res, %d proj (%.1fs)",
-                len(draft.education), len(draft.experience),
-                len(draft.research), len(draft.projects),
-                time.perf_counter() - t_composer)
-
-    t_verifier = time.perf_counter()
-    candidate_evidence = "\n".join(block.text for block in candidate_blocks(source))
-    result = _deterministic_verify_draft(source, draft)
-    trace_event(
-        "deterministic_verifier_result",
-        accepted=result is not None,
-        result=result,
-    )
-    if result is None:
-        fallback_candidate = None
+    candidate_source_blocks = candidate_blocks(source)
+    candidate_evidence = "\n".join(block.text for block in candidate_source_blocks)
+    compiler_scaffold_result = None
+    compiler_fastpath_result: VerifiedResult | None = None
+    if _fact_compiler_mode() != "legacy":
         try:
-            fallback_candidate = _grounded_source_fallback(
+            compiler_scaffold_result = _grounded_source_fallback(
                 cv_text,
                 query_text,
                 jd_text,
                 source,
                 candidate_evidence,
             )
-        except Exception as exc:
-            logger.warning("V2 | Pre-verifier source fallback failed: %s", exc)
-        if (
-            fallback_candidate is not None
-            and fallback_candidate[1] >= _SOURCE_FALLBACK_FASTPATH_MIN_COVERAGE
-            and _has_structured_history(fallback_candidate[0].resume)
-            and _fallback_is_structurally_safe(fallback_candidate[0].resume)
-        ):
-            result, fallback_coverage, _fallback_missing = fallback_candidate
-            result.changes.insert(0, Change(
-                path="*",
-                action="replace",
-                reason="Used high-coverage deterministic parser before LLM verification",
-            ))
-            logger.info(
-                "V2 | LLM Verifier skipped: evidence-gated fallback coverage %.1f%%",
-                fallback_coverage * 100,
+            trace_event(
+                "fact_compiler_scaffold",
+                source_coverage=compiler_scaffold_result[1],
+                missing_source_facts=compiler_scaffold_result[2],
             )
-        else:
-            logger.info("V2 | Falling back to LLM Verifier")
-            result = verify_resume(source, draft)
+            if (
+                _fact_compiler_mode() == "on"
+                and len(candidate_source_blocks) >= _FACT_COMPILER_FASTPATH_MIN_BLOCKS
+            ):
+                (
+                    fastpath_resume,
+                    fastpath_bindings,
+                    _fastpath_removed,
+                    fastpath_diagnostics,
+                ) = _apply_fact_compiler_candidate(
+                    compiler_scaffold_result[0].resume,
+                    source,
+                    scaffold=compiler_scaffold_result[0].resume,
+                    allow_reordered_record_bullets=True,
+                )
+                fastpath_recall = float(
+                    fastpath_diagnostics.get("after_atomic_recall") or 0.0
+                )
+                fastpath_has_history = _has_structured_history(fastpath_resume)
+                fastpath_allows_missing_school = not any(
+                    fact.fact_eligible
+                    and fact.section_hint == "education"
+                    and _SCHOOL_SUFFIX.search(fact.verbatim_text)
+                    and not _FALLBACK_PLACEHOLDER_TOKEN.search(fact.verbatim_text)
+                    for fact in source.fact_units
+                )
+                fastpath_structure_safe = _fallback_is_structurally_safe(
+                    fastpath_resume,
+                    allow_period_only_experience=True,
+                    allow_missing_education_school=fastpath_allows_missing_school,
+                    allow_partial_record_identity=True,
+                )
+                if (
+                    fastpath_diagnostics.get("accepted")
+                    and fastpath_recall >= _FACT_COMPILER_FASTPATH_MIN_ATOMIC_RECALL
+                    and fastpath_has_history
+                    and fastpath_structure_safe
+                ):
+                    compiler_fastpath_result = compiler_scaffold_result[0].model_copy(
+                        deep=True,
+                    )
+                    compiler_fastpath_result.resume = fastpath_resume
+                    compiler_fastpath_result.evidence_bindings = fastpath_bindings
+                    compiler_fastpath_result.changes.insert(0, Change(
+                        path="*",
+                        action="replace",
+                        reason=(
+                            "Used audited fact-compiler scaffold before free-form "
+                            "Composer for a long source"
+                        ),
+                    ))
+                    trace_event(
+                        "fact_compiler_fastpath",
+                        candidate_blocks=len(candidate_source_blocks),
+                        diagnostics=fastpath_diagnostics,
+                    )
+                    logger.warning(
+                        "V2 | Long-source Composer skipped: audited scaffold "
+                        "atomic recall %.1f%% across %d candidate blocks",
+                        float(fastpath_diagnostics["after_atomic_recall"]) * 100,
+                        len(candidate_source_blocks),
+                    )
+                else:
+                    logger.warning(
+                        "V2 | Long-source fact-compiler scaffold rejected: "
+                        "accepted=%s recall=%.1f%% history=%s structure_safe=%s "
+                        "allow_missing_school=%s candidate_blocks=%d",
+                        bool(fastpath_diagnostics.get("accepted")),
+                        fastpath_recall * 100,
+                        fastpath_has_history,
+                        fastpath_structure_safe,
+                        fastpath_allows_missing_school,
+                        len(candidate_source_blocks),
+                    )
+        except Exception as exc:
+            logger.warning("V2 | Fact compiler scaffold failed: %s", exc)
+
+    t_verifier = time.perf_counter()
+    if compiler_fastpath_result is not None:
+        result = compiler_fastpath_result
+        trace_event("composer_skipped_for_fact_compiler", result=result)
     else:
-        logger.info("V2 | LLM Verifier skipped")
+        t_composer = time.perf_counter()
+        draft = compose_resume(source)
+        trace_event("composer_assembled_draft", draft=draft)
+        logger.info("V2 | Composer done: %d edu, %d exp, %d res, %d proj (%.1fs)",
+                    len(draft.education), len(draft.experience),
+                    len(draft.research), len(draft.projects),
+                    time.perf_counter() - t_composer)
+
+        t_verifier = time.perf_counter()
+        result = _deterministic_verify_draft(source, draft)
+        trace_event(
+            "deterministic_verifier_result",
+            accepted=result is not None,
+            result=result,
+        )
+        if result is None:
+            fallback_candidate = compiler_scaffold_result
+            if fallback_candidate is None:
+                try:
+                    fallback_candidate = _grounded_source_fallback(
+                        cv_text,
+                        query_text,
+                        jd_text,
+                        source,
+                        candidate_evidence,
+                    )
+                except Exception as exc:
+                    logger.warning("V2 | Pre-verifier source fallback failed: %s", exc)
+            if (
+                fallback_candidate is not None
+                and fallback_candidate[1] >= _SOURCE_FALLBACK_FASTPATH_MIN_COVERAGE
+                and _has_structured_history(fallback_candidate[0].resume)
+                and _fallback_is_structurally_safe(fallback_candidate[0].resume)
+            ):
+                result, fallback_coverage, _fallback_missing = fallback_candidate
+                result.changes.insert(0, Change(
+                    path="*",
+                    action="replace",
+                    reason="Used high-coverage deterministic parser before LLM verification",
+                ))
+                logger.info(
+                    "V2 | LLM Verifier skipped: evidence-gated fallback coverage %.1f%%",
+                    fallback_coverage * 100,
+                )
+            else:
+                logger.info("V2 | Falling back to LLM Verifier")
+                result = verify_resume(source, draft)
+        else:
+            logger.info("V2 | LLM Verifier skipped")
     trace_event("verifier_selected_result", result=result)
     result.resume = _ground_bullets(result.resume, candidate_evidence)
     if _is_empty_resume(result.resume):
@@ -4792,6 +6578,55 @@ def run_v2_pipeline(
                 pre_ledger_recovery.appended_bullets,
                 pre_ledger_recovery.expanded_bullets,
             )
+
+    # Quality-v2 keeps the free-form Composer as the structural authority.
+    # The compiler is allowed to close only uniquely owned record-body gaps,
+    # cannot merge its fallback scaffold, cannot populate summary/skills or
+    # create records, and still has to pass the atomic precision/ownership
+    # transaction before the recovered clauses reach the wording optimizer.
+    if pipeline_profile.record_compiler_recovery and record_recovery_allowed:
+        (
+            recovered_resume,
+            recovered_bindings,
+            recovered_removed,
+            recovery_diagnostics,
+        ) = _apply_fact_compiler_candidate(
+            result.resume,
+            source,
+            scaffold=None,
+            allow_reordered_record_bullets=True,
+            mode_override="on",
+            merge_scaffold=False,
+            allowed_destinations=frozenset({
+                "experience", "research", "activities", "projects",
+            }),
+            cleanup_presentation=False,
+            require_identity_owner=True,
+        )
+        if recovery_diagnostics.get("accepted"):
+            result.resume = recovered_resume
+            result.evidence_bindings = recovered_bindings
+            result.changes.extend(
+                Change(path=path, action="remove", reason="No candidate evidence binding")
+                for path in recovered_removed
+            )
+            logger.warning(
+                "V2 | Quality-v2 recovered uniquely owned record facts before "
+                "optimizer: %.1f%% -> %.1f%%; recovered=%d",
+                float(recovery_diagnostics["before_atomic_recall"]) * 100,
+                float(recovery_diagnostics["after_atomic_recall"]) * 100,
+                int(recovery_diagnostics["recall_gain"]),
+            )
+        result.resume = _quality_v2_presentation_cleanup(result.resume)
+    elif pipeline_profile.record_compiler_recovery:
+        logger.info(
+            "V2 | Record compiler recovery skipped: OCR text does not retain "
+            "a trustworthy source-record layout"
+        )
+        trace_event(
+            "record_compiler_recovery_skipped",
+            reason="ocr_layout_unstable",
+        )
     logger.info("V2 | Verifier done: %d edu, %d exp, %d res, %d changes (%.1fs)",
                 len(result.resume.education), len(result.resume.experience),
                 len(result.resume.research), len(result.changes),
@@ -4812,7 +6647,23 @@ def run_v2_pipeline(
         for path in trusted_rewrites
         if (value := _bullet_path_value(result.resume, path)) is not None
     }
-    if _needs_optimizer(result.resume):
+    # The bounded narrative planner is an experimental surface-realization
+    # layer, not part of the factual compiler contract.  Keep it off by
+    # default until a held-out paired run demonstrates a factuality-neutral
+    # readability gain.  This also makes the safe compiler scaffold the
+    # production fallback instead of letting a development bad-case rule alter
+    # every dense CV.
+    cv_narrative_enabled = pipeline_profile.cv_narrative
+    narrative_record_keys = (
+        select_narrative_record_keys(result.resume)
+        if compiler_fastpath_result is not None and cv_narrative_enabled
+        else None
+    )
+    if _needs_optimizer(
+        result.resume,
+        audited_source_scaffold=compiler_fastpath_result is not None,
+        narrative_record_keys=narrative_record_keys,
+    ):
         before_optimizer = result.resume.model_copy(deep=True)
         trace_event("optimizer_input_resume", resume=before_optimizer, jd_text=jd_text)
         optimizer_bindings = bind_resume_evidence(
@@ -4824,6 +6675,7 @@ def run_v2_pipeline(
             result.resume,
             jd_text,
             evidence_bindings=optimizer_bindings,
+            record_keys=narrative_record_keys,
         )
         trace_event("optimizer_outcome", outcome=optimization)
         result.resume = optimization.resume
@@ -4851,7 +6703,13 @@ def run_v2_pipeline(
         )
         result.changes.extend(_bullet_rewrite_changes(before_optimizer, result.resume))
     else:
-        logger.info("V2 | Optimizer skipped: no factual bullets")
+        if compiler_fastpath_result is not None:
+            logger.info(
+                "V2 | Optimizer skipped: audited long-source scaffold has no "
+                "bounded multi-clause record requiring narrative grouping"
+            )
+        else:
+            logger.info("V2 | Optimizer skipped: no factual bullets")
     result.resume = _ground_bullets(
         result.resume,
         candidate_evidence,
@@ -5079,6 +6937,34 @@ def run_v2_pipeline(
         except Exception as exc:
             logger.warning("V2 | Source coverage fallback failed: %s", exc)
 
+    compiler_resume, compiler_bindings, compiler_removed, compiler_diagnostics = (
+        _apply_fact_compiler_candidate(
+            result.resume,
+            source,
+            scaffold=(
+                compiler_scaffold_result[0].resume
+                if compiler_scaffold_result is not None
+                else None
+            ),
+            trusted_rewrites=trusted_rewrites,
+            allow_reordered_record_bullets=True,
+        )
+    )
+    if compiler_diagnostics.get("accepted"):
+        result.resume = compiler_resume
+        result.evidence_bindings = compiler_bindings
+        result.changes.extend(
+            Change(path=path, action="remove", reason="No candidate evidence binding")
+            for path in compiler_removed
+        )
+        trusted_rewrites = _filter_trusted_rewrites(
+            result.resume, trusted_rewrites, trusted_outputs,
+        )
+        coverage, missing_blocks = _deterministic_source_coverage(
+            source,
+            result.evidence_bindings,
+        )
+
     summary_restored, restored_summary_facts = _restore_attested_source_summary(
         result.resume,
         source,
@@ -5104,6 +6990,48 @@ def run_v2_pipeline(
             len(restored_summary_facts),
             coverage * 100,
         )
+    # Template placeholders are never candidate facts and must not leak merely
+    # because the optional fact compiler is disabled.  This cleanup is local
+    # and deterministic, so apply it on every production path.
+    final_resume, final_placeholder_paths = sanitize_resume_placeholders(
+        result.resume,
+    )
+    if final_placeholder_paths:
+        result.resume = final_resume
+        result.evidence_bindings = bind_resume_evidence(
+            result.resume,
+            source,
+            trusted_rewrites=trusted_rewrites,
+        )
+        coverage, missing_blocks = _deterministic_source_coverage(
+            source,
+            result.evidence_bindings,
+        )
+        trace_event(
+            "final_placeholder_cleanup",
+            paths=final_placeholder_paths,
+            source_coverage=coverage,
+        )
+    if pipeline_profile.record_compiler_recovery:
+        quality_cleaned = _quality_v2_presentation_cleanup(result.resume)
+        if quality_cleaned != result.resume:
+            result.resume = quality_cleaned
+            trusted_rewrites = _filter_trusted_rewrites(
+                result.resume, trusted_rewrites, trusted_outputs,
+            )
+            result.evidence_bindings = bind_resume_evidence(
+                result.resume,
+                source,
+                trusted_rewrites=trusted_rewrites,
+            )
+            coverage, missing_blocks = _deterministic_source_coverage(
+                source,
+                result.evidence_bindings,
+            )
+            trace_event(
+                "quality_v2_presentation_cleanup",
+                source_coverage=coverage,
+            )
     if missing_blocks:
         logger.info("V2 | Final source coverage %.1f%%, missing=%s", coverage * 100, missing_blocks[:8])
     result.changes = [

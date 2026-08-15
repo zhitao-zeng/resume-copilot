@@ -575,9 +575,11 @@ def test_production_startup_shares_configurable_context_window():
     assert 'MAX_NUM_SEQS="${MAX_NUM_SEQS:-2}"' in startup
     assert 'MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"' in startup
     assert 'export LLM_CONTEXT_WINDOW="$MAX_MODEL_LEN"' in startup
+    assert 'PIPELINE_PROFILE="${PIPELINE_PROFILE:-f507_compatible}"' in startup
     assert 'export LLM_INFLIGHT_LIMIT="${LLM_INFLIGHT_LIMIT:-$MAX_NUM_SEQS}"' in startup
     assert 'LLM_COMPOSER_MAX_TOKENS="${LLM_COMPOSER_MAX_TOKENS:-6144}"' in startup
-    assert 'LLM_COMPOSER_MAX_FACT_BLOCKS="${LLM_COMPOSER_MAX_FACT_BLOCKS:-50}"' in startup
+    assert 'LLM_COMPOSER_MAX_FACT_BLOCKS="${LLM_COMPOSER_MAX_FACT_BLOCKS:-36}"' in startup
+    assert 'LLM_COMPOSER_CALL_TIMEOUT_SECONDS="${LLM_COMPOSER_CALL_TIMEOUT_SECONDS:-120}"' in startup
     assert '--max-model-len "$MAX_MODEL_LEN"' in startup
     assert '--max-num-seqs "$MAX_NUM_SEQS"' in startup
     assert '--max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS"' in startup

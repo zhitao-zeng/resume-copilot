@@ -246,3 +246,28 @@ def test_reply_lists_bounded_actionable_gaps() -> None:
     assert "2778164751" not in reply
     assert "knowpage" not in reply
     assert "求职意向：语文教师" not in reply
+
+
+def test_reply_prefers_atomic_audit_over_stale_block_preservation_gaps() -> None:
+    quality_report = {
+        "atomic_factuality": {
+            "unrepresented_source_fact_count": 0,
+            "unrepresented_source_facts": [],
+        },
+        "source_preservation": {
+            "unrepresented_item_count": 2,
+            "unrepresented_items": [
+                {"excerpt": "已经通过其他原子事实写入的旧分块"},
+                {"excerpt": "重复的结构性片段"},
+            ],
+        },
+        "fact_grounding": {"unsupported_item_count": 0},
+        "claim_improvement_opportunities": [],
+        "follow_up_questions": [],
+        "job_alignment": {"has_job_description": False},
+    }
+
+    reply = _reply_detail_block([], [], quality_report)
+
+    assert "原始材料中未充分写入" not in reply
+    assert "旧分块" not in reply

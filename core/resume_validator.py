@@ -121,18 +121,28 @@ def _parse_mm_yyyy(text: str) -> Optional[tuple[int, int]]:
     # Try yyyy-mm, yyyy/mm, or Chinese yyyy年m月.  Resume text commonly
     # contains one-digit months, so accepting only 01..12 loses otherwise
     # obvious overlaps before they reach the user confirmation report.
-    m = re.match(r"(19|20)(\d{2})(?:[./-]|年\s*)(0?[1-9]|1[0-2])(?:月)?", text)
+    m = re.match(
+        r"(19|20)(\d{2})(?:[./-]|年\s*)(1[0-2]|0?[1-9])(?!\d)(?:月)?",
+        text,
+    )
     if m:
         year = int(m.group(1) + m.group(2))
         month = int(m.group(3))
         return (year, month)
 
     # Try mm-yyyy or mm/yyyy
-    m = re.match(r"(0?[1-9]|1[0-2])[./-](19|20)(\d{2})", text)
+    m = re.match(r"(1[0-2]|0?[1-9])(?!\d)[./-](19|20)(\d{2})(?!\d)", text)
     if m:
         month = int(m.group(1))
         year = int(m.group(2) + m.group(3))
         return (year, month)
+
+    # Year-only ranges are common in senior resumes. Month precision is not
+    # available, but retaining January as a stable comparison point is more
+    # accurate than dropping the date and then emitting a false sort warning.
+    m = re.match(r"((?:19|20)\d{2})(?!\d)", text)
+    if m:
+        return (int(m.group(1)), 1)
 
     return None
 
@@ -175,6 +185,42 @@ def _parse_period(period: str) -> tuple[Optional[tuple[int, int]], Optional[tupl
         end = _parse_mm_yyyy(end_text)
 
     return (start, end)
+
+
+def _period_has_month_precision(period: str) -> bool:
+    """Return whether a period states at least one calendar month."""
+
+    text = unicodedata.normalize("NFKC", str(period or ""))
+    return bool(re.search(
+        r"(?:(?:19|20)\d{2}\s*(?:[./-]\s*(?:1[0-2]|0?[1-9])|"
+        r"年\s*(?:1[0-2]|0?[1-9])\s*月)|"
+        r"(?:1[0-2]|0?[1-9])\s*[./-]\s*(?:19|20)\d{2})",
+        text,
+    ))
+
+
+def _overlap_is_year_boundary_only(
+    period_i: str,
+    period_j: str,
+    start_i: tuple[int, int],
+    end_i: tuple[int, int],
+    start_j: tuple[int, int],
+    end_j: tuple[int, int],
+) -> bool:
+    """Avoid asserting overlap when coarse year ranges only touch a year.
+
+    ``2012年至2014年`` followed by ``2014年至2015年`` may be perfectly
+    sequential; the source does not state the months.  That uncertainty should
+    not become a user-visible time-conflict claim.
+    """
+
+    return bool(
+        max(start_i, start_j) == min(end_i, end_j)
+        and (
+            not _period_has_month_precision(period_i)
+            or not _period_has_month_precision(period_j)
+        )
+    )
 
 
 def _date_signatures(text: str) -> set[str]:
@@ -348,8 +394,11 @@ def _has_required_experience_fields(exp: dict) -> bool:
     """Check if an experience entry has all required fields."""
     if not isinstance(exp, dict):
         return False
-    required = ["period", "company", "role"]
-    return all(str(exp.get(f, "")).strip() for f in required)
+    return bool(
+        str(exp.get("period", "")).strip()
+        and str(exp.get("company") or exp.get("organization") or "").strip()
+        and str(exp.get("role", "")).strip()
+    )
 
 
 def _has_required_project_fields(proj: dict) -> bool:
@@ -461,13 +510,13 @@ def check_required_fields(
         for idx, edu in enumerate(education):
             if not isinstance(edu, dict):
                 continue
-            for key, label in [("school", "学校名称"), ("degree", "学位"), ("major", "专业名称"), ("period", "时间")]:
+            for key, label in [("school", "学校名称"), ("degree", "学位"), ("major", "专业名称"), ("period", "就读时间")]:
                 value = str(edu.get(key, "")).strip()
                 if is_missing_placeholder(value):
                     missing.append(MissingField(
                         field=f"education[{idx}].{key}",
                         label=label,
-                        reason=f"教育经历第{idx+1}段的{label}为必填项",
+                        reason=f"第{idx+1}段学习记录缺少{label}，请按真实信息补充",
                     ))
         if not str(meta.get("education_level", "")).strip():
             degrees = [
@@ -481,7 +530,7 @@ def check_required_fields(
                 missing.append(MissingField(
                     field="meta.education_level",
                     label="学历",
-                    reason="学历为必填项，请补充最高学历或教育背景中的学位信息",
+                    reason="请补充最高学历或学位信息",
                 ))
 
     # Summary is required.  Allow several complete factual sentences; the
@@ -536,39 +585,55 @@ def check_required_fields(
             reason="工作经历/实习经历/项目经历/校园经历不可全部为空，请至少补充一项经历",
         ))
 
-    # Check each experience has all required fields (period, company, role, bullets)
+    # Report partial records field-by-field. A broad "work experience is
+    # missing" message contradicts a resume that already contains the record
+    # and gives the user no indication of which source fact to add.
     if has_exp:
         for idx, exp in enumerate(experience):
             if not isinstance(exp, dict):
                 continue
-            if not _has_required_experience_fields(exp):
-                missing.append(MissingField(
-                    field=f"experience[{idx}]",
-                    label="工作经历",
-                    reason=f"工作经历第{idx+1}段缺少必填信息（公司名称/岗位/时间），请补充",
-                ))
+            identity_values = {
+                "company": exp.get("company") or exp.get("organization"),
+                "role": exp.get("role"),
+                "period": exp.get("period"),
+            }
+            for key, label in (
+                ("company", "公司或组织名称"),
+                ("role", "岗位名称"),
+                ("period", "任职时间"),
+            ):
+                if is_missing_placeholder(identity_values[key]):
+                    missing.append(MissingField(
+                        field=f"experience[{idx}].{key}",
+                        label=label,
+                        reason=f"第{idx+1}段任职记录缺少{label}，请按原始事实补充",
+                    ))
             if not _has_function_description(exp):
                 missing.append(MissingField(
                     field=f"experience[{idx}].function_description",
                     label="工作职能描述",
-                    reason=f"工作经历第{idx+1}段缺少工作职能描述，请补充具体负责内容",
+                    reason=f"第{idx+1}段任职记录缺少具体负责内容，请补充",
                 ))
             if not _has_result_description(exp):
                 missing.append(MissingField(
                     field=f"experience[{idx}].result_description",
                     label="工作成果描述",
-                    reason=f"工作经历第{idx+1}段缺少工作成果描述，请补充交付结果、业务影响或可验证口径",
+                    reason=f"第{idx+1}段任职记录缺少可核验成果，请补充交付结果或业务影响",
                 ))
 
     # Check projects have all required fields if user provided any
     for idx, proj in enumerate(projects):
-        if isinstance(proj, dict) and proj.get("name", "").strip():
-            if not _has_required_project_fields(proj):
-                missing.append(MissingField(
-                    field=f"projects[{idx}]",
-                    label="项目经历",
-                    reason="如提供了项目经历，则所有信息必填（项目名称/时间），请补充缺失信息",
-                ))
+        if isinstance(proj, dict) and any(
+            _has_any_text(proj.get(key))
+            for key in ("name", "organization", "company", "role", "period", "bullets", "description")
+        ):
+            for key, label in (("name", "项目名称"), ("period", "项目时间")):
+                if is_missing_placeholder(proj.get(key)):
+                    missing.append(MissingField(
+                        field=f"projects[{idx}].{key}",
+                        label=label,
+                        reason=f"第{idx+1}个项目缺少{label}，请按原始事实补充",
+                    ))
             # Independent, course and open-source projects do not necessarily
             # have a company/organization.  Do not turn an optional affiliation
             # into a false missing-field warning.
@@ -576,24 +641,34 @@ def check_required_fields(
                 missing.append(MissingField(
                     field=f"projects[{idx}].description",
                     label="项目描述",
-                    reason=f"项目经历第{idx+1}段缺少项目描述，请补充项目背景和目标",
+                    reason=f"第{idx+1}个项目缺少背景和目标说明，请补充",
                 ))
             if not _has_function_description(proj):
                 missing.append(MissingField(
                     field=f"projects[{idx}].function_description",
                     label="项目工作职能",
-                    reason=f"项目经历第{idx+1}段缺少本人职责或工作内容，请补充",
+                    reason=f"第{idx+1}个项目缺少本人职责或具体行动，请补充",
                 ))
             if not _has_result_description(proj):
                 missing.append(MissingField(
                     field=f"projects[{idx}].result_description",
                     label="项目工作成果",
-                    reason=f"项目经历第{idx+1}段缺少项目成果，请补充结果、影响或验证口径",
+                    reason=f"第{idx+1}个项目缺少可核验成果，请补充结果、影响或验证口径",
                 ))
 
-    for section_name, records, label, identity_fields in (
-        ("campus_experience", campus, "校园经历", ("company", "role", "period")),
-        ("research", research, "科研经历", ("company", "role", "period")),
+    for section_name, records, label, identity_labels in (
+        (
+            "campus_experience",
+            campus,
+            "校园/社会活动",
+            {"company": "组织名称", "role": "担任角色", "period": "活动时间"},
+        ),
+        (
+            "research",
+            research,
+            "科研记录",
+            {"company": "研究机构", "role": "研究主题", "period": "研究时间"},
+        ),
     ):
         for idx, record in enumerate(records):
             if not isinstance(record, dict):
@@ -604,17 +679,17 @@ def check_required_fields(
                 "role": record.get("role") or record.get("topic"),
                 "period": record.get("period"),
             }
-            missing_identity = [key for key in identity_fields if not str(identity_values.get(key) or "").strip()]
-            if missing_identity:
-                missing.append(MissingField(
-                    field=f"{section_name}[{idx}]",
-                    label=label,
-                    reason=f"{label}第{idx+1}段缺少组织/角色或主题/时间，请按原始事实补充",
-                ))
+            for key, field_label in identity_labels.items():
+                if not str(identity_values.get(key) or "").strip():
+                    missing.append(MissingField(
+                        field=f"{section_name}[{idx}].{key}",
+                        label=field_label,
+                        reason=f"第{idx+1}段{label}缺少{field_label}，请按原始事实补充",
+                    ))
             if not _has_function_description(record):
                 missing.append(MissingField(
                     field=f"{section_name}[{idx}].function_description",
-                    label=f"{label}工作内容",
+                    label=f"{label}具体行动",
                     reason=f"{label}第{idx+1}段缺少个人职责或具体行动，请补充",
                 ))
             if not _has_result_description(record):
@@ -670,6 +745,10 @@ def check_time_conflicts(resume_data: dict[str, Any]) -> list[FieldConflict]:
 
                 if start_i and end_j and start_j and end_i:
                     if start_i <= end_j and start_j <= end_i:
+                        if _overlap_is_year_boundary_only(
+                            period_i, period_j, start_i, end_i, start_j, end_j,
+                        ):
+                            continue
                         # Allow overlap when both entries share the same school
                         # (dual degree, minor, concurrent master+phd, etc.)
                         school_i = str(edu_i.get("school", "")).strip()
@@ -704,6 +783,10 @@ def check_time_conflicts(resume_data: dict[str, Any]) -> list[FieldConflict]:
 
                 if start_i and end_j and start_j and end_i:
                     if start_i <= end_j and start_j <= end_i:
+                        if _overlap_is_year_boundary_only(
+                            period_i, period_j, start_i, end_i, start_j, end_j,
+                        ):
+                            continue
                         company_i = str(exp_i.get("company", "")).strip() or f"工作经历{i+1}"
                         company_j = str(exp_j.get("company", "")).strip() or f"工作经历{j+1}"
                         role_i = str(exp_i.get("role", "")).strip()

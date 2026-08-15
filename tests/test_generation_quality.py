@@ -20,6 +20,7 @@ from resume_renderer import (
     render_pdf,
 )
 from resume_validator import check_required_fields
+from resume_generator import _build_generation_direction
 from resume_copilot_pipeline import build_reply_text, _build_targeted_suggestions
 from resume_verifier import (
     _ground_fixed_fields,
@@ -32,6 +33,7 @@ from v2_pipeline import (
     _build_evidence_summary,
     _canonical_to_v1_format,
     _compact_canonical,
+    _clean_target_role,
     _deterministic_verify_draft,
     _empty_profile_framework,
     _needs_optimizer,
@@ -40,6 +42,54 @@ from v2_pipeline import (
     run_v2_pipeline,
 )
 from v2_schemas import CanonicalResume, DraftResume
+
+
+def test_generation_direction_does_not_truncate_normal_english_role():
+    direction = _build_generation_direction("finance", "Senior Finance Professional")
+
+    assert "Senior Finance Professional" in direction
+    assert "Senior Finance Profe相关岗位" not in direction
+
+
+def test_instruction_text_is_not_exposed_as_target_role_or_direction():
+    assert _clean_target_role("帮我优化这份简历") == ""
+    assert _clean_target_role("下面是JD") == ""
+    direction = _build_generation_direction("teacher", "请按照下面JD优化简历")
+    assert "请按照下面JD优化简历" not in direction
+    assert "教育类岗位" in direction
+
+
+def test_evidence_summary_does_not_repeat_existing_bullet_context():
+    resume = CanonicalResume.model_validate({
+        "experience": [{
+            "organization": "某银行",
+            "role": "客户经理",
+            "bullets": ["在某银行工作期间，负责客户沟通并整理需求清单"],
+        }],
+    })
+
+    summary = _build_evidence_summary(resume)
+
+    assert "在某银行担任客户经理期间，在某银行" not in summary
+    assert "在某银行工作期间，负责客户沟通" in summary
+
+
+def test_professional_association_employment_is_not_reclassified_as_activity():
+    parsed = {
+        "experience": [{
+            "organization": "体育网络协会",
+            "role": "财务与行政主管",
+            "period": "2007年至2010年",
+            "bullets": ["设计财务策略并管理组织现金流"],
+        }],
+        "activities": [],
+        "research": [],
+    }
+
+    _reclassify_non_work(parsed, "专业经验\n体育网络协会\n财务与行政主管")
+
+    assert parsed["experience"][0]["role"] == "财务与行政主管"
+    assert parsed["activities"] == []
 
 
 def test_mixed_jd_url_preserves_inline_text():
@@ -279,6 +329,37 @@ def test_reply_lists_every_missing_field_and_gives_targeted_advice():
     )
     assert "当前简历缺少对应证据" in empty_profile_advice[0]
     assert all("职位详情" not in item for item in empty_profile_advice)
+
+
+def test_reply_groups_repeated_record_gaps_but_keeps_total_count():
+    missing = [
+        {
+            "field": f"experience[{index}].organization",
+            "label": "公司或组织名称",
+            "reason": f"第{index + 1}段任职记录缺少公司或组织名称",
+        }
+        for index in range(3)
+    ] + [{
+        "field": "meta.phone",
+        "label": "联系电话",
+        "reason": "联系电话为必填项，请在简历中补充",
+    }]
+
+    reply = build_reply_text(
+        scenario="scenario2",
+        industry="other",
+        user_stage="experienced",
+        missing_fields=missing,
+        conflicts=[],
+        ocr_warnings=[],
+        direction="",
+        score_total=0,
+    )
+
+    assert "缺失或待补充信息（4项）" in reply
+    assert "公司或组织名称（第1、2、3段工作/实习）" in reply
+    assert reply.count("公司或组织名称（第") == 1
+    assert reply.index("联系电话") < reply.index("公司或组织名称")
 
 
 def test_accepted_bullet_rewrite_is_exposed_in_changes_and_reply():
@@ -1390,7 +1471,13 @@ def test_optimizer_keeps_unchanged_sibling_inside_an_atomic_grouped_record():
         outcome = optimize_resume_with_provenance(resume, "产品经理")
 
     assert outcome.resume.experience[0].bullets == [combined, original_bullets[1]]
-    assert len(outcome.trusted_rewrites) == 2
+    # The unchanged sibling binds directly to source and does not need a
+    # synthetic trusted-rewrite entry.
+    assert outcome.trusted_rewrites == {
+        "experience[0].bullets[0]": "\n".join(
+            [original_bullets[0], original_bullets[2]]
+        ),
+    }
 
 
 def test_optimizer_keeps_safe_group_when_sibling_semantic_review_fails():
@@ -1450,6 +1537,40 @@ def test_optimizer_keeps_safe_group_when_sibling_semantic_review_fails():
     assert missing == []
 
 
+def test_optimizer_keeps_safe_group_when_sibling_fails_hard_fact_gate():
+    from resume_optimizer import optimize_resume_with_provenance
+
+    original = [
+        "负责梳理客户需求",
+        "通过10次用户访谈收集反馈并输出需求清单",
+        "SQL",
+    ]
+    resume = CanonicalResume.model_validate({
+        "experience": [{"bullets": original}],
+    })
+    combined = "负责通过10次用户访谈收集反馈，梳理客户需求并输出需求清单"
+    response = json.dumps({
+        "experience": [{
+            "index": 0,
+            "bullets": [
+                {"text": combined, "source_indices": [0, 1]},
+                {"text": "使用SQL完成数据分析", "source_indices": [2]},
+            ],
+        }],
+    }, ensure_ascii=False)
+    with patch("resume_optimizer.llm_enabled", return_value=True), patch(
+        "resume_optimizer.call_llm_text", return_value=response,
+    ), patch(
+        "resume_optimizer.review_entailment_batch", return_value=[True],
+    ):
+        outcome = optimize_resume_with_provenance(resume)
+
+    assert outcome.resume.experience[0].bullets == [combined, "SQL"]
+    assert outcome.trusted_rewrites == {
+        "experience[0].bullets[0]": "\n".join(original[:2]),
+    }
+
+
 def test_optimizer_payload_exposes_source_present_star_dimensions_only():
     from resume_optimizer import _build_optimizer_batches
 
@@ -1468,6 +1589,36 @@ def test_optimizer_payload_exposes_source_present_star_dimensions_only():
     assert "deliverable" in record["evidence_plan"][0]["source_dimensions"]
     assert record["evidence_plan"][1]["source_dimensions"] == ["method", "result"]
     assert record["evidence_plan"][0]["fact_ids"] == []
+
+
+def test_compaction_removes_skill_only_duplicate_from_narrative_record():
+    resume = CanonicalResume.model_validate({
+        "experience": [{
+            "role": "前端开发",
+            "bullets": ["HTML5", "负责开发搜索应用用户界面"],
+        }],
+        "skills": {"items": [{"name": "HTML5", "category": "language"}]},
+    })
+
+    compacted = _compact_canonical(resume)
+
+    assert compacted.experience[0].bullets == ["负责开发搜索应用用户界面"]
+    assert [item.name for item in compacted.skills.items] == ["HTML5"]
+
+
+def test_compaction_drops_skill_concatenated_with_dated_project_header():
+    resume = CanonicalResume.model_validate({
+        "experience": [{"role": "实习生", "bullets": ["Git"]}],
+        "skills": {"items": [{
+            "name": "GitAI助手机器人 2023年3月 - 4月",
+            "category": "tool",
+        }]},
+    })
+
+    compacted = _compact_canonical(resume)
+
+    assert compacted.skills.items == []
+    assert compacted.experience[0].bullets == ["Git"]
 
 
 def test_optimizer_payload_carries_only_each_bullets_bound_fact_ids():
@@ -1498,6 +1649,94 @@ def test_optimizer_payload_carries_only_each_bullets_bound_fact_ids():
     second = record["evidence_plan"][1]["fact_ids"]
     assert first and second
     assert set(first).isdisjoint(second)
+
+
+def test_narrative_planner_selects_only_bounded_multi_clause_records():
+    from resume_optimizer import select_narrative_record_keys
+
+    resume = CanonicalResume.model_validate({
+        "experience": [
+            {
+                "organization": "甲公司",
+                "bullets": [
+                    "负责梳理客户需求",
+                    "通过10次访谈收集反馈",
+                    "输出需求优先级清单",
+                ],
+            },
+            {
+                "organization": "乙公司",
+                "bullets": ["负责一项已经完整描述的工作"],
+            },
+        ],
+        "projects": [
+            {
+                "name": "项目A",
+                "bullets": ["参与现场执行", "整理问题记录"],
+            },
+        ],
+    })
+
+    selected = select_narrative_record_keys(
+        resume,
+        max_records=1,
+        max_bullets=3,
+    )
+
+    assert selected == {("experience", 0)}
+
+
+def test_optimizer_batches_include_only_planner_selected_records():
+    from resume_optimizer import _build_optimizer_batches
+
+    resume = CanonicalResume.model_validate({
+        "experience": [
+            {"bullets": ["负责需求分析", "输出需求清单"]},
+            {"bullets": ["负责活动执行", "整理问题记录"]},
+        ],
+        "projects": [{"bullets": ["参与测试", "记录测试结果"]}],
+    })
+
+    batches = _build_optimizer_batches(
+        resume,
+        record_keys={("experience", 1)},
+    )
+
+    records = [record for batch in batches for record in batch["experience"]]
+    assert [record["index"] for record in records] == [1]
+    assert all(not batch["projects"] for batch in batches)
+
+
+def test_optimizer_changes_only_planner_selected_record():
+    from resume_optimizer import optimize_resume_with_provenance
+
+    first = ["负责梳理客户需求", "输出需求清单"]
+    second = ["参与活动执行", "整理问题记录"]
+    resume = CanonicalResume.model_validate({
+        "experience": [
+            {"bullets": first},
+            {"bullets": second},
+        ],
+    })
+    combined = "负责梳理客户需求并输出需求清单"
+    response = json.dumps({
+        "experience": [{
+            "index": 0,
+            "bullets": [{"text": combined, "source_indices": [0, 1]}],
+        }],
+    }, ensure_ascii=False)
+    with patch("resume_optimizer.llm_enabled", return_value=True), patch(
+        "resume_optimizer.call_llm_text", return_value=response,
+    ), patch(
+        "resume_optimizer.review_entailment_batch", return_value=[True],
+    ):
+        outcome = optimize_resume_with_provenance(
+            resume,
+            record_keys={("experience", 0)},
+        )
+
+    assert outcome.resume.experience[0].bullets == [combined]
+    assert outcome.resume.experience[1].bullets == second
 
 
 def test_optimizer_reverts_high_risk_rewrite_when_semantic_review_rejects():

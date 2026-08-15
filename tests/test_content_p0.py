@@ -10,7 +10,12 @@ import pytest
 from docx import Document
 from docx.shared import Inches
 
-from evidence_binding import bind_resume_evidence, enforce_resume_evidence, measure_source_coverage
+from evidence_binding import (
+    _flexible_literal,
+    bind_resume_evidence,
+    enforce_resume_evidence,
+    measure_source_coverage,
+)
 from resume_composer import compose_from_query, compose_resume, compose_resume_with_outcome
 from resume_copilot_pipeline import PipelineContext, _build_llm_reply, stage_classify
 from resume_copilot_service import _collect_content_conflicts
@@ -26,6 +31,8 @@ from v2_pipeline import (
     _expand_optimizer_provenance,
     _ground_bullets,
     _ground_optimizer_output,
+    _needs_optimizer,
+    _quality_v2_presentation_cleanup,
     _recover_grounded_source_structure,
     _recover_missing_record_facts,
     _record_source_owners,
@@ -43,6 +50,30 @@ def _doc_text(path) -> str:
         for row in table.rows:
             values.extend(cell.text for cell in row.cells)
     return "\n".join(values)
+
+
+def test_quality_v2_cleanup_drops_duration_metadata_and_repairs_empty_metric_clause():
+    resume = CanonicalResume.model_validate({
+        "experience": [{
+            "organization": "某制造企业",
+            "role": "生产专员",
+            "period": "2022年至今",
+            "bullets": [
+                "14个月",
+                "领导小团队实施设备升级，实现了%的效率提升",
+                "通过流程优化将处理时长缩短15%",
+                "7个月内完成系统迁移",
+            ],
+        }],
+    })
+
+    cleaned = _quality_v2_presentation_cleanup(resume)
+
+    assert cleaned.experience[0].bullets == [
+        "领导小团队实施设备升级",
+        "通过流程优化将处理时长缩短15%",
+        "7个月内完成系统迁移",
+    ]
 
 
 def test_jd_only_request_reaches_framework_without_query_or_cv():
@@ -192,6 +223,41 @@ def test_organization_field_requires_organization_grammar(
     grounded, _, _ = enforce_resume_evidence(resume, source)
 
     assert getattr(grounded, section)[0].organization == expected_organization
+
+
+@pytest.mark.parametrize(
+    ("header", "organization", "role"),
+    [
+        ("XX实验小学语文老师", "XX实验小学", "语文老师"),
+        ("XX教育培训机构助教", "XX教育培训机构", "助教"),
+        ("华创新能源有限公司电池工艺实习生", "华创新能源有限公司", "电池工艺实习生"),
+        ("辽宁省人民医院住院医师", "辽宁省人民医院", "住院医师"),
+    ],
+)
+def test_compact_structured_header_binds_attested_organization(
+    header: str,
+    organization: str,
+    role: str,
+):
+    source = build_source_bundle(
+        f"工作经历\n{header}\n2022.01-2024.01\n负责日常工作并完成记录。",
+        "",
+        "",
+    )
+    resume = CanonicalResume.model_validate({
+        "experience": [{
+            "organization": organization,
+            "role": role,
+            "period": "2022.01-2024.01",
+            "bullets": ["负责日常工作并完成记录。"],
+        }],
+    })
+
+    grounded, _, removed = enforce_resume_evidence(resume, source)
+
+    assert grounded.experience[0].organization == organization
+    assert grounded.experience[0].role == role
+    assert removed == []
 
 
 @pytest.mark.parametrize(
@@ -450,6 +516,16 @@ def test_leading_body_phrase_cannot_bind_as_role_across_industries():
         assert not any(binding.path.endswith(".role") for binding in wrong_bindings)
 
 
+def test_flexible_evidence_literal_collapses_aligned_column_whitespace():
+    literal = _flexible_literal(
+        "RETAIL HUB INTERNATIONAL                                        2011年"
+    )
+
+    assert r"\ " not in literal
+    assert "\\s*\\s*" not in literal
+    assert literal.startswith(r"R\s*E\s*T\s*A\s*I\s*L")
+
+
 def test_compact_role_before_duties_survives_with_identity_context():
     source = build_source_bundle(
         "工作经历\n某科技公司 产品经理，负责需求分析与版本规划",
@@ -474,6 +550,23 @@ def test_compound_tool_list_remains_one_coherent_bullet():
     source = "负责开发落地工作，熟练运用 TensorFlow、Caffe、Torch 等机器学习框架"
 
     assert _split_grounded_fact_bullet(source) == [source]
+
+
+def test_audited_long_source_scaffold_does_not_repeat_llm_wording_pass():
+    resume = CanonicalResume.model_validate({
+        "experience": [{
+            "role": "销售主管",
+            "bullets": ["负责ERP销售策略并管理销售团队"],
+        }],
+    })
+
+    assert _needs_optimizer(resume)
+    assert not _needs_optimizer(resume, audited_source_scaffold=True)
+    assert _needs_optimizer(
+        resume,
+        audited_source_scaffold=True,
+        narrative_record_keys={("experience", 0)},
+    )
 
 
 def test_internal_raw_sections_are_not_public_resume_sections(tmp_path):
@@ -1202,6 +1295,50 @@ def test_grounded_structure_recovers_education_skills_certificates_and_awards():
     assert removed == []
 
 
+def test_quality_v2_structure_recovery_fills_fields_without_importing_content(
+    monkeypatch,
+):
+    monkeypatch.setenv("PIPELINE_PROFILE", "quality_v2")
+    source = build_source_bundle(
+        "工作经历\n甲公司｜产品经理｜2022.01-2024.01\n"
+        "负责需求分析。\n输出需求清单。\n"
+        "专业技能\nPython\n荣誉奖项\n优秀员工",
+        "",
+        "",
+    )
+    current = CanonicalResume.model_validate({
+        "experience": [{
+            "organization": "",
+            "role": "产品经理",
+            "period": "2022.01-2024.01",
+            "bullets": ["负责需求分析。"],
+        }],
+    })
+    fallback = CanonicalResume.model_validate({
+        "experience": [{
+            "organization": "甲公司",
+            "role": "产品经理",
+            "period": "2022.01-2024.01",
+            "bullets": ["负责需求分析。", "输出需求清单。"],
+        }],
+        "skills": {"items": [{"name": "Python", "category": "language"}]},
+        "awards": ["优秀员工"],
+    })
+
+    recovered, stats = _recover_grounded_source_structure(
+        current, fallback, source,
+    )
+
+    assert recovered.experience[0].organization == "甲公司"
+    assert recovered.experience[0].bullets == ["负责需求分析。"]
+    assert recovered.skills.items == []
+    assert recovered.awards == []
+    assert stats.filled_fields == 1
+    assert stats.appended_bullets == 0
+    assert stats.appended_values == 0
+    assert stats.appended_records == 0
+
+
 def test_fact_ledger_does_not_turn_a_short_role_header_into_a_bullet():
     source = build_source_bundle(
         "项目经历\n增长项目\n负责人\n负责活动策划与执行。",
@@ -1240,6 +1377,239 @@ def test_grounded_original_summary_keeps_unique_fact_and_stays_complete():
     assert "8年三甲医院临床经验" in compacted.summary
     assert len(compacted.summary) <= 260
     assert compacted.summary.endswith("。")
+
+
+def test_compaction_merges_same_period_duplicate_recovery_rows():
+    resume = CanonicalResume.model_validate({
+        "experience": [
+            {
+                "organization": "",
+                "role": "助理财务经理",
+                "period": "2018年3月 - 2022年5月",
+                "bullets": ["制定并实施内部控制框架和会计政策"],
+            },
+            {
+                "organization": "",
+                "role": "财务经理",
+                "period": "2018年3月-2022年5月",
+                "bullets": [
+                    "制定并实施内部控制框架和会计政策。",
+                    "管理短期和长期财务规划及预算编制。",
+                ],
+            },
+        ],
+    })
+
+    compacted = _compact_canonical(resume)
+
+    assert len(compacted.experience) == 1
+    assert compacted.experience[0].role == "助理财务经理"
+    assert len(compacted.experience[0].bullets) == 2
+
+
+def test_compaction_keeps_distinct_concurrent_roles_separate():
+    resume = CanonicalResume.model_validate({
+        "experience": [
+            {
+                "organization": "甲医院",
+                "role": "主治医师",
+                "period": "2020年至2022年",
+                "bullets": ["负责门诊诊疗"],
+            },
+            {
+                "organization": "乙大学",
+                "role": "讲师",
+                "period": "2020年至2022年",
+                "bullets": ["承担临床课程教学"],
+            },
+        ],
+    })
+
+    assert len(_compact_canonical(resume).experience) == 2
+
+
+def test_compaction_prefers_complete_certification_and_drops_year_fragment():
+    resume = CanonicalResume.model_validate({
+        "certifications": [
+            "监管合规证书 - 2011",
+            "- 监管合规",
+            "- 2011",
+        ],
+    })
+
+    assert _compact_canonical(resume).certifications == ["监管合规证书 - 2011"]
+
+
+@pytest.mark.parametrize(
+    "period",
+    ["209年-至今", "2609年3月-至今", "2014年16月-至今", "年月-年月"],
+)
+def test_compaction_clears_impossible_non_education_periods(period):
+    resume = CanonicalResume.model_validate({
+        "experience": [{
+            "organization": "甲公司",
+            "role": "工程师",
+            "period": period,
+            "bullets": ["负责系统开发"],
+        }],
+    })
+
+    compacted = _compact_canonical(resume)
+
+    assert len(compacted.experience) == 1
+    assert compacted.experience[0].period == ""
+    assert compacted.experience[0].organization == "甲公司"
+    assert compacted.experience[0].bullets == ["负责系统开发"]
+
+
+def test_compaction_keeps_valid_non_education_periods_and_education_future_date():
+    resume = CanonicalResume.model_validate({
+        "experience": [{
+            "organization": "甲公司",
+            "role": "工程师",
+            "period": "2020.03-2024.12",
+            "bullets": ["负责系统开发"],
+        }],
+        "education": [{
+            "school": "乙大学",
+            "degree": "本科",
+            "period": "预计2030年毕业",
+        }],
+    })
+
+    compacted = _compact_canonical(resume)
+
+    assert compacted.experience[0].period == "2020.03-2024.12"
+    assert compacted.education[0].period == "预计2030年毕业"
+
+
+def test_compaction_reclassifies_metric_fragment_role_as_content():
+    resume = CanonicalResume.model_validate({
+        "experience": [{
+            "organization": "甲公司",
+            "role": "实现10%的效率提升",
+            "period": "2020年至2022年",
+            "bullets": [],
+        }],
+    })
+
+    compacted = _compact_canonical(resume)
+
+    assert compacted.experience[0].role == ""
+    assert compacted.experience[0].bullets == ["实现10%的效率提升"]
+
+
+def test_compaction_reclassifies_narrative_identity_fragments_as_content():
+    resume = CanonicalResume.model_validate({
+        "experience": [{
+            "organization": "从欧洲、中东及非洲区客户经理晋升，取得公司最高留存率",
+            "role": "确保产品留存无损失",
+            "period": "2020年至2022年",
+            "bullets": [],
+        }],
+    })
+
+    compacted = _compact_canonical(resume)
+
+    assert compacted.experience[0].organization == ""
+    assert compacted.experience[0].role == ""
+    assert compacted.experience[0].bullets == ["确保产品留存无损失"]
+
+
+def test_compaction_reclassifies_relational_duty_sentence_as_content():
+    resume = CanonicalResume.model_validate({
+        "experience": [{
+            "organization": "",
+            "role": "与市场数据部门的主要联络人，确保产品留存无损失",
+            "period": "2020年至2022年",
+            "bullets": [],
+        }],
+    })
+
+    compacted = _compact_canonical(resume)
+
+    assert compacted.experience[0].role == ""
+    assert compacted.experience[0].bullets == [
+        "与市场数据部门的主要联络人，确保产品留存无损失",
+    ]
+
+
+def test_compaction_drops_generic_name_and_invalid_year_credential_fragment():
+    resume = CanonicalResume.model_validate({
+        "meta": {"name": "个人"},
+        "certifications": ["实用护理师资格证书", "（2664)"],
+    })
+
+    compacted = _compact_canonical(resume)
+
+    assert compacted.meta.name == ""
+    assert compacted.certifications == ["实用护理师资格证书"]
+
+
+def test_compaction_prunes_recovered_highlight_duplicates_but_keeps_unique_fact():
+    resume = CanonicalResume.model_validate({
+        "experience": [{
+            "organization": "甲公司",
+            "role": "产品经理",
+            "bullets": ["负责需求分析", "推动版本上线"],
+        }],
+        "skills": {"items": [{"name": "招聘、培养和激励高绩效团队"}]},
+        "additional_sections": {"经历亮点": [
+            "负责需求分析；推动版本上线",
+            "撸长招聘、培养和激励高绩效团队",
+            "此前担任：副总裁，投资策略（收入1.1亿美元>副总裁，全球客户管理",
+            "与关键决策者培养关系，顾问及导师 年月-年月",
+            "指数与分析总监。负责：",
+            "独立建立跨区域合作机制",
+        ]},
+    })
+
+    compacted = _compact_canonical(resume)
+
+    assert compacted.additional_sections == {
+        "经历亮点": ["独立建立跨区域合作机制"],
+    }
+
+
+def test_work_experience_cannot_bind_to_calendar_year_suffix():
+    source = build_source_bundle(
+        "教育背景\n某大学｜2023年9月-至今\n软件工程硕士",
+        "",
+        "",
+    )
+    resume = CanonicalResume.model_validate({
+        "meta": {"work_experience": "3年"},
+        "education": [{
+            "school": "某大学",
+            "degree": "软件工程硕士",
+            "period": "2023年9月-至今",
+        }],
+    })
+
+    gated, _bindings, removed = enforce_resume_evidence(resume, source)
+
+    assert gated.meta.work_experience == ""
+    assert "meta.work_experience" in removed
+
+
+def test_placeholder_company_token_cannot_support_residual_organization():
+    source = build_source_bundle(
+        "工作经历\n[公司] Technologies, [国家]\n4G网络顾问\n2018年至2019年\n负责网络优化",
+        "",
+        "",
+    )
+    resume = CanonicalResume.model_validate({
+        "experience": [{
+            "organization": "Technologies",
+            "role": "4G网络顾问",
+            "period": "2018年至2019年",
+            "bullets": ["负责网络优化"],
+        }],
+    })
+
+    gated, _bindings, _removed = enforce_resume_evidence(resume, source)
+
+    assert gated.experience[0].organization == ""
 
 
 def test_summary_formats_machine_role_slug_and_bare_seniority_for_people():

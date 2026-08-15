@@ -18,11 +18,11 @@ from v2_schemas import CanonicalResume, EvidenceBinding, FactUnit, SourceBlock, 
 _SOURCE_HEADINGS = {
     "个人信息", "基本信息", "联系方式", "个人总结", "个人简介", "职业概述", "自我评价",
     "教育经历", "教育背景", "学历信息",
-    "工作经历", "实习经历", "任职经历", "职业经历", "科研经历", "研究经历", "实验室经历",
-    "项目经历", "项目经验", "课程项目", "个人项目", "开源项目", "校园经历", "社团经历", "组织经历",
+    "工作经历", "实习经历", "任职经历", "职业经历", "专业经历", "科研经历", "研究经历", "实验室经历",
+    "项目经历", "项目经验", "课程项目", "个人项目", "开源项目", "学术项目与研讨会", "校园经历", "社团经历", "组织经历",
     "志愿经历", "社会实践", "学生工作", "专业技能", "技能清单", "技术栈", "工具", "语言能力",
     "荣誉奖项", "荣誉与奖项", "获奖经历", "奖项", "论文", "论文发表", "论文成果", "学术成果",
-    "出版物", "专利", "专利成果", "证书", "证书与资质", "职业资格", "执业资格", "执照",
+    "出版物", "专利", "专利成果", "证书", "证书与资质", "认证资质", "职业资格", "执业资格", "执照",
     "培训经历", "进修经历", "教学经历", "授课经历", "培养经历",
     "学术会议", "会议经历", "专业会员", "专业组织", "专著", "作品集", "作品经历",
 }
@@ -64,6 +64,16 @@ def _date_signature(value: str) -> tuple[str, ...]:
         month = match.group("month1") or match.group("month2")
         signature.append(f"{year}{int(month):02d}")
     return tuple(signature)
+
+
+_CALENDAR_DATE = re.compile(
+    r"(?<!\d)(?:19|20)\d{2}(?:\s*年|[./-](?:0?[1-9]|1[0-2]))?(?!\d)"
+)
+_TRAILING_FIELD_DATE = re.compile(
+    r"^(?P<label>.+?\S)(?:\s*[（(]\s*|\s*[-–—]\s*|\s+)"
+    r"(?P<date>(?:19|20)\d{2}(?:\s*年(?:\s*(?:0?[1-9]|1[0-2])\s*月?)?)?)"
+    r"(?:\s*[)）])?\s*$"
+)
 
 
 def _grouped_date_matches(
@@ -273,10 +283,53 @@ def _bind_exact_compound(
     """
 
     parts = atomize_claim_text(value)
+    scoped_blocks = blocks
+    explicit_record_list = re.fullmatch(
+        r"(?P<label>技术栈|技术)\s*[:：]\s*(?P<values>.+)",
+        str(value or "").strip(),
+        re.IGNORECASE,
+    )
+    if explicit_record_list:
+        list_values = [
+            item.strip()
+            for item in re.split(r"\s*[•·▪◦]\s*", explicit_record_list.group("values"))
+            if item.strip()
+        ]
+        if len(list_values) >= 2:
+            parts = [
+                f"{explicit_record_list.group('label')}：{list_values[0]}",
+                *list_values[1:],
+            ]
+            head_binding = _bind(
+                path,
+                parts[0],
+                blocks,
+                minimum=max(0.58, minimum),
+            )
+            block_by_id = {block.block_id: block for block in blocks}
+            head_block = (
+                block_by_id.get(head_binding.block_id)
+                if head_binding is not None else None
+            )
+            if head_block is None or not head_block.record_id:
+                return None
+            scoped_blocks = [
+                block
+                for block in blocks
+                if block.record_id == head_block.record_id
+                and block.source_type == head_block.source_type
+                and block.section_hint == head_block.section_hint
+            ]
+    trailing_date_split = False
+    if len(parts) < 2:
+        trailing = _TRAILING_FIELD_DATE.fullmatch(str(value or "").strip())
+        if trailing:
+            parts = [trailing.group("label"), trailing.group("date")]
+            trailing_date_split = True
     if len(parts) < 2:
         return None
     resolved = [
-        _bind(path, part, blocks, minimum=max(0.58, minimum))
+        _bind(path, part, scoped_blocks, minimum=max(0.58, minimum))
         for part in parts
     ]
     if not all(item is not None for item in resolved):
@@ -288,6 +341,19 @@ def _bind_exact_compound(
     ):
         return None
     block_by_id = {block.block_id: block for block in blocks}
+    if trailing_date_split:
+        # A credential/title and its detached year must be adjacent source
+        # rows.  A matching year elsewhere in the resume is not evidence that
+        # the two facts belong together.
+        order = {block.block_id: index for index, block in enumerate(blocks)}
+        positions = [
+            order[block_id]
+            for item in bindings
+            for block_id in (item.block_ids or [item.block_id])
+            if block_id in order
+        ]
+        if not positions or max(positions) - min(positions) > 1:
+            return None
     records = {
         block_by_id[block_id].record_id
         for item in bindings
@@ -373,6 +439,10 @@ _RELATION_ONLY_ROLE = re.compile(
 _ORGANIZATION_FIELD_LABEL = re.compile(
     r"(?:公司|单位|组织|机构|学校|院校|所属公司)\s*[:：]"
 )
+_ORGANIZATION_PLACEHOLDER = re.compile(
+    r"\[(?:公司|单位|组织|机构|学校|院校|大学)\]",
+    re.IGNORECASE,
+)
 _ORGANIZATION_RELATION = re.compile(
     r"(?:就职于|任职于|供职于|受雇于|在|于)\s*"
 )
@@ -382,14 +452,36 @@ _NON_ORGANIZATION_VALUE = re.compile(
 _NON_ORGANIZATION_PREFIX = re.compile(
     r"(?:做过?|从事|担任|参与|负责|有|具备|完成|开展)\s*$"
 )
+_EXPLICIT_WORK_EXPERIENCE = re.compile(
+    r"(?:工作|从业|职业|专业|相关|项目|临床|销售|护理)?经验\s*[:：]?\s*"
+    r"(?:超过|至少|约|近)?(?:\d+(?:\.\d+)?|[一二三四五六七八九十两]+)\s*"
+    r"(?:年|个月|月)|"
+    r"(?:拥有|具备|累计|超过|至少|约|近)?\s*"
+    r"(?:\d+(?:\.\d+)?|[一二三四五六七八九十两]+)\s*"
+    r"(?:年|个月|月)(?:以上)?[^。；;\n]{0,20}(?:工作|从业|职业|专业|相关|项目|临床|销售|护理)?经验",
+    re.IGNORECASE,
+)
 _ACTIVITY_ORGANIZATION_END = re.compile(
     r"(?:协会|学会|学生会|社团|委员会|志愿队|服务队|部门|部|团队|中心|"
     r"医院|学校|学院|大学)$"
 )
+_STRUCTURED_ORGANIZATION_END = re.compile(
+    r"(?:幼儿园|研究院|实验室|委员会|工作室|基金会|事务所|"
+    r"有限公司|公司|企业|集团|机构|中心|部门|协会|学会|社团|律所|"
+    r"银行|医院|学校|中学|小学|学院|大学|政府|团队|基地|单位)$"
+)
 
 
 def _flexible_literal(value: str) -> str:
-    return r"\s*".join(re.escape(char) for char in str(value or "").strip())
+    # OCR/native extractors may insert or remove whitespace between any two
+    # visible characters.  Remove source whitespace before adding the flexible
+    # separators.  Keeping a literal space token between two ``\s*`` tokens
+    # creates overlapping quantifiers (``\s*\ \s*``); a long aligned column
+    # can then trigger catastrophic regex backtracking during every evidence
+    # bind.  The compact form has the same matching semantics without the
+    # ambiguity.
+    compact = re.sub(r"\s+", "", str(value or "").strip())
+    return r"\s*".join(re.escape(char) for char in compact)
 
 
 def _role_block_is_valid(block: SourceBlock, value: str) -> bool:
@@ -494,7 +586,12 @@ def _organization_block_is_valid(block: SourceBlock, value: str) -> bool:
 
     text = str(block.text or "").strip()
     organization = str(value or "").strip()
-    if not text or not organization or _NON_ORGANIZATION_VALUE.search(organization):
+    if (
+        not text
+        or not organization
+        or _NON_ORGANIZATION_VALUE.search(organization)
+        or _ORGANIZATION_PLACEHOLDER.search(text)
+    ):
         return False
     literal = _flexible_literal(organization)
     occurrences = list(re.finditer(literal, text, re.IGNORECASE))
@@ -516,6 +613,7 @@ def _organization_block_is_valid(block: SourceBlock, value: str) -> bool:
         return True
 
     duty = _RECORD_DUTY_START.search(text)
+    organization_shape = organization.rstrip(")）").rstrip()
     for occurrence in occurrences:
         prefix = text[:occurrence.start()].rstrip()
         suffix = text[occurrence.end():].lstrip()
@@ -529,6 +627,47 @@ def _organization_block_is_valid(block: SourceBlock, value: str) -> bool:
         # organization must precede the first duty clause; otherwise a company
         # mentioned in a result/bullet cannot become the current employer.
         if _date_signature(prefix) and (duty is None or occurrence.start() < duty.start()):
+            return True
+        if (
+            block.section_hint in {"experience", "activities", "projects", "research"}
+            and block.record_id
+            and occurrence.start() == 0
+            and not _looks_like_record_body(text)
+            and _STRUCTURED_ORGANIZATION_END.search(organization_shape)
+            and _normalize(
+                _STRUCTURED_ORGANIZATION_END.sub("", organization_shape)
+            )
+        ):
+            # Compact record headers frequently concatenate an employer and
+            # title without a delimiter, for example ``甲医院住院医师`` or
+            # ``XX实验小学语文老师``.  The source adapter has already assigned
+            # such a line to one record, so an organization-shaped prefix is
+            # structural identity evidence.  Requiring a non-empty modifier
+            # before the organization suffix keeps generic duty/project text
+            # such as ``小学语文试讲`` from manufacturing an employer.
+            return True
+        if (
+            block.section_hint in {"experience", "activities", "projects", "research"}
+            and block.record_id
+            and occurrence.start() == 0
+            and not _looks_like_record_body(text)
+            and _CALENDAR_DATE.search(suffix)
+            and len(_normalize(organization)) >= 2
+        ):
+            # Brand-only employers need not end in ``公司/集团``.  A literal
+            # prefix followed by a source date inside a parser-owned record is
+            # still strong organization grammar and does not rely on a title
+            # dictionary.
+            return True
+        if (
+            block.section_hint == "activities"
+            and block.record_id
+            and occurrence.start() <= 3
+            and _ACTIVITY_ORGANIZATION_END.search(organization_shape)
+            and _CALENDAR_DATE.search(text)
+        ):
+            # A bullet-style volunteer header such as ``财务委员会成员，...，
+            # 2016年至今`` carries explicit organization and date structure.
             return True
         if (
             block.section_hint == "activities"
@@ -562,6 +701,35 @@ def _bind_organization(
         if binding is not None:
             return binding
     return None
+
+
+def _bind_work_experience(
+    path: str,
+    value: str,
+    blocks: list[SourceBlock],
+    *,
+    minimum: float = 0.65,
+) -> EvidenceBinding | None:
+    """Bind seniority only to an explicit source duration statement.
+
+    A derived value such as ``3年`` must not bind to the trailing characters
+    of ``2023年``.  Date ranges remain evidence for individual record periods,
+    but not for a computed total-career duration unless the candidate states
+    that duration explicitly.
+    """
+
+    explicit = [
+        block for block in blocks
+        if _EXPLICIT_WORK_EXPERIENCE.search(str(block.text or ""))
+    ]
+    if not explicit:
+        return None
+    return _bind_with_provenance(
+        path,
+        value,
+        explicit,
+        minimum=minimum,
+    )
 
 
 def _record_scope_key(
@@ -977,16 +1145,25 @@ def bind_resume_evidence(
     blocks = candidate_blocks(source)
     bindings: list[EvidenceBinding] = []
 
-    def add(path: str, value: str, minimum: float = 0.22) -> None:
+    def add(
+        path: str,
+        value: str,
+        minimum: float = 0.22,
+        *,
+        candidate_pool: list[SourceBlock] | None = None,
+    ) -> None:
+        active_blocks = candidate_pool if candidate_pool is not None else blocks
         binding = (
-            _bind_role(path, value, blocks, minimum=minimum)
+            _bind_role(path, value, active_blocks, minimum=minimum)
             if path.endswith(".role")
-            else _bind_organization(path, value, blocks, minimum=minimum)
+            else _bind_organization(path, value, active_blocks, minimum=minimum)
             if path.endswith(".organization")
+            else _bind_work_experience(path, value, active_blocks, minimum=minimum)
+            if path == "meta.work_experience"
             else _bind_with_provenance(
                 path,
                 value,
-                blocks,
+                active_blocks,
                 minimum=minimum,
                 trusted_rewrites=trusted_rewrites,
             )
@@ -1010,9 +1187,22 @@ def bind_resume_evidence(
         "projects": ("name", "organization", "role", "period"),
     }
     for section, fields in section_fields.items():
+        # Identity fields must prefer evidence from their own semantic
+        # section.  A bare education year such as ``2000`` otherwise binds to
+        # an employment range containing the same year and corrupts record
+        # ownership.  Fall back to the global pool only for genuinely
+        # unsectioned source formats.
+        identity_blocks = [
+            block for block in blocks if block.section_hint == section
+        ] or blocks
         for index, record in enumerate(getattr(resume, section)):
             for field in fields:
-                add(f"{section}[{index}].{field}", getattr(record, field), 0.65)
+                add(
+                    f"{section}[{index}].{field}",
+                    getattr(record, field),
+                    0.65,
+                    candidate_pool=identity_blocks,
+                )
             if hasattr(record, "bullets"):
                 for bullet_index, bullet in enumerate(record.bullets):
                     add(f"{section}[{index}].bullets[{bullet_index}]", bullet)

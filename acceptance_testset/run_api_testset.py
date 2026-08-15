@@ -65,13 +65,30 @@ def _part_file(boundary: str, name: str, path: Path) -> bytes:
     return header + path.read_bytes() + b"\r\n"
 
 
+def _part_inline_file(boundary: str, name: str, filename: str, value: str) -> bytes:
+    header = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'
+        "Content-Type: text/plain; charset=utf-8\r\n\r\n"
+    ).encode("utf-8")
+    return header + str(value).encode("utf-8") + b"\r\n"
+
+
 def _multipart(case: dict[str, Any]) -> tuple[bytes, str]:
     boundary = f"resume-copilot-{int(time.time() * 1000)}"
     parts: list[bytes] = []
     if case.get("query"):
         parts.append(_part_text(boundary, "query", str(case["query"])))
-    if case.get("target_jd"):
-        parts.append(_part_text(boundary, "target_jd", str(case["target_jd"])))
+    target_jd = case.get("target_jd") or case.get("jd_text")
+    if target_jd:
+        parts.append(_part_text(boundary, "target_jd", str(target_jd)))
+    if case.get("cv_text"):
+        parts.append(_part_inline_file(
+            boundary,
+            "cv",
+            f"{case.get('id', 'case')}.txt",
+            str(case["cv_text"]),
+        ))
     for field, api_name in (
         ("cv_path", "cv"),
         ("target_jd_file_path", "target_jd_file"),

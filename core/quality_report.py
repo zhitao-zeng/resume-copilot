@@ -106,6 +106,11 @@ _QUANTIFIED_SIGNAL = re.compile(
     r"元|年|个月|月|天|小时|分钟|ms|s|qps|tps|fps|mb|gb)?",
     re.IGNORECASE,
 )
+_CONTEXT_ONLY_BULLET = re.compile(
+    r"^(?:行业|领域|部门|地点|工作地点|客户类型|业务范围|服务对象|"
+    r"技术环境|项目背景|专业方向|研究方向|产品|焦点)\s*[:：]",
+    re.IGNORECASE,
+)
 
 
 def _value(item: Any, key: str, default: Any = "") -> Any:
@@ -657,8 +662,32 @@ def assess_jd_requirements(
     resume: CanonicalResume,
     evidence_bindings: Iterable[EvidenceBinding],
     source: SourceBundle,
+    *,
+    jd_supplied: bool | None = None,
+    jd_unavailable: bool = False,
 ) -> dict[str, Any]:
     """Return evidence states for dynamically extracted JD requirements."""
+
+    jd_available = bool(str(jd_text or "").strip())
+    supplied = jd_available if jd_supplied is None else bool(jd_supplied)
+    unavailable = bool(supplied and jd_unavailable and not jd_available)
+    if unavailable:
+        recommendation = (
+            "已收到JD链接，但当前无法读取页面内容。请直接粘贴岗位职责和任职要求；"
+            "在此之前不会推测岗位要求，也不会把链接内容写成候选人经历。"
+        )
+        return {
+            "has_job_description": True,
+            "job_description_available": False,
+            "source_status": "unavailable",
+            "target_role": str(target_role or "").strip(),
+            "requirements": [],
+            "supported_requirement_count": 0,
+            "partial_requirement_count": 0,
+            "missing_requirement_count": 0,
+            "recommendations": [recommendation],
+            "follow_up_questions": ["请粘贴目标岗位的岗位职责和任职要求，以便逐项核对匹配情况。"],
+        }
 
     bindings = list(evidence_bindings)
     claims = _trusted_claims(resume, source, bindings)
@@ -767,7 +796,9 @@ def assess_jd_requirements(
         value for _, value in sorted(question_entries, key=lambda item: gap_rank[item[0]])
     ]
     return {
-        "has_job_description": bool(str(jd_text or "").strip()),
+        "has_job_description": supplied,
+        "job_description_available": jd_available,
+        "source_status": "available" if jd_available else "not_provided",
         "target_role": str(target_role or "").strip(),
         "requirements": items,
         "supported_requirement_count": sum(item["status"] == "supported" for item in items),
@@ -863,6 +894,11 @@ def _claim_improvement_items(
         if ".bullets[" not in claim["path"]:
             continue
         text = claim["text"]
+        # Context labels preserve useful source facts, but they are not
+        # accomplishment claims and should not trigger a request for an
+        # action/method/result that never existed in the source.
+        if _CONTEXT_ONLY_BULLET.match(text.strip()):
+            continue
         missing: list[str] = []
         if not _ACTION_SIGNAL.search(text):
             missing.append("个人行动")
@@ -904,6 +940,8 @@ def build_quality_report(
     changes: Iterable[Any] = (),
     missing_fields: Iterable[Any] = (),
     jd_text: str = "",
+    jd_supplied: bool | None = None,
+    jd_unavailable: bool = False,
     target_role: str = "",
     framework_mode: bool = False,
 ) -> dict[str, Any]:
@@ -985,6 +1023,8 @@ def build_quality_report(
         canonical,
         bindings,
         source,
+        jd_supplied=jd_supplied,
+        jd_unavailable=jd_unavailable,
     )
     claim_gaps = _claim_improvement_items(canonical, source, bindings)
     atomic_audit = audit_atomic_facts(

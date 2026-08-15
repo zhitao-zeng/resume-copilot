@@ -1,0 +1,263 @@
+{
+  "dataset_version": "public-resume-holdout-1.0",
+  "policy": {
+    "holdout_for_promotion_only": true,
+    "jd_is_not_candidate_evidence": true,
+    "one_page_limit": false,
+    "retire_case_after_fixing_against_it": true,
+    "shadow_not_for_daily_development": true
+  },
+  "source": {
+    "excluded_resume_ids": {
+      "01267": "conflicting source variants for one employment end date"
+    },
+    "homepage": "https://github.com/Avature/jobresqa-benchmark",
+    "license": "CC-BY-SA-2.0",
+    "name": "JobResQA Chinese split",
+    "revision": "1dbe6ffcf82cb06ec00f29bb0e4aeebde556addf",
+    "selection_seed": 20260813,
+    "source_bytes": 3111764,
+    "source_rows": 581,
+    "source_sha256": "a749770f4064e3723fb5f7a712f66b88f28a2b5545c589a8d3998f83c8852814",
+    "source_url": "https://raw.githubusercontent.com/Avature/jobresqa-benchmark/1dbe6ffcf82cb06ec00f29bb0e4aeebde556addf/data/jobresqa.zh.tsv",
+    "supplemental_source": {
+      "homepage": "https://huggingface.co/datasets/michaelozon/candidate-matching-synthetic",
+      "license": "MIT",
+      "name": "Candidate-Job Matching Synthetic Dataset",
+      "revision": "178ab864dcad9910c5670d43e4bdbbb901a11f18",
+      "selected_profile_file": "supplemental_profiles.json",
+      "selected_profile_sha256": "e66ac5fb13ef61762a9e3fdebec2b5b4c655f2927462015ec82519713152b847",
+      "selected_profiles": 18
+    },
+    "unique_jds": 101,
+    "unique_resumes": 104
+  },
+  "splits": {
+    "holdout_v2": {
+      "career_level_counts": {
+        "Junior": 6,
+        "Mid": 6,
+        "unspecified": 48
+      },
+      "case_count": 60,
+      "frozen": true,
+      "industry_counts": {
+        "design": 1,
+        "doctor": 9,
+        "finance": 6,
+        "operations": 13,
+        "product_research": 17,
+        "sales_presale": 8,
+        "teacher": 6
+      },
+      "input_profile_counts": {
+        "jd_only_no_personal_facts": 15,
+        "plain_text": 18,
+        "query_only_full_profile": 15,
+        "scanned_two_column_png": 4,
+        "single_column_docx": 4,
+        "two_column_pdf": 4
+      },
+      "scenario_counts": {
+        "scenario1": 15,
+        "scenario2": 15,
+        "scenario3": 15,
+        "scenario4": 15
+      },
+      "source_dataset_counts": {
+        "JobResQA": 48,
+        "michaelozon/candidate-matching-synthetic": 12
+      },
+      "source_domain_counts": {
+        "Cybersecurity": 1,
+        "E-commerce": 1,
+        "EdTech": 2,
+        "FinTech": 1,
+        "Gaming": 1,
+        "Healthcare": 2,
+        "Logistics": 1,
+        "Retail": 1,
+        "SaaS": 1,
+        "Travel": 1,
+        "design": 1,
+        "doctor": 9,
+        "finance": 6,
+        "operations": 11,
+        "product_research": 9,
+        "sales_presale": 6,
+        "teacher": 6
+      },
+      "source_jd_ids": [
+        "121494",
+        "128207",
+        "129389",
+        "142504",
+        "17239",
+        "182400",
+        "18936",
+        "199577",
+        "210168",
+        "2105",
+        "224908",
+        "22669",
+        "25305",
+        "266639",
+        "29782",
+        "31049",
+        "32555",
+        "36202",
+        "4005",
+        "40112",
+        "44540",
+        "4507",
+        "50522",
+        "5593",
+        "64572",
+        "74409",
+        "78966",
+        "80988",
+        "91366",
+        "9173"
+      ],
+      "source_resume_ids": [
+        "01268",
+        "01270",
+        "01271",
+        "01273",
+        "01279",
+        "01280",
+        "01284",
+        "01286",
+        "01287",
+        "01289",
+        "01293",
+        "01297",
+        "01304",
+        "01308",
+        "01309",
+        "01321",
+        "01322",
+        "01324",
+        "01328",
+        "01331",
+        "01333",
+        "01338",
+        "01339",
+        "01340",
+        "01341",
+        "01342",
+        "01350",
+        "01363",
+        "01364",
+        "01368",
+        "01375",
+        "01382",
+        "01383",
+        "R_000003",
+        "R_000012",
+        "R_000018",
+        "R_000020",
+        "R_000022",
+        "R_000033",
+        "R_000036",
+        "R_000044",
+        "R_000045",
+        "R_000048",
+        "R_000072",
+        "R_000085"
+      ],
+      "split": "holdout_v2",
+      "stage_counts": {
+        "experienced": 42,
+        "job_seeker": 3,
+        "unknown": 15
+      }
+    },
+    "shadow_v3": {
+      "career_level_counts": {
+        "Junior": 3,
+        "Mid": 3,
+        "unspecified": 18
+      },
+      "case_count": 24,
+      "frozen": true,
+      "industry_counts": {
+        "doctor": 2,
+        "finance": 6,
+        "operations": 5,
+        "product_research": 4,
+        "sales_presale": 5,
+        "teacher": 2
+      },
+      "input_profile_counts": {
+        "jd_only_no_personal_facts": 6,
+        "plain_text": 12,
+        "query_only_full_profile": 6
+      },
+      "scenario_counts": {
+        "scenario1": 6,
+        "scenario2": 6,
+        "scenario3": 6,
+        "scenario4": 6
+      },
+      "source_dataset_counts": {
+        "JobResQA": 18,
+        "michaelozon/candidate-matching-synthetic": 6
+      },
+      "source_domain_counts": {
+        "Cybersecurity": 1,
+        "E-commerce": 1,
+        "FinTech": 1,
+        "Logistics": 1,
+        "Retail": 1,
+        "Travel": 1,
+        "doctor": 2,
+        "finance": 5,
+        "operations": 5,
+        "product_research": 2,
+        "sales_presale": 2,
+        "teacher": 2
+      },
+      "source_jd_ids": [
+        "153732",
+        "222289",
+        "25131",
+        "290916",
+        "33268",
+        "37716",
+        "43981",
+        "59764",
+        "65176",
+        "7017",
+        "83123",
+        "9073"
+      ],
+      "source_resume_ids": [
+        "01278",
+        "01296",
+        "01300",
+        "01310",
+        "01311",
+        "01317",
+        "01318",
+        "01327",
+        "01344",
+        "01347",
+        "01351",
+        "01372",
+        "R_000001",
+        "R_000002",
+        "R_000005",
+        "R_000006",
+        "R_000089",
+        "R_000115"
+      ],
+      "split": "shadow_v3",
+      "stage_counts": {
+        "experienced": 16,
+        "job_seeker": 2,
+        "unknown": 6
+      }
+    }
+  }
+}

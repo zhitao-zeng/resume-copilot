@@ -9,6 +9,11 @@ import numpy as np
 from PIL import Image
 
 import resume_io
+from tensorrt_ocr import (
+    TensorRTConsensusOCR,
+    TensorRTMediumRecognitionConsensus,
+    TensorRTRecognitionConsensus,
+)
 
 
 def _touch_bundle(root: Path, model_type: str) -> None:
@@ -29,8 +34,73 @@ def _touch_bundle(root: Path, model_type: str) -> None:
         (root / name).touch()
 
 
+def _touch_tensorrt_bundle(root: Path, *, missing: str = "") -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    for name in (
+        "det.engine",
+        "cls.engine",
+        "primary-rec.engine",
+        "secondary-rec.engine",
+        "medium-rec.engine",
+        "keys.txt",
+    ):
+        if name != missing:
+            (root / name).touch()
+
+
 def _sleep_forever(seconds: float) -> None:
     time.sleep(seconds)
+
+
+def test_ppstructure_is_primary_raster_parser(tmp_path, monkeypatch):
+    image_path = tmp_path / "resume.png"
+    Image.new("RGB", (200, 100), "white").save(image_path)
+    monkeypatch.setattr(resume_io, "ppstructure_enabled", lambda: True)
+    monkeypatch.setattr(
+        resume_io,
+        "extract_ppstructure_text",
+        lambda _content, *, filename: "左栏经历\n右栏技能",
+    )
+    monkeypatch.setattr(
+        resume_io,
+        "_init_rapid_ocr",
+        lambda: (_ for _ in ()).throw(AssertionError("RapidOCR must not initialize")),
+    )
+
+    text = resume_io.extract_text_from_image_bytes(
+        image_path.read_bytes(), image_path.name
+    )
+
+    assert text == "左栏经历\n右栏技能"
+
+
+def test_ppstructure_failure_falls_back_to_existing_ocr_bbox(tmp_path, monkeypatch):
+    image_path = tmp_path / "resume.png"
+    Image.new("RGB", (200, 100), "white").save(image_path)
+    released = []
+    monkeypatch.setattr(resume_io, "ppstructure_enabled", lambda: True)
+    monkeypatch.setattr(
+        resume_io,
+        "extract_ppstructure_text",
+        lambda _content, *, filename: (_ for _ in ()).throw(RuntimeError("GPU OOM")),
+    )
+    monkeypatch.setattr(
+        resume_io, "release_ppstructure_runtime", lambda: released.append(True)
+    )
+    monkeypatch.setattr(resume_io, "_RAPID_OCR_INITED", True)
+    monkeypatch.setattr(resume_io, "_RAPID_OCR", object())
+    monkeypatch.setattr(
+        resume_io,
+        "_ocr_image_with_rapid",
+        lambda _content, *, prepared_image: "OCR+BBOX 回退内容",
+    )
+
+    text = resume_io.extract_text_from_image_bytes(
+        image_path.read_bytes(), image_path.name
+    )
+
+    assert text == "OCR+BBOX 回退内容"
+    assert released
 
 
 def _png_bytes(image: Image.Image) -> bytes:
@@ -95,6 +165,168 @@ def test_incomplete_ppocrv6_bundle_falls_back_to_v5_mobile(tmp_path):
     assert selected["model_type"] == "mobile"
 
 
+def test_tensorrt_bundle_requires_all_three_recognition_heads(tmp_path):
+    complete = tmp_path / "complete"
+    incomplete = tmp_path / "incomplete"
+    _touch_tensorrt_bundle(complete)
+    _touch_tensorrt_bundle(incomplete, missing="medium-rec.engine")
+
+    assert resume_io._select_tensorrt_ocr_bundle([incomplete, complete]) == complete
+    assert resume_io._select_tensorrt_ocr_bundle([incomplete]) is None
+
+
+def test_tensorrt_hybrid_bundle_only_requires_two_witnesses(tmp_path):
+    for name in ("secondary-rec.engine", "medium-rec.engine", "keys.txt"):
+        (tmp_path / name).touch()
+
+    assert resume_io._select_tensorrt_ocr_bundle(
+        [tmp_path], recognition_only=True
+    ) == tmp_path
+    assert resume_io._select_tensorrt_ocr_bundle([tmp_path]) is None
+
+
+def test_tensorrt_medium_primary_bundle_requires_both_small_witnesses(tmp_path):
+    for name in (
+        "primary-rec.engine",
+        "secondary-rec.engine",
+        "medium-rec.engine",
+        "keys.txt",
+    ):
+        (tmp_path / name).touch()
+
+    assert resume_io._select_tensorrt_ocr_bundle(
+        [tmp_path], recognition_only=True, medium_primary=True
+    ) == tmp_path
+    (tmp_path / "primary-rec.engine").unlink()
+    assert resume_io._select_tensorrt_ocr_bundle(
+        [tmp_path], recognition_only=True, medium_primary=True
+    ) is None
+
+
+def test_tensorrt_recognition_padding_matches_rapidocr_normalized_zero():
+    crop = np.full((24, 48, 3), 255, dtype=np.uint8)
+
+    padded, _ratio = TensorRTConsensusOCR._prepare_recognition_crop(crop)
+    classifier = TensorRTConsensusOCR._prepare_classifier_crop(crop)
+
+    assert padded.dtype == np.float32
+    assert classifier.dtype == np.float32
+    assert np.all(padded[:, -1] == 0.0)
+    assert np.all(classifier[:, -1] == 0.0)
+    assert np.allclose(padded[:, :96], 1.0)
+
+
+def test_tensorrt_native_height_padding_preserves_source_raster():
+    crop = np.zeros((24, 48, 3), dtype=np.uint8)
+    crop[:, :24] = 255
+
+    padded, ratio = TensorRTConsensusOCR._prepare_recognition_crop(
+        crop,
+        preprocess_mode="native-height-pad",
+    )
+
+    assert padded.shape == (48, 320, 3)
+    assert ratio == 2.0
+    assert np.allclose(padded[:24, :24], 1.0)
+    assert np.allclose(padded[:24, 24:48], -1.0)
+    assert np.allclose(padded[24:, :], 0.0)
+
+
+def test_tensorrt_native_height_padding_falls_back_for_tall_crop():
+    crop = np.full((96, 48, 3), 255, dtype=np.uint8)
+
+    native, native_ratio = TensorRTConsensusOCR._prepare_recognition_crop(
+        crop,
+        preprocess_mode="native-height-pad",
+    )
+    standard, standard_ratio = TensorRTConsensusOCR._prepare_recognition_crop(
+        crop,
+        preprocess_mode="standard-resize",
+    )
+
+    assert native_ratio == standard_ratio
+    assert np.array_equal(native, standard)
+
+
+def test_tensorrt_native_height_preparation_keeps_common_width_batchable():
+    engine = object.__new__(TensorRTConsensusOCR)
+    engine._np = np
+    engine._recognition_preprocess = "native-height-pad"
+    crops = [
+        np.zeros((24, 48, 3), dtype=np.uint8),
+        np.zeros((32, 80, 3), dtype=np.uint8),
+    ]
+
+    prepared = engine._prepare_recognition_crops(crops)
+
+    assert [entry[1].shape for entry in prepared] == [
+        (48, 320, 3),
+        (48, 320, 3),
+    ]
+
+    standard = engine._prepare_recognition_crops(
+        crops,
+        preprocess_mode="standard-resize",
+    )
+    assert np.allclose(standard[0][1][:, :96], -1.0)
+    assert not np.array_equal(prepared[0][1], standard[0][1])
+
+
+def test_explicit_tensorrt_backend_is_selected_without_onnx_cuda(tmp_path, monkeypatch):
+    _touch_tensorrt_bundle(tmp_path)
+    fake_engine = object()
+    monkeypatch.setenv("RAPID_OCR_BACKEND", "tensorrt")
+    monkeypatch.setenv("PPOCRV6_TRT_MODEL_DIR", str(tmp_path))
+    monkeypatch.setattr(resume_io, "_RAPID_OCR", None)
+    monkeypatch.setattr(resume_io, "_RAPID_OCR_INITED", False)
+    monkeypatch.setattr(
+        resume_io,
+        "_build_tensorrt_recognition_consensus",
+        lambda _root, **_kwargs: fake_engine,
+    )
+
+    resume_io._init_rapid_ocr()
+
+    assert resume_io._RAPID_OCR is fake_engine
+    assert resume_io._RAPID_OCR_PROVIDER == "TensorRTMediumRecognition+CPUDetection"
+    assert (
+        resume_io._RAPID_OCR_MODEL_TYPE
+        == "medium+two-small-trt-fp32-consensus"
+    )
+
+
+def test_unsupported_ppocrv6_runtime_falls_back_to_v5_mobile(tmp_path, monkeypatch):
+    for name in ("det.onnx", "rec.onnx", "cls.onnx", "keys.txt"):
+        (tmp_path / name).touch()
+    _touch_bundle(tmp_path, "mobile")
+    selected = resume_io._select_rapid_ocr_bundle(
+        [tmp_path], prefer_server=False, forced_model_type="auto"
+    )
+    attempted = []
+
+    def fake_build(bundle, *, use_cuda, cpu_threads):
+        attempted.append((bundle["version"], bundle["model_type"]))
+        if bundle["version"] == "v6":
+            raise RuntimeError("runtime has no PPOCRV6 enum")
+        return object()
+
+    monkeypatch.setattr(resume_io, "_build_rapid_ocr", fake_build)
+
+    engine, actual = resume_io._build_rapid_ocr_with_fallback(
+        selected,
+        candidates=[tmp_path],
+        prefer_server=False,
+        forced_model_type="auto",
+        use_cuda=False,
+        cpu_threads=2,
+    )
+
+    assert engine is not None
+    assert actual["version"] == "v5"
+    assert actual["model_type"] == "mobile"
+    assert attempted == [("v6", "small"), ("v5", "mobile")]
+
+
 def test_unreadable_candidate_is_skipped_instead_of_aborting(tmp_path, monkeypatch):
     _touch_bundle(tmp_path, "mobile")
     protected = Path("/protected-ocr-models")
@@ -155,6 +387,257 @@ def test_prepare_ocr_image_keeps_normal_resume_resolution():
     assert original_size == (1300, 1800)
     assert prepared.size == original_size
     assert prepared.mode == "RGB"
+
+
+def test_ocr_normalization_repairs_only_internal_numeric_parentheses():
+    actual = resume_io._normalize_extracted_resume_text(
+        "2004年\n2((4年\n35(0万元\n(2019年)\n负责2(19+1)个测试",
+        repair_ocr_artifacts=True,
+    )
+
+    assert actual.splitlines() == [
+        "2004年",
+        "2004年",
+        "3500万元",
+        "(2019年)",
+        "负责2019+1)个测试",
+    ]
+
+
+def test_ocr_normalization_canonicalizes_noisy_fixture_placeholders():
+    actual = resume_io._normalize_extracted_resume_text(
+        "【公司1\n［学校］\n[城市2]\n【项目】 数据平台\n【公司12012-2022",
+        repair_ocr_artifacts=True,
+    )
+
+    assert actual.splitlines() == [
+        "[公司]", "[学校]", "[城市]", "[项目] 数据平台", "[公司]2012-2022",
+    ]
+
+
+def test_numeric_consensus_suppression_keeps_clause_but_removes_anchor():
+    assert resume_io._ocr_numeric_signature("收入35(0万元") == ("3500",)
+    assert resume_io._suppress_disputed_numeric_anchors(
+        "监督价值250万美元的业务运营"
+    ) == "监督价值万美元的业务运营"
+    assert resume_io._suppress_disputed_numeric_anchors(
+        "2012年9月-至今"
+    ) == "年月-至今"
+
+
+def test_numeric_consensus_skips_medium_when_small_heads_already_disagree(monkeypatch):
+    class PrimaryEngine:
+        @staticmethod
+        def crop_text_regions(_image, boxes):
+            return [np.full((8, 8, 3), index, dtype=np.uint8) for index, _ in enumerate(boxes)]
+
+        @staticmethod
+        def cls_and_rotate(crops):
+            return crops, None
+
+    class RecognitionResult:
+        def __init__(self, txts):
+            self.txts = tuple(txts)
+
+    class SecondaryRecognizer:
+        def __call__(self, _input):
+            return RecognitionResult(("负责11个项目", "覆盖20名用户", "无数字"))
+
+    class MediumRecognizer:
+        def __init__(self):
+            self.crop_markers = []
+
+        def __call__(self, rec_input):
+            self.crop_markers = [int(crop[0, 0, 0]) for crop in rec_input.img]
+            return RecognitionResult(("覆盖20名用户",))
+
+    class PrimaryResult:
+        boxes = np.zeros((3, 4, 2), dtype=np.float32)
+        txts = ("负责10个项目", "覆盖20名用户", "无数字")
+
+    medium = MediumRecognizer()
+    monkeypatch.setattr(resume_io, "_RAPID_OCR", PrimaryEngine())
+    monkeypatch.setattr(resume_io, "_RAPID_OCR_SECONDARY_REC", SecondaryRecognizer())
+    monkeypatch.setattr(resume_io, "_RAPID_OCR_NUMERIC_REC", medium)
+    monkeypatch.setattr(resume_io, "_init_numeric_ocr_consensus", lambda: True)
+
+    result = resume_io._apply_numeric_ocr_consensus(
+        np.zeros((40, 40, 3), dtype=np.uint8),
+        PrimaryResult(),
+    )
+
+    assert medium.crop_markers == [1]
+    assert result.txts == ("负责个项目", "覆盖20名用户", "无数字")
+
+
+def test_tensorrt_result_does_not_run_cpu_consensus_twice(monkeypatch):
+    result = SimpleNamespace(
+        boxes=np.zeros((1, 4, 2), dtype=np.float32),
+        txts=("覆盖20名用户",),
+        numeric_consensus_applied=True,
+    )
+    monkeypatch.setattr(
+        resume_io,
+        "_init_numeric_ocr_consensus",
+        lambda: (_ for _ in ()).throw(AssertionError("must not run")),
+    )
+
+    assert resume_io._apply_numeric_ocr_consensus(
+        np.zeros((40, 40, 3), dtype=np.uint8), result
+    ) is result
+
+
+def test_tensorrt_hybrid_keeps_cpu_primary_and_accelerates_only_witnesses():
+    class Primary:
+        def __call__(self, _image):
+            return SimpleNamespace(
+                boxes=np.zeros((3, 4, 2), dtype=np.float32),
+                txts=("负责10个项目", "覆盖20名用户", "无数字"),
+                scores=(0.99, 0.99, 0.99),
+            )
+
+        @staticmethod
+        def crop_text_regions(_image, boxes):
+            return [np.zeros((8, 8, 3), dtype=np.uint8) for _ in boxes]
+
+        @staticmethod
+        def cls_and_rotate(crops):
+            return crops, None
+
+    engine = object.__new__(TensorRTRecognitionConsensus)
+    engine._np = np
+    engine._primary_ocr = Primary()
+    engine._secondary_rec = "secondary"
+    engine._medium_rec = "medium"
+    engine._numeric_signature = resume_io._ocr_numeric_signature
+    engine._suppress_numeric = resume_io._suppress_disputed_numeric_anchors
+    engine._repair_text = resume_io._repair_ocr_text_artifacts
+    captured_medium_indexes = []
+
+    def prepare(_crops, *, result_indexes=None, batch_size=6):
+        del batch_size
+        indexes = list(result_indexes) if result_indexes is not None else [0, 1, 2]
+        if result_indexes is not None:
+            captured_medium_indexes.extend(indexes)
+        return [(index, np.zeros((48, 320, 3), dtype=np.float32), 1.0) for index in indexes]
+
+    def recognize(session, _prepared, result_size):
+        if session == "secondary":
+            return [("负责11个项目", 0.99), ("覆盖20名用户", 0.99), ("无数字", 0.99)]
+        values = [("", 0.0)] * result_size
+        values[1] = ("覆盖20名用户", 0.99)
+        return values
+
+    engine._prepare_recognition_crops = prepare
+    engine._recognize = recognize
+
+    result = engine(np.zeros((40, 40, 3), dtype=np.uint8))
+
+    assert captured_medium_indexes == [1]
+    assert result.txts == ("负责个项目", "覆盖20名用户", "无数字")
+    assert result.numeric_consensus_applied is True
+
+
+def test_tensorrt_medium_primary_uses_small_heads_only_for_numeric_lines():
+    class Primary:
+        text_score = 0.5
+
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, _image, **kwargs):
+            self.calls.append(kwargs)
+            return SimpleNamespace(
+                boxes=np.arange(24, dtype=np.float32).reshape(3, 4, 2),
+            )
+
+        @staticmethod
+        def crop_text_regions(_image, boxes):
+            return [np.zeros((8, 8, 3), dtype=np.uint8) for _ in boxes]
+
+        @staticmethod
+        def cls_and_rotate(crops):
+            return crops, None
+
+    engine = object.__new__(TensorRTMediumRecognitionConsensus)
+    engine._np = np
+    engine._primary_ocr = Primary()
+    engine._primary_rec = "small-primary"
+    engine._secondary_rec = "small-secondary"
+    engine._medium_rec = "medium"
+    engine._numeric_signature = resume_io._ocr_numeric_signature
+    engine._suppress_numeric = resume_io._suppress_disputed_numeric_anchors
+    engine._repair_text = resume_io._repair_ocr_text_artifacts
+    witness_indexes = []
+    witness_preprocess = []
+
+    def prepare(
+        _crops,
+        *,
+        result_indexes=None,
+        batch_size=6,
+        preprocess_mode=None,
+    ):
+        del batch_size
+        indexes = list(result_indexes) if result_indexes is not None else [0, 1, 2]
+        if result_indexes is not None:
+            witness_indexes.extend(indexes)
+            witness_preprocess.append(preprocess_mode)
+        return [
+            (index, np.zeros((48, 320, 3), dtype=np.float32), 1.0)
+            for index in indexes
+        ]
+
+    def recognize(session, _prepared, result_size):
+        if session == "medium":
+            return [
+                ("负责10个项目", 0.99),
+                ("覆盖20名用户", 0.99),
+                ("改善流程", 0.99),
+            ]
+        values = [("", 0.0)] * result_size
+        values[0] = ("负责11个项目", 0.99)
+        values[1] = ("覆盖20名用户", 0.99)
+        return values
+
+    engine._prepare_recognition_crops = prepare
+    engine._recognize = recognize
+
+    result = engine(np.zeros((40, 40, 3), dtype=np.uint8))
+
+    assert engine._primary_ocr.calls == [
+        {"use_det": True, "use_cls": False, "use_rec": False}
+    ]
+    assert witness_indexes == [0, 1]
+    assert witness_preprocess == ["standard-resize"]
+    assert result.txts == ("负责个项目", "覆盖20名用户", "改善流程")
+    assert result.numeric_consensus_applied is True
+
+
+def test_tensorrt_runtime_error_falls_back_to_cpu_engine(monkeypatch):
+    class Result:
+        boxes = np.array([[[0, 0], [100, 0], [100, 20], [0, 20]]])
+        txts = ("识别成功",)
+        numeric_consensus_applied = True
+
+    def failing_engine(_image):
+        raise RuntimeError("TensorRT execution failed")
+
+    def switch_to_cpu(_reason):
+        monkeypatch.setattr(resume_io, "_RAPID_OCR", lambda _image: Result())
+        monkeypatch.setattr(resume_io, "_RAPID_OCR_PROVIDER", "CPUExecutionProvider")
+        return True
+
+    monkeypatch.setattr(resume_io, "_RAPID_OCR", failing_engine)
+    monkeypatch.setattr(resume_io, "_RAPID_OCR_PROVIDER", "TensorRTExecutionProvider")
+    monkeypatch.setattr(resume_io, "_RAPID_OCR_VERSION", "v6")
+    monkeypatch.setattr(resume_io, "_switch_rapid_ocr_to_cpu_mobile", switch_to_cpu)
+
+    text = resume_io._ocr_image_with_rapid(
+        _png_bytes(Image.new("RGB", (200, 100), "white"))
+    )
+
+    assert text == "识别成功"
 
 
 def test_multicandidate_reuses_global_engine_and_returns_first_success(monkeypatch):

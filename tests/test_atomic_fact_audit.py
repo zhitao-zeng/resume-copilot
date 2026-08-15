@@ -148,6 +148,34 @@ def test_summary_accepts_role_only_work_and_context_wrappers():
     assert audit["atomic_factuality"]["precision"] == 1.0
 
 
+def test_summary_may_combine_exact_metric_from_an_adjacent_source_line():
+    audit = _audit(
+        "仁和医院｜住院医师｜2020.08-2025.06\n"
+        "参与内科门诊与病区诊疗\n"
+        "管理120例住院病例\n"
+        "组织每周疑难病例讨论",
+        {
+            "summary": (
+                "在仁和医院担任住院医师，参与内科门诊与病区诊疗，"
+                "管理120例住院病例并组织每周疑难病例讨论。"
+            ),
+            "experience": [{
+                "organization": "仁和医院",
+                "role": "住院医师",
+                "period": "2020.08-2025.06",
+                "bullets": ["管理120例住院病例"],
+            }],
+        },
+    )
+
+    factuality = audit["atomic_factuality"]
+    assert not any(
+        item.get("unmatched_anchors") == ["120例"]
+        for item in factuality["unsupported_output"]
+    )
+    assert audit["structural_invariants"]["metric"]["added_count"] == 0
+
+
 def test_ownership_audit_detects_cross_record_bullet_swap():
     audit = _audit(
         "工作经历\n甲公司｜产品经理｜2022.01-2024.01\n负责用户访谈。\n"

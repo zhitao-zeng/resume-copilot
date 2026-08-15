@@ -292,6 +292,66 @@ def test_complete_long_summary_is_not_reported_as_missing():
     assert not any(item.field == "summary" for item in missing)
 
 
+def test_partial_records_report_exact_fields_without_claiming_section_missing():
+    missing = check_required_fields({
+        "meta": {
+            "name": "某候选人",
+            "phone": "13812345678",
+            "email": "candidate@example.com",
+            "education_level": "硕士",
+        },
+        "summary": "拥有财务管理与内部审计方面的真实工作背景。",
+        "education": [{
+            "school": "", "degree": "硕士", "major": "工商管理", "period": "1999年",
+        }],
+        "experience": [{
+            "company": "独立财务咨询公司",
+            "role": "",
+            "period": "2015年12月至今",
+            "bullets": ["制定财务战略和内部审计程序"],
+        }],
+        "projects": [{
+            "name": "",
+            "period": "",
+            "bullets": ["开发自动化财务预测模型，使处理时间减少40%"],
+        }],
+        "skills": {"others": ["SAP"]},
+    })
+
+    fields = {item.field for item in missing}
+    assert "education[0].school" in fields
+    assert "experience[0].role" in fields
+    assert "projects[0].name" in fields
+    assert "projects[0].period" in fields
+    assert "experience[0]" not in fields
+    assert "projects[0]" not in fields
+    assert all("经历" not in item.reason for item in missing)
+
+
+def test_chinese_december_and_year_only_periods_sort_without_false_conflict():
+    resume = {
+        "experience": [
+            {
+                "organization": "独立财务咨询公司",
+                "role": "顾问",
+                "period": "2015年12月至今",
+            },
+            {
+                "organization": "BUILDTECH SUPPLIES INC.",
+                "role": "财务与资源经理",
+                "period": "2015年6月至2015年11月",
+            },
+            {
+                "organization": "工业阀门有限公司",
+                "role": "财务与系统主管",
+                "period": "2014年至2015年",
+            },
+        ],
+    }
+
+    assert check_time_conflicts(resume) == []
+
+
 def test_student_internship_and_research_overlap_is_not_a_time_conflict():
     resume = {
         "education": [{

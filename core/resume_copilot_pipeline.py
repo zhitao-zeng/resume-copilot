@@ -292,6 +292,9 @@ class PipelineContext:
     cv_uploaded: bool = False
     cv_extraction_failed: bool = False
     has_jd: bool = False
+    jd_supplied: bool = False
+    jd_available: bool = False
+    jd_unavailable: bool = False
     resume_data: dict = field(default_factory=dict)
 
     # Stage 3 (Enrich) output
@@ -499,11 +502,12 @@ async def _resolve_jd_text(
             return merge_fetched_jd(resolved, supplied_text)
         perf["jd_resolve_s"] = round(time.perf_counter() - started, 3)
         return value
-    url = str(target_jd_url or jd_url or "").strip()
-    if url:
-        resolved = await _fetch_jd_url(url, warnings)
+    url_value = str(target_jd_url or jd_url or "").strip()
+    if url_value:
+        url, supplied_text = split_url_and_text(url_value)
+        resolved = await _fetch_jd_url(url or url_value, warnings)
         perf["jd_resolve_s"] = round(time.perf_counter() - started, 3)
-        return resolved
+        return merge_fetched_jd(resolved, supplied_text)
     if target_jd_file is not None:
         text = await _extract_upload_text(target_jd_file, "target_jd", perf, warnings)
         perf["jd_resolve_s"] = round(time.perf_counter() - started, 3)
@@ -658,6 +662,7 @@ def _build_targeted_suggestions(
 _REPLY_MAX_SOURCE_GAPS = 5
 _REPLY_MAX_CLAIM_GAPS = 3
 _REPLY_MAX_FOLLOW_UPS = 3
+_REPLY_MAX_MISSING_GROUPS = 10
 _REPLY_CONTACT_OR_URL = re.compile(
     r"(?:\b1[3-9]\d{9}\b|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|"
     r"https?://\S+|www\.\S+|(?:电话|手机|邮箱|联系方式)\s*[:：]|"
@@ -675,6 +680,109 @@ _REPLY_STRUCTURAL_ONLY = re.compile(
     r"项目经历|科研经历|校园经历|专业技能|技能|证书|荣誉奖项|个人总结|自我评价)$",
     re.IGNORECASE,
 )
+
+
+_MISSING_INDEXED_FIELD = re.compile(
+    r"^(education|experience|research|activities|campus_experience|projects)"
+    r"\[(\d+)](?:\.(.+))?$"
+)
+
+
+def _missing_field_priority(field: str) -> tuple[int, str]:
+    value = str(field or "").casefold()
+    if any(token in value for token in ("name", "phone", "email", "姓名", "电话", "邮箱")):
+        return 0, value
+    if value.startswith("education"):
+        return 1, value
+    if any(token in value for token in ("organization", "company", "role")):
+        return 2, value
+    if "period" in value or "time" in value:
+        return 3, value
+    if "bullets" in value or "summary" in value:
+        return 4, value
+    if "skill" in value:
+        return 5, value
+    return 6, value
+
+
+def _group_missing_fields(
+    missing_fields: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """Group repeated per-record gaps without changing the structured report.
+
+    The public JSON still exposes every missing field.  This helper only makes
+    the human reply readable by collapsing, for example, five missing employer
+    names into one prioritized line with all affected record numbers.
+    """
+
+    unique_items: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in missing_fields:
+        field = str(item.get("field", "") or "").strip()
+        reason = str(item.get("reason", "") or "").strip()
+        key = (field, reason)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_items.append(item)
+
+    groups: dict[tuple[str, str, str], dict[str, Any]] = {}
+    order: list[tuple[str, str, str]] = []
+    for item in unique_items:
+        field = str(item.get("field", "") or "").strip()
+        label = str(item.get("label") or field or "字段").strip()
+        match = _MISSING_INDEXED_FIELD.match(field)
+        if match:
+            section, index_text, suffix = match.groups()
+            key = (section, suffix or "", label)
+            if key not in groups:
+                groups[key] = {
+                    "field": field,
+                    "label": label,
+                    "reason": str(item.get("reason", "") or "").strip(),
+                    "section": section,
+                    "indices": [],
+                    "item_count": 0,
+                }
+                order.append(key)
+            groups[key]["indices"].append(int(index_text))
+            groups[key]["item_count"] += 1
+            continue
+        key = ("", field, label)
+        groups[key] = {
+            "field": field,
+            "label": label,
+            "reason": str(item.get("reason", "") or "").strip(),
+            "section": "",
+            "indices": [],
+            "item_count": 1,
+        }
+        order.append(key)
+
+    grouped = [groups[key] for key in order]
+    grouped.sort(key=lambda item: _missing_field_priority(str(item.get("field", ""))))
+    return grouped, len(unique_items)
+
+
+def _missing_group_line(item: dict[str, Any]) -> str:
+    label = str(item.get("label") or item.get("field") or "字段").strip()
+    section = str(item.get("section", "") or "")
+    indices = sorted(set(int(value) for value in item.get("indices", []) or []))
+    reason = str(item.get("reason", "") or "").strip()
+    if section and indices:
+        noun = {
+            "education": "段教育",
+            "experience": "段工作/实习",
+            "research": "段科研",
+            "activities": "段校园/社会",
+            "campus_experience": "段校园/社会",
+            "projects": "个项目",
+        }[section]
+        numbers = "、".join(str(index + 1) for index in indices)
+        label += f"（第{numbers}{noun}）"
+        if len(indices) > 1:
+            reason = f"请按原始事实补充上述记录对应的{str(item.get('label') or '信息').strip()}"
+    return f"- {label}：{reason}" if reason else f"- {label}"
 
 
 def _clean_report_excerpt(value: Any) -> str:
@@ -756,39 +864,32 @@ def _reply_detail_block(
 ) -> str:
     lines: list[str] = ["缺失信息："]
     if missing_fields:
-        unique_items: list[dict[str, Any]] = []
-        seen: set[tuple[str, str]] = set()
-        for item in missing_fields:
-            key = (str(item.get("field", "")), str(item.get("reason", "")))
-            if key not in seen:
-                seen.add(key)
-                unique_items.append(item)
-        lines.append(f"缺失或待补充信息（{len(unique_items)}项）：")
-        for item in unique_items:
-            label = str(item.get("label") or item.get("field") or "字段").strip()
-            field = str(item.get("field", ""))
-            indexed = re.match(
-                r"(education|experience|research|activities|campus_experience|projects)\[(\d+)]",
-                field,
+        grouped_items, unique_count = _group_missing_fields(missing_fields)
+        lines.append(f"缺失或待补充信息（{unique_count}项）：")
+        visible = grouped_items[:_REPLY_MAX_MISSING_GROUPS]
+        lines.extend(_missing_group_line(item) for item in visible)
+        hidden_count = sum(
+            int(item.get("item_count", 1) or 1)
+            for item in grouped_items[_REPLY_MAX_MISSING_GROUPS:]
+        )
+        if hidden_count:
+            lines.append(
+                f"- 另有 {hidden_count} 项低优先级缺失信息未在回复中逐项展开，"
+                "完整字段仍保留在结构化报告中。"
             )
-            if indexed:
-                noun = {
-                    "education": "段教育",
-                    "experience": "段工作/实习",
-                    "research": "段科研",
-                    "activities": "段校园/社会",
-                    "campus_experience": "段校园/社会",
-                    "projects": "个项目",
-                }[indexed.group(1)]
-                label += f"（第{int(indexed.group(2)) + 1}{noun}）"
-            reason = str(item.get("reason", "")).strip()
-            lines.append(f"- {label}：{reason}" if reason else f"- {label}")
     else:
         lines.append("- 未检测到必填信息缺失；仍建议核对联系方式、时间和成果数据。")
     lines.append("岗位匹配与建议：")
     report = quality_report if isinstance(quality_report, dict) else {}
     alignment = report.get("job_alignment", {})
-    if isinstance(alignment, dict) and alignment.get("has_job_description"):
+    if (
+        isinstance(alignment, dict)
+        and alignment.get("source_status") == "unavailable"
+    ):
+        lines.append(
+            "- 已收到JD链接，但页面内容未能读取；本次未把链接地址或推测内容当作岗位要求。"
+        )
+    elif isinstance(alignment, dict) and alignment.get("has_job_description"):
         supported = int(alignment.get("supported_requirement_count", 0) or 0)
         partial = int(alignment.get("partial_requirement_count", 0) or 0)
         missing = int(alignment.get("missing_requirement_count", 0) or 0)
@@ -816,13 +917,26 @@ def _reply_detail_block(
         lines.extend(f"- {item}" for item in targeted_suggestions)
     else:
         lines.append("- 暂无足够岗位信息形成具体匹配结论；提供完整JD后可进一步优化关键词与经历排序。")
+    # The atomic audit is the authoritative final-resume view.  The legacy
+    # block-level preservation diagnostic is retained for compatibility, but
+    # it can mark a source line missing even when all of its atomic facts were
+    # written elsewhere.  Prefer atomic facts in the user-facing reply and
+    # fall back only for older reports that do not contain that audit.
+    atomic = report.get("atomic_factuality", {})
+    has_atomic_gaps = isinstance(atomic, dict) and "unrepresented_source_facts" in atomic
     preservation = report.get("source_preservation", {})
-    unrepresented = (
-        preservation.get("unrepresented_items", [])
-        if isinstance(preservation, dict) else []
-    )
+    if has_atomic_gaps:
+        unrepresented = atomic.get("unrepresented_source_facts", [])
+        total = int(atomic.get("unrepresented_source_fact_count", len(unrepresented)) or 0)
+    else:
+        unrepresented = (
+            preservation.get("unrepresented_items", [])
+            if isinstance(preservation, dict) else []
+        )
+        total = int(
+            preservation.get("unrepresented_item_count", len(unrepresented)) or 0
+        ) if isinstance(preservation, dict) else len(unrepresented)
     if unrepresented:
-        total = int(preservation.get("unrepresented_item_count", len(unrepresented)) or 0)
         lines.append(f"原始材料中未充分写入成稿的信息（{total}项）：")
         selected_unrepresented = _select_reply_source_gaps(unrepresented)
         for item in selected_unrepresented:
@@ -1480,7 +1594,18 @@ async def stage_ingest(
         ctx.cv_extraction_failed = True
     ctx.has_cv = bool(ctx.cv_text.strip())
 
-    # JD resolution
+    # JD resolution. Track presence separately from availability: an
+    # inaccessible URL is still a JD supplied by the user, but its contents
+    # must not be guessed or treated as extracted requirements.
+    _jd_input_values = (target_jd, jd_text, target_jd_url, jd_url)
+    ctx.jd_supplied = target_jd_file is not None or any(
+        bool(str(value or "").strip()) for value in _jd_input_values
+    )
+    _jd_url_supplied = any(
+        bool(split_url_and_text(str(value or "").strip())[0])
+        for value in _jd_input_values
+        if str(value or "").strip()
+    )
     ctx.jd_text = await _resolve_jd_text(
         target_jd=target_jd, jd_text=jd_text,
         target_jd_url=target_jd_url, jd_url=jd_url,
@@ -1488,15 +1613,20 @@ async def stage_ingest(
         perf=ctx.perf, warnings=ctx.ocr_warnings,
     )
     _ensure_time_budget(ctx.started, "input_resolve")
-    ctx.has_jd = bool(ctx.jd_text.strip())
+    ctx.jd_available = bool(ctx.jd_text.strip())
+    ctx.jd_unavailable = bool(ctx.jd_supplied and _jd_url_supplied and not ctx.jd_available)
+    # ``has_jd`` drives scenario selection and means "the user supplied a JD".
+    # Downstream extraction uses ``jd_text``/``jd_available`` and therefore
+    # cannot turn an unavailable URL into candidate or JD facts.
+    ctx.has_jd = ctx.jd_supplied
 
     # Diagnostic log
     cv_text_len = len(ctx.cv_text.strip()) if ctx.cv_text else 0
     logger.info(
-        "CV extraction summary | has_cv=%s | cv_text_chars=%d | ocr_quality=%s | low_ocr_quality=%s | query_chars=%d | has_jd=%s",
+        "CV extraction summary | has_cv=%s | cv_text_chars=%d | ocr_quality=%s | low_ocr_quality=%s | query_chars=%d | has_jd=%s | jd_available=%s",
         ctx.has_cv, cv_text_len,
         ctx.ocr_quality.get("score") if ctx.ocr_quality else "N/A",
-        ctx._low_ocr_quality, len(ctx.query_text), ctx.has_jd,
+        ctx._low_ocr_quality, len(ctx.query_text), ctx.has_jd, ctx.jd_available,
     )
     if ctx.cv_text and ctx.cv_text.strip():
         logger.info("CV extraction succeeded | chars=%d", len(ctx.cv_text))

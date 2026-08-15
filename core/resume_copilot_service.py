@@ -432,8 +432,190 @@ def _final_evidence_bindings(final_resume: Any, source: Any, prior_bindings: Ite
             continue
         current = values.get(binding.path, "")
         if current and current == str(binding.claim or "").strip():
-            retained.setdefault(binding.path, binding)
+            existing = retained.get(binding.path)
+            # A fresh fuzzy bind can use ``mode=rewritten`` without carrying
+            # the optimizer's reviewed source claim.  Do not let that weaker
+            # placeholder shadow the exact provenance retained by V2.
+            if (
+                binding.mode == "rewritten"
+                and binding.source_claim
+                and (existing is None or not existing.source_claim)
+            ):
+                retained[binding.path] = binding
+            else:
+                retained.setdefault(binding.path, binding)
     return list(retained.values())
+
+
+_ATOMIC_INDEX = re.compile(r"#atom\[(\d+)]$")
+
+
+def _repair_unsupported_atomic_values(
+    resume: Any,
+    unsupported_output: Iterable[dict[str, Any]],
+) -> tuple[Any, list[str]]:
+    """Remove only unsupported atoms while retaining supported siblings.
+
+    The independent atomic audit reports paths plus atom indexes.  Applying
+    those indexes to the same public atomizer lets the final delivery gate trim
+    one JD-only skill or one fabricated result clause without deleting the
+    surrounding, source-supported record.
+    """
+
+    from atomic_fact_audit import atomize_claim_text
+
+    unsupported: dict[str, set[int]] = {}
+    for item in unsupported_output:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("canonical_field_path") or "").strip()
+        match = _ATOMIC_INDEX.search(str(item.get("atom_id") or ""))
+        if path and match:
+            unsupported.setdefault(path, set()).add(int(match.group(1)))
+    if not unsupported:
+        return resume, []
+
+    repaired = resume.model_copy(deep=True)
+    changed: list[str] = []
+
+    def repair_value(path: str, value: str, separator: str = "，") -> str:
+        bad = unsupported.get(path)
+        text = str(value or "").strip()
+        if not bad or not text:
+            return text
+        atoms = atomize_claim_text(text)
+        kept = [atom for index, atom in enumerate(atoms) if index not in bad]
+        if len(kept) == len(atoms):
+            return text
+        changed.append(path)
+        if not kept:
+            return ""
+        result = separator.join(kept).strip("，,、。；; ")
+        return result + ("。" if separator == "，" else "")
+
+    for key in ("name", "phone", "email", "work_experience"):
+        path = f"meta.{key}"
+        setattr(repaired.meta, key, repair_value(path, getattr(repaired.meta, key)))
+
+    summary_sentences = [
+        item.strip()
+        for item in re.split(r"[。；;！？!?]+", str(repaired.summary or ""))
+        if item.strip()
+    ]
+    kept_summary: list[str] = []
+    for index, sentence in enumerate(summary_sentences):
+        value = repair_value(f"summary[{index}]", sentence)
+        if value:
+            kept_summary.append(value.rstrip("。"))
+    repaired.summary = "。".join(kept_summary) + ("。" if kept_summary else "")
+
+    record_fields = {
+        "education": ("school", "degree", "major", "period"),
+        "experience": ("organization", "role", "period"),
+        "research": ("institution", "topic", "period"),
+        "activities": ("organization", "role", "period"),
+        "projects": ("name", "organization", "role", "period"),
+    }
+    for section, fields in record_fields.items():
+        for record_index, record in enumerate(getattr(repaired, section)):
+            for field in fields:
+                path = f"{section}[{record_index}].{field}"
+                setattr(record, field, repair_value(path, getattr(record, field)))
+            if not hasattr(record, "bullets"):
+                continue
+            bullets: list[str] = []
+            for bullet_index, bullet in enumerate(record.bullets):
+                path = f"{section}[{record_index}].bullets[{bullet_index}]"
+                value = repair_value(path, bullet)
+                if value:
+                    bullets.append(value)
+            record.bullets = bullets
+
+    kept_skills = []
+    for index, skill in enumerate(repaired.skills.items):
+        path = f"skills.items[{index}].name"
+        name = repair_value(path, skill.name, "、")
+        if name:
+            skill.name = name
+            kept_skills.append(skill)
+    repaired.skills.items = kept_skills
+
+    for section in (
+        "awards", "publications", "patents", "certifications", "training", "teaching",
+    ):
+        values: list[str] = []
+        for index, value in enumerate(getattr(repaired, section)):
+            path = f"{section}[{index}]"
+            cleaned = repair_value(path, value)
+            if cleaned:
+                values.append(cleaned)
+        setattr(repaired, section, values)
+
+    additional: dict[str, list[str]] = {}
+    for title, values in repaired.additional_sections.items():
+        kept: list[str] = []
+        for index, value in enumerate(values):
+            path = f"additional_sections.{title}[{index}]"
+            cleaned = repair_value(path, value)
+            if cleaned:
+                kept.append(cleaned)
+        if kept:
+            additional[title] = kept
+    repaired.additional_sections = additional
+    return repaired, list(dict.fromkeys(changed))
+
+
+def _enforce_final_atomic_gate(
+    resume_data: dict[str, Any],
+    source: Any,
+    prior_bindings: Iterable[Any],
+    *,
+    max_iterations: int = 4,
+) -> tuple[dict[str, Any], Any, list[Any], list[str], dict[str, Any]]:
+    """Audit and minimally repair the exact structure sent to the renderer."""
+
+    from atomic_fact_audit import audit_atomic_facts
+    from v2_pipeline import _canonical_to_v1_format
+
+    framework = copy.deepcopy(resume_data.get("framework"))
+    canonical = _canonical_resume_from_render_data(resume_data)
+    bindings = _final_evidence_bindings(canonical, source, prior_bindings)
+    removed_paths: list[str] = []
+    audit: dict[str, Any] = {}
+    for _iteration in range(max(1, int(max_iterations))):
+        audit = audit_atomic_facts(
+            source=source,
+            resume=canonical,
+            evidence_bindings=bindings,
+        )
+        unsupported = list(
+            (audit.get("atomic_factuality") or {}).get("unsupported_output") or []
+        )
+        if not unsupported:
+            break
+        repaired, changed = _repair_unsupported_atomic_values(canonical, unsupported)
+        if not changed or repaired == canonical:
+            break
+        canonical = repaired
+        removed_paths.extend(changed)
+        bindings = _final_evidence_bindings(canonical, source, bindings)
+
+    # Report the post-repair state, including the unlikely case where a path
+    # could not be addressed deterministically.
+    audit = audit_atomic_facts(
+        source=source,
+        resume=canonical,
+        evidence_bindings=bindings,
+    )
+    rendered = _canonical_to_v1_format(canonical)
+    if isinstance(framework, dict):
+        rendered["framework"] = framework
+    trace_event(
+        "final_atomic_gate",
+        removed_paths=list(dict.fromkeys(removed_paths)),
+        atomic_factuality=audit.get("atomic_factuality", {}),
+    )
+    return rendered, canonical, bindings, list(dict.fromkeys(removed_paths)), audit
 
 
 def _detail_render_paths(
@@ -1116,7 +1298,22 @@ async def _resume_copilot_service_impl(
     # V2 pipeline — synchronous call (handles both CV and no-CV cases)
     t_v2 = time.perf_counter()
     from v2_pipeline import run_v2_pipeline
-    v2_result = await asyncio.to_thread(run_v2_pipeline, ctx.cv_text, ctx.query_text, ctx.jd_text)
+    cv_was_ocr = any(
+        str(item.get("source") or "") == "cv"
+        and "OCR" in str(item.get("message") or "").upper()
+        for item in ctx.ocr_warnings
+        if isinstance(item, dict)
+    )
+    v2_result = await asyncio.to_thread(
+        run_v2_pipeline,
+        ctx.cv_text,
+        ctx.query_text,
+        ctx.jd_text,
+        # Plain OCR output preserves text spans but not a sufficiently stable
+        # cross-column record graph.  Keep generation and verification active,
+        # but do not recover omitted clauses into a guessed source record.
+        record_recovery_allowed=not cv_was_ocr,
+    )
     ctx.resume_data = v2_result.resume_dict
     trace_event(
         "service_v2_result",
@@ -1172,6 +1369,43 @@ async def _resume_copilot_service_impl(
         for c in (v2_result.changes or [])
     ]
 
+    # Enforce the independent atomic audit against the exact renderer schema.
+    # This catches values (notably JD-only skills) that a coarser field guard
+    # can report but cannot remove, and trims only the unsupported clause when
+    # a bullet also contains supported candidate facts.
+    final_canonical = None
+    final_bindings: list[Any] = []
+    atomic_gate_started = time.perf_counter()
+    try:
+        (
+            ctx.resume_data,
+            final_canonical,
+            final_bindings,
+            atomic_removed,
+            final_atomic_audit,
+        ) = _enforce_final_atomic_gate(
+            ctx.resume_data,
+            truth_bundle,
+            v2_result.evidence_bindings,
+        )
+        ctx.changes.extend({
+            "path": path,
+            "action": "remove",
+            "reason": "Unsupported atomic candidate fact removed by final delivery gate",
+        } for path in atomic_removed)
+        ctx.perf["final_atomic_unsupported"] = float(
+            (final_atomic_audit.get("atomic_factuality") or {}).get(
+                "unsupported_atom_count", 0,
+            )
+        )
+    except Exception as exc:
+        # Keep the already evidence-gated V2 result if this defensive audit
+        # itself fails; the quality report below will still expose the issue.
+        logger.warning("Final atomic delivery gate failed: %s", exc)
+    ctx.perf["final_atomic_gate_s"] = round(
+        time.perf_counter() - atomic_gate_started, 3,
+    )
+
     # Check required fields on V2 output
     ctx.missing_fields = check_required_fields(
         ctx.resume_data,
@@ -1183,12 +1417,13 @@ async def _resume_copilot_service_impl(
     ctx.conflicts = _collect_content_conflicts(ctx.resume_data, ctx.jd_text)
     quality_started = time.perf_counter()
     try:
-        final_canonical = _canonical_resume_from_render_data(ctx.resume_data)
-        final_bindings = _final_evidence_bindings(
-            final_canonical,
-            truth_bundle,
-            v2_result.evidence_bindings,
-        )
+        if final_canonical is None:
+            final_canonical = _canonical_resume_from_render_data(ctx.resume_data)
+            final_bindings = _final_evidence_bindings(
+                final_canonical,
+                truth_bundle,
+                v2_result.evidence_bindings,
+            )
         ctx.perf["evidence_bindings"] = float(len(final_bindings))
         ctx._write_debug(
             "09_final_evidence_bindings.json",
@@ -1199,9 +1434,11 @@ async def _resume_copilot_service_impl(
             source=truth_bundle,
             resume=final_canonical,
             evidence_bindings=final_bindings,
-            changes=v2_result.changes,
+            changes=ctx.changes,
             missing_fields=ctx.missing_fields,
             jd_text=ctx.jd_text,
+            jd_supplied=ctx.jd_supplied,
+            jd_unavailable=ctx.jd_unavailable,
             target_role=ctx.target_role,
             framework_mode=isinstance(ctx.resume_data.get("framework"), dict),
         )
