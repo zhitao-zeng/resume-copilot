@@ -157,7 +157,11 @@ def validate_realized_claims(frozen: FrozenResume, fact_graph: FactGraph) -> lis
                 violations.append(f"{claim.claim_id}:unknown_fact:{fact_id}")
             elif not fact.eligible:
                 violations.append(f"{claim.claim_id}:ineligible_fact:{fact_id}")
-            elif fact.text not in claim.text:
+            elif not summary_citation and fact.text not in claim.text:
+                # Summary citations are synthesis surfaces: they are gated by
+                # the Phase 4 summary verifier (bound fact IDs, no novel
+                # numbers, no inferred tenure or unsupported adjectives), so
+                # the atomic audit does not demand verbatim preservation.
                 violations.append(f"{claim.claim_id}:source_text_not_preserved:{fact_id}")
             if fact is not None and not summary_citation and fact.record_id != claim.record_id:
                 violations.append(f"{claim.claim_id}:record_mismatch:{fact_id}")

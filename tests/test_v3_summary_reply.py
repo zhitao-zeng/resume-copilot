@@ -126,6 +126,55 @@ def test_timeline_concatenation_rejected():
     assert any("timeline_concatenation" in v for v in violations)
 
 
+def test_foreign_anchor_rejected_when_not_bound():
+    def typed_semantic(_model, _system, user_prompt, **_kwargs):
+        decisions = []
+        for candidate in json.loads(user_prompt)["candidates"]:
+            text = candidate["candidate_text"]
+            fact_type = "organization" if "公司" in text else "action"
+            decisions.append({
+                "candidate_fact_id": candidate["candidate_fact_id"],
+                "classification": "fact",
+                "record_id": candidate["locked_record_id"],
+                "atoms": [{
+                    "quote": text,
+                    "fact_type": fact_type,
+                    "destination_section": "experience",
+                    "destination_field": "bullet",
+                }],
+                "context_spans": [],
+            })
+        return {"schema_version": SCHEMA_VERSION, "decisions": decisions}
+
+    result = run_v3_pipeline(
+        cv_text=CV_TWO_RECORDS,
+        semantic_llm_call=typed_semantic,
+        realizer_llm_call=_echo_realizer,
+    )
+    graph = result.output.graph
+    b_facts = [
+        fact.fact_id for fact in graph.eligible_facts()
+        if fact.record_id and "record:2" in fact.record_id
+    ]
+    all_ids = [fact.fact_id for fact in graph.eligible_facts()]
+    # 只绑定乙公司（record:2）的事实，却在总结里提到甲公司 → foreign_entity
+    verified, violations = validate_summary_sentences(
+        [{"text": "曾在甲公司负责订单系统。", "fact_ids": b_facts or all_ids[-2:]}],
+        graph,
+        allowed_fact_ids=all_ids,
+    )
+    assert verified == []
+    assert any("foreign_entity" in v for v in violations)
+
+
+def test_reply_conflicts_hide_internal_ids():
+    from core.v3.reply_builder import _friendly_conflicts
+
+    friendly = _friendly_conflicts(["cv:record:4:period", "cv:record:4:period", "cv:record:7:organization"])
+    assert friendly == ["存在多处不一致的时间表述，请核对确认。", "存在多处不一致的组织表述，请核对确认。"]
+    assert all("record:" not in item and "cv:" not in item for item in friendly)
+
+
 def test_length_budget_drops_trailing_sentences():
     result = _graph_with_sentences()
     graph = result.output.graph
@@ -234,6 +283,30 @@ def test_reply_jd_analysis_bounded_and_evidence_backed():
     assert len(match_lines) <= 3
     assert len(gap_lines) <= 3
     assert any("依据：" in line for line in match_lines)
+
+
+def test_reply_never_shows_jd_structure_artifacts_as_gaps():
+    jd = (
+        "前端开发工程师\n"
+        "职位概述：\n"
+        "作为前端开发工程师，负责使用现代框架开发高可用界面\n"
+        "主要职责：\n"
+        "要求：5 年以上 React 开发经验\n"
+        "要求：熟悉 TypeScript 与构建工具链"
+    )
+    result = run_v3_pipeline(
+        cv_text=CV_TWO_RECORDS,
+        jd_text=jd,
+        semantic_llm_call=_echo_semantic,
+        realizer_llm_call=_echo_realizer,
+    )
+    reply = result.reply_text
+    assert "职位概述" not in reply
+    assert "主要职责" not in reply
+    gap_lines = [line for line in reply.splitlines() if line.startswith("- 差距：")]
+    assert all("前端开发工程师；" not in line for line in gap_lines)
+    # 真正的要求内容仍然在
+    assert "React" in reply or "TypeScript" in reply or "现代框架" in reply
 
 
 def test_reply_groups_undetermined_ownership_without_internal_ids():

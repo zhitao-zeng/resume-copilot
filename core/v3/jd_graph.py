@@ -16,6 +16,11 @@ def build_requirement_graph(text: str, *, source_id: str = "jd") -> RequirementG
         cursor = start + len(raw) + 1
         if not value:
             continue
+        # Pure section headers ("职位概述：", "主要职责：") are document
+        # structure, never requirements — they must not surface as match or
+        # gap items anywhere downstream.
+        if re.fullmatch(r"[^：:\n]{1,15}[：:]\s*", value):
+            continue
         lowered = value.casefold()
         if any(token in lowered for token in ("要求", "职责", "负责", "requirement", "responsibilit", "qualification")):
             req_type = "responsibility" if any(token in lowered for token in ("负责", "职责", "responsibilit")) else "qualification"

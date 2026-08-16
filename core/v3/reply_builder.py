@@ -25,6 +25,29 @@ _MAX_GAPS = 3
 _MAX_UNDETERMINED = 3
 
 
+_REQUIREMENT_CONTENT_SIGNAL = re.compile(
+    r"负责|要求|经验|技能|能力|熟练|熟悉|精通|优先|以上|年|学历|学位|证书"
+    r"|manage|develop|build|lead|design|experience|skill|degree",
+    re.IGNORECASE,
+)
+_PURE_LABEL_LINE = re.compile(r"^[^：:\n]{1,15}[：:]\s*$")
+
+
+def _is_actionable_requirement(text: str) -> bool:
+    """Only real requirement content may surface as a match/gap item.
+
+    JD section headers and bare title lines are parsing artifacts; showing
+    them to the user as "差距" would expose our own mistakes in the reply.
+    """
+
+    compact = re.sub(r"\s+", "", str(text))
+    if not compact or _PURE_LABEL_LINE.match(str(text).strip()):
+        return False
+    if len(compact) <= 8 and not _REQUIREMENT_CONTENT_SIGNAL.search(compact):
+        return False
+    return True
+
+
 def _excerpt(text: str, limit: int = 24) -> str:
     compact = re.sub(r"\s+", "", str(text))
     return compact if len(compact) <= limit else compact[: limit - 1] + "…"
@@ -64,6 +87,30 @@ def undetermined_ownership_facts(audit: Audit, fact_graph: FactGraph) -> list[st
     return items
 
 
+_CONFLICT_TYPE_LABELS = {
+    "period": "时间",
+    "organization": "组织",
+    "role": "岗位",
+    "metric": "数字",
+    "credential": "证书或资质",
+}
+
+
+def _friendly_conflicts(conflicts: list[str]) -> list[str]:
+    """Render audit conflict hints without internal record/fact identifiers."""
+
+    labels = []
+    for item in conflicts:
+        fact_type = str(item).rsplit(":", 1)[-1]
+        label = _CONFLICT_TYPE_LABELS.get(fact_type, "信息")
+        if label not in labels:
+            labels.append(label)
+    return [
+        f"存在多处不一致的{label}表述，请核对确认。"
+        for label in labels
+    ]
+
+
 def build_reply(
     audit: Audit,
     fact_graph: FactGraph,
@@ -81,7 +128,10 @@ def build_reply(
     else:
         lines.append("生成方向：仅依据可回指的个人事实组织简历；JD 仅用于排序与差距分析，不会补写为个人经历。")
 
-    requirement_items = list(requirements.requirements) if requirements else []
+    requirement_items = [
+        item for item in (requirements.requirements if requirements else [])
+        if _is_actionable_requirement(item.text)
+    ]
     if requirement_items:
         matches: list[str] = []
         gaps: list[str] = []
@@ -117,15 +167,15 @@ def build_reply(
     undetermined = undetermined_ownership_facts(audit, fact_graph)
     if undetermined:
         excerpts = "、".join(f"「{_excerpt(text, 30)}」" for text in undetermined[:_MAX_UNDETERMINED])
-        extra = "" if len(undetermined) <= _MAX_UNDETERMINED else f"等 {len(undetermined)} 条"
+        shown = min(len(undetermined), _MAX_UNDETERMINED)
         lines.append(
-            f"待确认归属：{extra or f'{len(undetermined)} 条'}信息未能确认所属经历，已按原文保留：{excerpts}。"
+            f"待确认归属：共 {len(undetermined)} 条信息未能确认所属经历，已按原文保留（展示 {shown} 条）：{excerpts}。"
             "请确认这些信息分别属于哪段经历。"
         )
 
     if audit.conflicts:
         lines.append("冲突检查：")
-        lines.extend(f"- {item}" for item in audit.conflicts[:3])
+        lines.extend(f"- {item}" for item in _friendly_conflicts(list(audit.conflicts)[:3]))
     else:
         lines.append("冲突检查：未发现时间或信息冲突。")
     return "\n".join(lines)

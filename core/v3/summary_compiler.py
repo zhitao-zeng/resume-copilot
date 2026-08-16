@@ -154,6 +154,40 @@ def validate_summary_sentences(
             cited.append(fact)
         cited_texts = [fact.text for fact in cited]
         blob = "\n".join(cited_texts)
+        allowed_anchor_texts = {
+            anchor.text for fact in cited for anchor in fact.anchors
+        }
+        # A hard anchor (org/role/period/number/credential) may only appear in
+        # the summary when it belongs to a bound fact — no foreign anchors.
+        for other in graph.eligible_facts():
+            for anchor in other.anchors:
+                if (
+                    anchor.text
+                    and anchor.text not in allowed_anchor_texts
+                    and anchor.text in text
+                    and anchor.text not in blob
+                ):
+                    sentence_violations.append(
+                        f"{label}:foreign_anchor:{anchor.text}"
+                    )
+        # Organization/role/credential entities likewise require binding:
+        # mentioning an uncited entity is fabrication surface, even when
+        # every number checks out.  Candidates are the whitespace/punctuation
+        # segments of entity-typed facts, minus date/number fragments.
+        entity_candidates: set[str] = set()
+        for other in graph.eligible_facts():
+            if other.fact_type not in {"organization", "role", "credential"}:
+                continue
+            for segment in re.split(r"[\s，,、；;：:（）()]+", other.text):
+                segment = segment.strip()
+                if len(segment) < 2 or _NUMBER_RE.fullmatch(segment):
+                    continue
+                if segment in blob:
+                    continue
+                entity_candidates.add(segment)
+        for segment in sorted(entity_candidates):
+            if segment in text:
+                sentence_violations.append(f"{label}:foreign_entity:{segment}")
         allowed_numbers = set()
         for fact_text in cited_texts:
             allowed_numbers.update(_NUMBER_RE.findall(fact_text))
