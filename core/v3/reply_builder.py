@@ -50,6 +50,7 @@ def _is_actionable_requirement(text: str) -> bool:
 
 def _excerpt(text: str, limit: int = 24) -> str:
     compact = re.sub(r"\s+", "", str(text))
+    compact = compact.lstrip("-•·*▪◦")
     return compact if len(compact) <= limit else compact[: limit - 1] + "…"
 
 
