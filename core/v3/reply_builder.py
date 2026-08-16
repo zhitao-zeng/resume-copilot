@@ -1,4 +1,17 @@
-"""Build user-facing explanation from the frozen audit only."""
+"""Concise user-facing reply compiled from the frozen audit only (R24 Phase 4).
+
+Structure (roughly 250-600 Chinese characters by design, never a hard cut):
+
+- 生成方向: one or two sentences, no resume echo.
+- 岗位匹配 (JD supplied): up to three evidence-backed matches and up to
+  three gaps with an action; without a JD, positioning and evidence
+  completeness advice instead.
+- 缺失信息: exact absent field labels only.
+- 待确认归属: material facts whose ownership stayed undetermined, grouped in
+  source wording with one clarification question — never guessed into an
+  experience, never silently dropped, never exposing internal IDs.
+- 冲突检查: actual conflicts only, otherwise one explicit no-conflict line.
+"""
 from __future__ import annotations
 
 import re
@@ -7,53 +20,115 @@ from .contracts import Audit, FactGraph, RequirementGraph
 
 
 _JD_STOPWORDS = {"岗位要求", "任职要求", "工作职责", "职责", "要求", "负责", "能力", "经验"}
+_MAX_MATCHES = 3
+_MAX_GAPS = 3
+_MAX_UNDETERMINED = 3
 
 
-def _requirement_supported(requirement: str, fact_texts: list[str]) -> bool:
-    tokens = [
+def _excerpt(text: str, limit: int = 24) -> str:
+    compact = re.sub(r"\s+", "", str(text))
+    return compact if len(compact) <= limit else compact[: limit - 1] + "…"
+
+
+def _requirement_tokens(requirement: str) -> list[str]:
+    return [
         token.casefold()
-        for token in re.findall(r"[A-Za-z][A-Za-z0-9+#.-]{1,}|[\u4e00-\u9fff]{2,8}", requirement)
+        for token in re.findall(r"[A-Za-z][A-Za-z0-9+#.-]{1,}|[一-鿿]{2,8}", requirement)
         if token.casefold() not in {item.casefold() for item in _JD_STOPWORDS}
     ]
-    return any(token in fact.casefold() for token in tokens for fact in fact_texts)
 
 
-def build_reply(audit: Audit, fact_graph: FactGraph, requirements: RequirementGraph | None = None) -> str:
-    facts = fact_graph.fact_map()
-    written = [facts[fid].text for fid in audit.written_fact_ids if fid in facts]
-    missing = [facts[fid].text for fid in audit.missing_fact_ids if fid in facts]
-    lines = ["处理总结：", "生成方向总结：仅使用可回指的个人事实组织简历；JD只用于排序和差距分析。"]
-    if written:
-        lines.append("已写入信息：")
-        lines.extend(f"- {text}" for text in written)
+def _supporting_fact(requirement: str, fact_texts: list[str]) -> str:
+    tokens = _requirement_tokens(requirement)
+    for fact in fact_texts:
+        folded = fact.casefold()
+        if any(token in folded for token in tokens):
+            return fact
+    return ""
+
+
+def undetermined_ownership_facts(audit: Audit, fact_graph: FactGraph) -> list[str]:
+    """Material written facts that were never assigned to a record."""
+
+    fact_map = fact_graph.fact_map()
+    items: list[str] = []
+    for fact_id in audit.written_fact_ids:
+        fact = fact_map.get(fact_id)
+        if fact is None or fact.record_id is not None:
+            continue
+        if fact.fact_type in {"identity", "contact", "placeholder"}:
+            continue
+        if fact.destination_section in {"contact", "summary"}:
+            continue
+        items.append(fact.text)
+    return items
+
+
+def build_reply(
+    audit: Audit,
+    fact_graph: FactGraph,
+    requirements: RequirementGraph | None = None,
+    *,
+    missing_fields: list[dict] | None = None,
+    skeleton: bool = False,
+) -> str:
+    fact_map = fact_graph.fact_map()
+    written = [fact_map[fid].text for fid in audit.written_fact_ids if fid in fact_map]
+    lines: list[str] = []
+
+    if skeleton:
+        lines.append("生成方向：当前未提供可写入的个人事实，已生成结构化待填写框架，不虚构任何经历。")
     else:
-        lines.append("已写入信息：暂无可验证的个人事实，已保留结构化待补充框架。")
-    if missing:
-        lines.append("建议补充或未纳入的信息：")
-        lines.extend(f"- {text}" for text in missing)
+        lines.append("生成方向：仅依据可回指的个人事实组织简历；JD 仅用于排序与差距分析，不会补写为个人经历。")
+
+    requirement_items = list(requirements.requirements) if requirements else []
+    if requirement_items:
+        matches: list[str] = []
+        gaps: list[str] = []
+        for item in requirement_items[:8]:
+            support = _supporting_fact(item.text, written)
+            if support:
+                matches.append(f"{_excerpt(item.text, 20)}（依据：{_excerpt(support)}）")
+            else:
+                gaps.append(f"{_excerpt(item.text, 20)}")
+        lines.append(f"岗位匹配：{len(matches)} 项要求找到直接事实依据，{len(gaps)} 项暂无依据（来自JD的要求仅作参考，不会补写为个人经历）。")
+        for match in matches[:_MAX_MATCHES]:
+            lines.append(f"- 匹配：{match}")
+        for gap in gaps[:_MAX_GAPS]:
+            lines.append(f"- 差距：{gap}；建议补充真实对应经历，不会代为虚构。")
     else:
-        lines.append("建议补充或未纳入的信息：暂无已识别但未写入的个人事实。")
+        if skeleton:
+            lines.append("岗位建议：提供目标 JD 后可基于写入事实做匹配分析；当前先按框架补充真实信息。")
+        else:
+            advice = "材料已覆盖通用必备模块。" if not missing_fields else "建议优先补齐下方缺失项后再投递。"
+            lines.append(f"岗位建议：未提供目标岗位，已按通用结构保留全部可验证事实；{advice}")
+
+    labels = [
+        str(item.get("label") or item.get("field") or "")
+        for item in (missing_fields or [])
+        if isinstance(item, dict)
+    ]
+    labels = [label for label in labels if label]
+    if labels:
+        lines.append("缺失信息：" + "、".join(labels) + "。")
+    else:
+        lines.append("缺失信息：当前通用必备模块未发现明确缺项。")
+
+    undetermined = undetermined_ownership_facts(audit, fact_graph)
+    if undetermined:
+        excerpts = "、".join(f"「{_excerpt(text, 30)}」" for text in undetermined[:_MAX_UNDETERMINED])
+        extra = "" if len(undetermined) <= _MAX_UNDETERMINED else f"等 {len(undetermined)} 条"
+        lines.append(
+            f"待确认归属：{extra or f'{len(undetermined)} 条'}信息未能确认所属经历，已按原文保留：{excerpts}。"
+            "请确认这些信息分别属于哪段经历。"
+        )
+
     if audit.conflicts:
-        lines.append("待确认的潜在冲突：")
-        lines.extend(f"- {item}" for item in audit.conflicts)
+        lines.append("冲突检查：")
+        lines.extend(f"- {item}" for item in audit.conflicts[:3])
     else:
-        lines.append("待确认的潜在冲突：未发现结构化冲突。")
-    if requirements and requirements.requirements:
-        lines.append("岗位建议：")
-        considered = requirements.requirements[:8]
-        covered = [item.text for item in considered if _requirement_supported(item.text, written)]
-        unsupported = [item.text for item in considered if item.text not in covered]
-        lines.append("- 已按岗位要求对已有事实排序；以下内容来自JD，不会被补写为个人经历。")
-        if covered:
-            lines.append("- 现有事实中找到直接文本依据的要求：" + "；".join(covered))
-        if unsupported:
-            lines.append("- 尚未在个人材料中找到直接依据的要求：" + "；".join(unsupported))
-    else:
-        lines.append("岗位建议：提供目标JD后可基于现有事实进行岗位匹配排序。")
-    if audit.recommendations:
-        lines.append("下一步建议：")
-        lines.extend(f"- {item}" for item in audit.recommendations)
+        lines.append("冲突检查：未发现时间或信息冲突。")
     return "\n".join(lines)
 
 
-__all__ = ["build_reply"]
+__all__ = ["build_reply", "undetermined_ownership_facts"]

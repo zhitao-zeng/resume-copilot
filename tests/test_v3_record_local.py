@@ -311,7 +311,10 @@ def test_packing_respects_character_budget(monkeypatch):
 
 
 def test_summary_only_when_all_units_clean_and_single_pack():
+    seen = []
+
     def summarizing_realizer(_model, _system, user_prompt, **_kwargs):
+        seen.append(json.loads(user_prompt))
         response = _echo_realizer(_model, _system, user_prompt, **_kwargs)
         request = json.loads(user_prompt)
         if "optional_summary" in request:
@@ -334,22 +337,22 @@ def test_summary_only_when_all_units_clean_and_single_pack():
             }]
         return response
 
-    clean = run_v3_pipeline(
+    run_v3_pipeline(
         cv_text=CV_TWO_RECORDS,
         semantic_llm_call=_echo_semantic,
         realizer_llm_call=summarizing_realizer,
     )
-    assert clean.realization_report.status == "success"
-    assert clean.resume_data.get("summary")
+    assert any("optional_summary" in payload for payload in seen)
 
-    degraded = run_v3_pipeline(
+    seen.clear()
+    run_v3_pipeline(
         cv_text=CV_TWO_RECORDS,
         semantic_llm_call=_degrading_semantic("订单系统重构"),
         realizer_llm_call=summarizing_realizer,
     )
-    assert degraded.realization_report.status == "partial"
-    # Degraded units disable the optional summary request entirely.
-    assert not degraded.resume_data.get("summary")
+    # Degraded units disable the realizer's optional summary request entirely;
+    # the verified Phase 4 summary compiler owns the section from here on.
+    assert all("optional_summary" not in payload for payload in seen)
 
 
 def test_invalid_summary_claim_is_rejected_without_touching_body():

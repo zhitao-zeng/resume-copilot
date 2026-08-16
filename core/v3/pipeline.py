@@ -17,6 +17,7 @@ from .repair import minimal_repair
 from .reply_builder import build_reply
 from .resume_adapter import frozen_to_resume_data
 from .semantic_llm import SemanticCompilationReport, compile_semantics
+from .summary_compiler import compile_summary
 from .training_examples import build_training_records, maybe_write_training_trace
 
 
@@ -46,7 +47,7 @@ def _native_graph(source_id: str, source_type: str, text: str):
     return from_native_text(asset, text)
 
 
-def _quality_report(output: V3Output, semantic: SemanticCompilationReport, realization: RealizationReport) -> dict[str, Any]:
+def _quality_report(output: V3Output, semantic: SemanticCompilationReport, realization: RealizationReport, summary: dict[str, Any] | None = None) -> dict[str, Any]:
     audit = output.audit
     graph = output.graph
     factual_claim_ids = [claim.claim_id for claim in output.frozen.claims if claim.fact_ids]
@@ -120,6 +121,9 @@ def _quality_report(output: V3Output, semantic: SemanticCompilationReport, reali
             "realization_status": realization.status,
             "realization_error": realization.error,
             "realization_violations": list(realization.violations),
+            "realization_unit_reports": [dict(report) for report in realization.unit_reports],
+            "summary_status": (summary or {}).get("status", ""),
+            "summary_violations": (summary or {}).get("violations") or [],
         },
     }
 
@@ -152,37 +156,6 @@ def _missing_fields(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
-def _delivery_reply(
-    base: str,
-    resume_data: dict[str, Any],
-    missing_fields: list[dict[str, Any]],
-) -> str:
-    section_labels = {
-        "summary": "个人总结", "experience": "工作/实习经历", "projects": "项目经历",
-        "research": "科研经历", "campus_experience": "校园与志愿经历",
-        "education": "教育经历", "skills": "技能", "certifications": "证书与资质",
-        "awards": "荣誉奖项", "publications": "论文成果", "training": "培训与进修",
-        "teaching": "教学经历", "additional_sections": "补充经历",
-    }
-    meta = resume_data.get("meta") if isinstance(resume_data.get("meta"), dict) else {}
-    generated = ["基本信息"] if any(meta.get(key) for key in ("name", "phone", "email", "expected_city")) else []
-    generated.extend(
-        label for key, label in section_labels.items()
-        if resume_data.get(key)
-    )
-    if isinstance(resume_data.get("framework"), dict):
-        generated = ["结构化待填写简历框架"]
-    lines = [base]
-    lines.append("输出模块：" + ("、".join(generated) if generated else "基本信息"))
-    if missing_fields:
-        lines.append("缺失信息明细：")
-        for item in missing_fields:
-            lines.append(f"- {item.get('label', item.get('field', '信息'))}：{item.get('reason', '未提供')}。")
-    else:
-        lines.append("缺失信息明细：当前通用必备模块未发现明确缺项；仍建议人工确认联系方式与时间。")
-    return "\n".join(lines)
-
-
 def run_v3_pipeline(
     *,
     cv_content: bytes = b"",
@@ -197,6 +170,7 @@ def run_v3_pipeline(
     cv_document_graph: DocumentGraph | None = None,
     semantic_llm_call: Any = None,
     realizer_llm_call: Any = None,
+    summary_llm_call: Any = None,
 ) -> V3PipelineResult:
     """Execute V3 while keeping every trainable decision behind fixed schemas."""
 
@@ -250,6 +224,18 @@ def run_v3_pipeline(
     if not audit.clean:
         frozen = minimal_repair(frozen, audit, graph)
         audit = audit_frozen_resume(frozen, graph, requirements)
+    # R24 Phase 4: the profile summary is compiled and re-verified as bound
+    # atomic claims (no inferred tenure, no unsupported adjectives); it
+    # survives only when the atomic verifier still accepts the frozen resume.
+    summary_result = compile_summary(
+        frozen,
+        graph,
+        requirements,
+        use_llm=use_llm,
+        llm_call=summary_llm_call,
+    )
+    frozen = summary_result.frozen
+    audit = audit_frozen_resume(frozen, graph, requirements)
     ledger = CoverageLedger(
         eligible_fact_ids=plan.ledger.eligible_fact_ids,
         planned_fact_ids=plan.ledger.planned_fact_ids,
@@ -263,9 +249,18 @@ def run_v3_pipeline(
     plan = plan.model_copy(update={"ledger": ledger})
     resume_data = frozen_to_resume_data(frozen, graph, target_role=target_role)
     missing = _missing_fields(resume_data)
-    reply = _delivery_reply(build_reply(audit, graph, requirements), resume_data, missing)
+    # R24 Phase 4: concise reply compiled from the frozen audit — direction,
+    # bounded evidence-backed match/gap analysis, exact missing fields,
+    # grouped undetermined-ownership items, and real conflicts only.
+    reply = build_reply(
+        audit,
+        graph,
+        requirements,
+        missing_fields=missing,
+        skeleton=plan.skeleton,
+    )
     output = V3Output(graph=graph, plan=plan, frozen=frozen, audit=audit, reply=reply)
-    quality = _quality_report(output, semantic_result.report, realization.report)
+    quality = _quality_report(output, semantic_result.report, realization.report, summary_result.report.to_dict())
     conflicts = [
         {"field": "source_conflict", "description": conflict}
         for conflict in audit.conflicts

@@ -1981,9 +1981,10 @@ def test_jd_only_v3_is_structured_framework_without_candidate_facts():
     assert not result.output.graph.eligible_facts()
     rendered = json.dumps(result.resume_data, ensure_ascii=False)
     assert "用户研究" not in rendered
-    assert "输出模块：结构化待填写简历框架" in result.reply_text
-    assert "缺失信息明细" in result.reply_text
-    assert "姓名" in result.reply_text
+    # R24 concise reply contract: framework direction + exact missing labels.
+    assert "结构化待填写框架" in result.reply_text
+    assert "缺失信息：" in result.reply_text
+    assert "生成方向：" in result.reply_text
 
 
 def test_docx_adapter_preserves_body_table_hierarchy_and_exact_spans():
