@@ -425,3 +425,137 @@ def test_multi_pack_skips_summary_request(monkeypatch):
     # resumes report the skip instead of synthesizing from a partial view.
     assert all("optional_summary" not in payload for payload in seen)
     assert result.realization_report.status == "success"
+
+
+def _label_splitting_semantic(_model, _system, user_prompt, **_kwargs):
+    """Mirror the production label/value split: value atom + label context."""
+
+    decisions = []
+    for candidate in json.loads(user_prompt)["candidates"]:
+        text = candidate["candidate_text"]
+        if "：" in text or ":" in text:
+            sep = "：" if "：" in text else ":"
+            label, _, value = text.partition(sep)
+            quote = value.strip()
+            context = [{
+                "quote": label + sep + " ",
+                "reason": "label",
+                "char_start": 0,
+                "char_end": len(label) + len(sep),
+            }]
+        else:
+            quote = text
+            context = []
+        decisions.append({
+            "candidate_fact_id": candidate["candidate_fact_id"],
+            "classification": "fact",
+            "record_id": candidate["locked_record_id"],
+            "atoms": [{
+                "quote": quote,
+                "fact_type": "metric" if any(ch.isdigit() for ch in quote) else "action",
+                "destination_section": "education",
+                "destination_field": "bullet",
+            }],
+            "context_spans": context,
+        })
+    return {"schema_version": SCHEMA_VERSION, "decisions": decisions}
+
+
+def test_unmoored_value_claim_falls_back_to_labeled_source_text():
+    """A bare '3.84' without its label must not survive per-unit validation."""
+
+    def bare_value_realizer(_model, _system, user_prompt, **_kwargs):
+        request = json.loads(user_prompt)
+        # 请求应携带 label_prefix 提示；这里故意忽略它，只写剥离标签的数值。
+        labeled = [
+            fact
+            for unit in request["units"]
+            for group in unit["groups"]
+            for fact in group["facts"]
+            if fact.get("label_prefix")
+        ]
+        assert labeled, "label-split facts must advertise their label_prefix"
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "request_fact_ids": request["request_fact_ids"],
+            "units": [
+                {
+                    "unit_id": unit["unit_id"],
+                    "claims": [
+                        {
+                            "claim_id": f"claim:{index}",
+                            "section": fact["destination_section"],
+                            "field": fact["destination_field"],
+                            "text": fact["source_text"],  # bare value, label dropped
+                            "fact_ids": [fact["fact_id"]],
+                            "record_id": fact["record_id"],
+                            "group_id": group["group_id"],
+                        }
+                        for group in unit["groups"]
+                        for index, fact in enumerate(group["facts"])
+                    ],
+                }
+                for unit in request["units"]
+            ],
+        }
+
+    result = run_v3_pipeline(
+        cv_text="乙大学 软件工程 2016年9月 - 2020年6月\n成绩/平均绩点: 3.84",
+        semantic_llm_call=_label_splitting_semantic,
+        realizer_llm_call=bare_value_realizer,
+    )
+
+    reports = _unit_reports(result)
+    labeled_reports = [
+        report for report in reports.values()
+        if any("label_not_preserved" in violation for violation in report["violations"])
+    ]
+    assert labeled_reports, "unmoored value claim must be rejected unit-locally"
+    assert labeled_reports[0]["status"] == "deterministic_fallback"
+    # 确定性回退恢复带标签的完整原文，事实不丢失。
+    rendered = json.dumps(result.resume_data, ensure_ascii=False)
+    assert "成绩/平均绩点: 3.84" in rendered
+    assert result.quality_report["atomic_factuality"]["recall"] == 1.0
+    assert result.quality_report["atomic_factuality"]["precision"] == 1.0
+
+
+def test_labeled_value_claim_is_accepted():
+    def labeled_realizer(_model, _system, user_prompt, **_kwargs):
+        request = json.loads(user_prompt)
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "request_fact_ids": request["request_fact_ids"],
+            "units": [
+                {
+                    "unit_id": unit["unit_id"],
+                    "claims": [
+                        {
+                            "claim_id": f"claim:{index}",
+                            "section": fact["destination_section"],
+                            "field": fact["destination_field"],
+                            "text": (fact.get("label_prefix") or "") + fact["source_text"],
+                            "fact_ids": [fact["fact_id"]],
+                            "record_id": fact["record_id"],
+                            "group_id": group["group_id"],
+                        }
+                        for group in unit["groups"]
+                        for index, fact in enumerate(group["facts"])
+                    ],
+                }
+                for unit in request["units"]
+            ],
+        }
+
+    result = run_v3_pipeline(
+        cv_text="乙大学 软件工程 2016年9月 - 2020年6月\n成绩/平均绩点: 3.84",
+        semantic_llm_call=_label_splitting_semantic,
+        realizer_llm_call=labeled_realizer,
+    )
+
+    assert result.realization_report.status == "success"
+    assert not [
+        violation
+        for report in result.realization_report.unit_reports
+        for violation in report["violations"]
+    ]
+    assert "成绩/平均绩点: 3.84" in json.dumps(result.resume_data, ensure_ascii=False)

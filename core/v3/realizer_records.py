@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 import json
 import logging
 import os
+import re
 import time
 from typing import Any, Callable, Iterable
 
@@ -59,7 +60,9 @@ schema_version 必须是 resume_compiler_v3.4，request_fact_ids 必须与请求
 5. 组织、岗位、时间、数字、学历、资质和工具不得改写、推断或新增。
 6. 只有输入同时提供背景、动作、方法、交付物或结果时才可组合为 STAR，不补齐缺失维度。
 7. 不为了篇幅删除事实，不输出解释、评分或待整理原始信息。
-8. 仅当请求包含 optional_summary 时，才可额外输出最多一条 summary_claims：
+8. 事实若提供 label_prefix（来源原文中的键名标签，如 成绩/平均绩点: ），claim.text 必须原样保留该标签，
+   不得只输出剥离标签后的数值或片段。
+9. 仅当请求包含 optional_summary 时，才可额外输出最多一条 summary_claims：
    section=summary、field=summary、group_id=summary:profile、record_id=null，
    引用 summary_evidence_fact_ids 中的 fact_id，且同样逐字保留所引用事实的原文。"""
 
@@ -149,7 +152,31 @@ def partition_units(
     return units
 
 
-def _unit_payload(unit: RealizationUnit, fact_map: dict[str, FactUnit]) -> dict[str, Any]:
+_LABEL_PREFIX_RE = re.compile(r"^[^：:\n]{1,20}[：:]\s*$")
+
+
+def _label_prefix(fact: FactUnit, graph: FactGraph) -> str:
+    """Recover the source-line label prefix for label-split atoms.
+
+    The semantic stage splits ``成绩/平均绩点: 3.84`` into a label context span
+    and a bare-value atom.  A claim carrying only ``3.84`` is unmoored: it
+    reads as a number without a subject and trips the atomic verifier's
+    hard-anchor audit.  The deterministic path always restores the full
+    source slice including the label, so LLM claims must keep it too.
+    """
+
+    for span in fact.spans:
+        document = graph.documents.get(span.source_id, "")
+        if not document or span.char_start <= 0 or span.char_start > len(document):
+            continue
+        line_start = document.rfind("\n", 0, span.char_start) + 1
+        prefix = document[line_start:span.char_start]
+        if _LABEL_PREFIX_RE.match(prefix):
+            return prefix
+    return ""
+
+
+def _unit_payload(unit: RealizationUnit, fact_map: dict[str, FactUnit], graph: FactGraph) -> dict[str, Any]:
     groups = []
     for group in unit.groups:
         facts = []
@@ -157,7 +184,7 @@ def _unit_payload(unit: RealizationUnit, fact_map: dict[str, FactUnit]) -> dict[
             fact = fact_map.get(fact_id)
             if fact is None or not fact.eligible:
                 continue
-            facts.append({
+            entry = {
                 "fact_id": fact.fact_id,
                 "source_text": fact.text,
                 "fact_type": fact.fact_type,
@@ -165,7 +192,11 @@ def _unit_payload(unit: RealizationUnit, fact_map: dict[str, FactUnit]) -> dict[
                 "destination_field": fact.destination_field or "bullet",
                 "record_id": fact.record_id,
                 "hard_anchors": [anchor.text for anchor in fact.anchors],
-            })
+            }
+            label = _label_prefix(fact, graph)
+            if label:
+                entry["label_prefix"] = label
+            facts.append(entry)
         if facts:
             groups.append({
                 "group_id": group.group_id,
@@ -185,13 +216,14 @@ def _unit_payload(unit: RealizationUnit, fact_map: dict[str, FactUnit]) -> dict[
 def _pack_units(
     units: list[RealizationUnit],
     fact_map: dict[str, FactUnit],
+    graph: FactGraph,
     max_chars: int,
 ) -> list[list[RealizationUnit]]:
     packs: list[list[RealizationUnit]] = []
     current: list[RealizationUnit] = []
     current_chars = 0
     for unit in units:
-        size = len(json.dumps(_unit_payload(unit, fact_map), ensure_ascii=False))
+        size = len(json.dumps(_unit_payload(unit, fact_map, graph), ensure_ascii=False))
         if current and current_chars + size > max_chars:
             packs.append(current)
             current, current_chars = [], 0
@@ -237,11 +269,18 @@ def _deterministic_unit_claims(
             source_unit = fact.base_fact_id or fact.fact_id
             buckets.setdefault((section, field_name, source_unit), []).append(fact)
         for subindex, ((section, field_name, _src), bucket) in enumerate(buckets.items()):
+            text = _join_facts(list(bucket), graph)
+            # Label-split atoms restore their source-line label (e.g.
+            # "成绩/平均绩点: ") so a bare value never ships unmoored; the
+            # slice already containing the label is left untouched.
+            label = _label_prefix(bucket[0], graph) if bucket else ""
+            if label and label not in text:
+                text = label + text
             claims.append(RealizedClaim(
                 claim_id=f"{unit.unit_id}/det:{group.group_id}:{subindex}",
                 section=section,
                 field=field_name,  # type: ignore[arg-type]
-                text=_join_facts(list(bucket), graph),
+                text=text,
                 fact_ids=[fact.fact_id for fact in bucket],
                 record_id=group.record_id,
                 anchors=[anchor for fact in bucket for anchor in fact.anchors],
@@ -289,12 +328,24 @@ def _validate_unit(
         request_fact_ids=list(unit.fact_ids),
         claims=claims,
     )
-    return validate_realizer_response(
+    violations = validate_realizer_response(
         response,
         graph,
         allowed_fact_ids=unit.fact_ids,
         allowed_group_by_fact=allowed_group_by_fact,
     )
+    # Unmoored-value guard: a claim citing a label-split atom must keep the
+    # source-line label (e.g. "成绩/平均绩点: "), not emit the bare value.
+    fact_map = graph.fact_map()
+    for claim in claims:
+        for fact_id in claim.fact_ids:
+            fact = fact_map.get(fact_id)
+            if fact is None:
+                continue
+            label = _label_prefix(fact, graph)
+            if label and label not in claim.text:
+                violations.append(f"{claim.claim_id}:label_not_preserved:{fact_id}")
+    return violations
 
 
 def _validate_summary_claims(
@@ -501,7 +552,7 @@ def realize_record_local(
         )
 
     max_chars = _env_int("V3_REALIZER_PACK_CHARS", 9000, 1000)
-    packs = _pack_units(clean_units, fact_map, max_chars)
+    packs = _pack_units(clean_units, fact_map, graph, max_chars)
     # The optional cross-record summary stays single-request and clean-graph
     # only: a degraded unit means the model would synthesize from a partial
     # evidence view, so multi-pack or degraded resumes keep deterministic
@@ -528,7 +579,7 @@ def realize_record_local(
         payload: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
             "request_fact_ids": [fact_id for unit in pack for fact_id in unit.fact_ids],
-            "units": [_unit_payload(unit, fact_map) for unit in pack],
+            "units": [_unit_payload(unit, fact_map, graph) for unit in pack],
         }
         if include_summary:
             payload["optional_summary"] = {
