@@ -46,6 +46,7 @@ class RealizationReport:
     error: str = ""
     training_input: dict[str, Any] | None = None
     training_output: dict[str, Any] | None = None
+    unit_reports: tuple[dict[str, Any], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -56,6 +57,7 @@ class RealizationReport:
             "error": self.error,
             "training_input": self.training_input,
             "training_output": self.training_output,
+            "unit_reports": list(self.unit_reports),
         }
 
 

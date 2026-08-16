@@ -1471,14 +1471,14 @@ def test_full_semantic_contract_fallback_skips_model_realizer():
     )
 
     assert result.semantic_report.status == "fallback"
-    assert result.realization_report.status == "disabled"
+    # Record-local contract: every unit is degraded, so no LLM call is made
+    # and the whole resume stays on the exact deterministic path.
+    assert result.realization_report.status == "deterministic"
     assert calls["realizer"] == 0
     assert result.quality_report["atomic_factuality"]["recall"] == 1.0
 
 
-def test_partial_semantic_fallback_skips_unusable_full_resume_realizer():
-    calls = {"realizer": 0}
-
+def test_partial_semantic_fallback_degrades_only_the_affected_unit():
     def partial_semantic(_model, _system, user_prompt, **_kwargs):
         candidates = json.loads(user_prompt)["candidates"]
         first, second = candidates
@@ -1512,9 +1512,31 @@ def test_partial_semantic_fallback_skips_unusable_full_resume_realizer():
             ],
         }
 
-    def realizer(*_args, **_kwargs):
-        calls["realizer"] += 1
-        raise AssertionError("realizer precondition is false after semantic fallback")
+    def realizer(_model, _system, user_prompt, **_kwargs):
+        request = json.loads(user_prompt)
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "request_fact_ids": request["request_fact_ids"],
+            "units": [
+                {
+                    "unit_id": unit["unit_id"],
+                    "claims": [
+                        {
+                            "claim_id": f"claim:{index}",
+                            "section": fact["destination_section"],
+                            "field": fact["destination_field"],
+                            "text": fact["source_text"],
+                            "fact_ids": [fact["fact_id"]],
+                            "record_id": fact["record_id"],
+                            "group_id": group["group_id"],
+                        }
+                        for group in unit["groups"]
+                        for index, fact in enumerate(group["facts"])
+                    ],
+                }
+                for unit in request["units"]
+            ],
+        }
 
     result = run_v3_pipeline(
         cv_text="负责用户访谈\n输出需求报告",
@@ -1524,9 +1546,17 @@ def test_partial_semantic_fallback_skips_unusable_full_resume_realizer():
 
     assert result.semantic_report.status == "partial"
     assert result.semantic_report.fallback_fact_ids
-    assert calls["realizer"] == 0
-    assert result.realization_report.status == "disabled"
+    # R24 record-local contract: the unit holding the fallback fact restores
+    # exact source sentences deterministically while the clean unit keeps LLM
+    # realization; the whole-resume realizer is no longer shut down.
+    assert result.realization_report.status == "partial"
+    unit_status = {
+        report["status"] for report in result.realization_report.unit_reports
+    }
+    assert "deterministic_degraded" in unit_status
+    assert "llm" in unit_status
     assert result.quality_report["atomic_factuality"]["recall"] == 1.0
+    assert result.quality_report["atomic_factuality"]["precision"] == 1.0
 
 
 def test_v3_realizer_budget_admission_uses_exact_deterministic_fallback(monkeypatch):
@@ -1793,22 +1823,25 @@ def test_non_fact_decision_may_explain_exact_context_without_emitting_atoms():
 def test_end_to_end_fixed_schema_realizer_populates_renderer_schema():
     def realizer(_model, _system, user_prompt, **_kwargs):
         request = json.loads(user_prompt)
-        claims = []
-        for index, group in enumerate(request["groups"]):
-            for fact in group["facts"]:
-                claims.append({
-                    "claim_id": f"generated:{index}:{fact['fact_id']}",
-                    "section": fact["destination_section"],
-                    "field": fact["destination_field"],
-                    "text": fact["source_text"],
-                    "fact_ids": [fact["fact_id"]],
-                    "record_id": fact["record_id"],
-                    "group_id": group["group_id"],
-                })
+        units = []
+        for unit in request["units"]:
+            claims = []
+            for index, group in enumerate(unit["groups"]):
+                for fact in group["facts"]:
+                    claims.append({
+                        "claim_id": f"generated:{index}:{fact['fact_id']}",
+                        "section": fact["destination_section"],
+                        "field": fact["destination_field"],
+                        "text": fact["source_text"],
+                        "fact_ids": [fact["fact_id"]],
+                        "record_id": fact["record_id"],
+                        "group_id": group["group_id"],
+                    })
+            units.append({"unit_id": unit["unit_id"], "claims": claims})
         return {
             "schema_version": SCHEMA_VERSION,
             "request_fact_ids": request["request_fact_ids"],
-            "claims": claims,
+            "units": units,
         }
 
     result = run_v3_pipeline(
@@ -1838,18 +1871,24 @@ def test_v3_renderer_adapter_produces_editable_docx(tmp_path):
         realizer_llm_call=lambda _model, _system, user_prompt, **_kwargs: {
             "schema_version": SCHEMA_VERSION,
             "request_fact_ids": (request := json.loads(user_prompt))["request_fact_ids"],
-            "claims": [
+            "units": [
                 {
-                    "claim_id": f"claim:{index}",
-                    "section": fact["destination_section"],
-                    "field": fact["destination_field"],
-                    "text": fact["source_text"],
-                    "fact_ids": [fact["fact_id"]],
-                    "record_id": fact["record_id"],
-                    "group_id": group["group_id"],
+                    "unit_id": unit["unit_id"],
+                    "claims": [
+                        {
+                            "claim_id": f"claim:{index}",
+                            "section": fact["destination_section"],
+                            "field": fact["destination_field"],
+                            "text": fact["source_text"],
+                            "fact_ids": [fact["fact_id"]],
+                            "record_id": fact["record_id"],
+                            "group_id": group["group_id"],
+                        }
+                        for index, group in enumerate(unit["groups"])
+                        for fact in group["facts"]
+                    ],
                 }
-                for index, group in enumerate(request["groups"])
-                for fact in group["facts"]
+                for unit in request["units"]
             ],
         },
     )
@@ -1890,21 +1929,14 @@ def test_realizer_can_reuse_source_fact_in_optional_summary_without_ownership_er
     def realizer(_model, _system, user_prompt, **_kwargs):
         request = json.loads(user_prompt)
         fact_id = request["request_fact_ids"][0]
-        group = request["groups"][0]
+        unit = request["units"][0]
+        group = unit["groups"][0]
         return {
             "schema_version": SCHEMA_VERSION,
             "request_fact_ids": request["request_fact_ids"],
-            "claims": [
-                {
-                    "claim_id": "summary",
-                    "section": "summary",
-                    "field": "summary",
-                    "text": "具备负责用户访谈经验。",
-                    "fact_ids": [fact_id],
-                    "record_id": None,
-                    "group_id": "summary:profile",
-                },
-                {
+            "units": [{
+                "unit_id": unit["unit_id"],
+                "claims": [{
                     "claim_id": "body",
                     "section": "experience",
                     "field": "bullet",
@@ -1912,8 +1944,17 @@ def test_realizer_can_reuse_source_fact_in_optional_summary_without_ownership_er
                     "fact_ids": [fact_id],
                     "record_id": group["record_id"],
                     "group_id": group["group_id"],
-                },
-            ],
+                }],
+            }],
+            "summary_claims": [{
+                "claim_id": "summary",
+                "section": "summary",
+                "field": "summary",
+                "text": "具备负责用户访谈经验。",
+                "fact_ids": [fact_id],
+                "record_id": None,
+                "group_id": "summary:profile",
+            }],
         }
 
     result = run_v3_pipeline(

@@ -11,7 +11,8 @@ from .fact_graph import build_fact_graph
 from .input_adapters import build_input_document_graph
 from .jd_graph import build_requirement_graph
 from .planner import plan_resume
-from .realizer_llm import RealizationReport, realize_with_llm
+from .realizer_llm import RealizationReport
+from .realizer_records import realize_record_local
 from .repair import minimal_repair
 from .reply_builder import build_reply
 from .resume_adapter import frozen_to_resume_data
@@ -229,21 +230,20 @@ def run_v3_pipeline(
     normalized_mode = template_mode if template_mode in {"tagged", "anchored", "style_only"} else "style_only"
     template = TemplateAST(mode=normalized_mode) if template_mode != "none" else None
     plan = plan_resume(graph, requirements, template)
-    # The realizer contract assumes every requested fact already passed the
-    # semantic schema.  If even one source unit fell back, a full-resume model
-    # call cannot repair that boundary and has to be rejected or reverted.
-    # Preserve the exact deterministic output immediately instead of spending
-    # most of the 480-second budget on a call whose precondition is false.
-    # Item-level semantic warnings are allowed when all source units compiled;
-    # the hard realizer verifier remains the final gate in that case.
-    realizer_use_llm = bool(
-        use_llm and not semantic_result.report.fallback_fact_ids
-    )
-    realization = realize_with_llm(
+    # R24 Phase 3: record-local realization.  A semantic fallback fact now
+    # degrades only its own record/section unit; clean units keep constrained
+    # LLM realization and failed units restore exact record-local source
+    # sentences.  The hard per-unit verifier and the downstream atomic
+    # verifier remain the final gates.
+    realization = realize_record_local(
         plan,
         graph,
-        use_llm=realizer_use_llm,
+        use_llm=use_llm,
         llm_call=realizer_llm_call,
+        degraded_fact_ids=(
+            set(semantic_result.report.fallback_fact_ids)
+            | set(semantic_result.report.fail_closed_fact_ids)
+        ),
     )
     frozen = realization.frozen
     audit = audit_frozen_resume(frozen, graph, requirements)
