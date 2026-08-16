@@ -70,8 +70,14 @@ def _supporting_fact(requirement: str, fact_texts: list[str]) -> str:
     return ""
 
 
+# Record-family destinations: facts routed here are expected to belong to a
+# record.  Skills/education/contact legitimately own no record and must never
+# be surfaced as "待确认归属" noise.
+_RECORD_FAMILY_SECTIONS = {"experience", "projects", "research", "activities", "teaching"}
+
+
 def undetermined_ownership_facts(audit: Audit, fact_graph: FactGraph) -> list[str]:
-    """Material written facts that were never assigned to a record."""
+    """Material written facts that look record-bound but stayed unassigned."""
 
     fact_map = fact_graph.fact_map()
     items: list[str] = []
@@ -81,7 +87,8 @@ def undetermined_ownership_facts(audit: Audit, fact_graph: FactGraph) -> list[st
             continue
         if fact.fact_type in {"identity", "contact", "placeholder"}:
             continue
-        if fact.destination_section in {"contact", "summary"}:
+        destination = fact.destination_section or ""
+        if destination not in _RECORD_FAMILY_SECTIONS:
             continue
         items.append(fact.text)
     return items
