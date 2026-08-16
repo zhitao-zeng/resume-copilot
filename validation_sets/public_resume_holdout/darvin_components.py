@@ -46,6 +46,15 @@ from evidence_binding import bind_resume_evidence  # noqa: E402
 from quality_report import measure_source_coverage, source_fact_units  # noqa: E402
 from resume_copilot_service import _canonical_resume_from_render_data  # noqa: E402
 
+try:  # rendered-document gate is optional evidence (DOCX may be absent)
+    from rendered_audit import (
+        audit_rendered_docx,
+        template_fidelity_score01,
+        visual_layout_score01,
+    )
+except ImportError:  # pragma: no cover - python-docx missing in minimal envs
+    audit_rendered_docx = None
+
 
 # ---------------------------------------------------------------------------
 # Rubric definition (frozen in metric-contract.md, 2026-08-16)
@@ -250,6 +259,37 @@ def assess_case_components(
             "rendered-docx evidence required; JSON cannot establish this subdimension"
         )
         entry["evidence"] = {"docx_present": bool(raw.get("docx_base64") or raw.get("docx_url"))}
+    # Rendered-document gate: when the immutable row carries a DOCX path and
+    # the artifact still exists, visual_layout and template_fidelity become
+    # measurable rendered-tier signals instead of unmeasured placeholders.
+    files = raw.get("files") if isinstance(raw.get("files"), dict) else {}
+    docx_path = str(files.get("docx") or "")
+    if docx_path and audit_rendered_docx is not None and Path(docx_path).is_file():
+        rendered = audit_rendered_docx(docx_path, resume_data=resume_data)
+        visual = visual_layout_score01(rendered)
+        fidelity = template_fidelity_score01(rendered)
+        if visual is not None:
+            entry = subs["visual_layout"]
+            entry["measurable"] = True
+            entry["score01"] = visual
+            entry["applicability_reason"] = ""
+            entry["evidence"] = {
+                "rendered_gate": rendered.get("gate_version"),
+                "label_remnants": len(rendered.get("label_remnants") or []),
+                "separator_artifacts": len(rendered.get("separator_artifacts") or []),
+                "sparse_trailing": rendered.get("sparse_trailing"),
+                "fact_retention": rendered.get("fact_retention"),
+            }
+        if fidelity is not None:
+            entry = subs["template_fidelity"]
+            entry["measurable"] = True
+            entry["score01"] = fidelity
+            entry["applicability_reason"] = ""
+            entry["evidence"] = {
+                "rendered_gate": rendered.get("gate_version"),
+                "template_mode": rendered.get("template_mode"),
+                "leftover_tags": len(rendered.get("leftover_tags") or []),
+            }
 
     # ---- completeness ----------------------------------------------------
     if coverage_error:
