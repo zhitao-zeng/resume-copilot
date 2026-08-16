@@ -128,8 +128,11 @@ export OUTPUT_DIR="${OUTPUT_DIR:-/root/app/output}"
 export RESUME_PIPELINE_VERSION="${RESUME_PIPELINE_VERSION:-v2}"
 export V3_TRAINING_TRACE_ENABLED="${V3_TRAINING_TRACE_ENABLED:-0}"
 export V3_SEMANTIC_CONCURRENCY="${V3_SEMANTIC_CONCURRENCY:-2}"
-export V3_SEMANTIC_BATCH_FACTS="${V3_SEMANTIC_BATCH_FACTS:-28}"
+# R24 accepted semantic configuration (verified on the representative long
+# case HV2-S3-001: fallback 53 -> 16, 12/12 schema-valid, zero truncation).
+export V3_SEMANTIC_BATCH_FACTS="${V3_SEMANTIC_BATCH_FACTS:-14}"
 export V3_SEMANTIC_BATCH_CHARS="${V3_SEMANTIC_BATCH_CHARS:-9000}"
+export V3_SEMANTIC_MAX_TOKENS="${V3_SEMANTIC_MAX_TOKENS:-6144}"
 export V3_REALIZER_MIN_REMAINING_SECONDS="${V3_REALIZER_MIN_REMAINING_SECONDS:-240}"
 # Production defaults to the locally validated reference content path. New
 # recovery/composer modules are opt-in profiles until their grouped ownership

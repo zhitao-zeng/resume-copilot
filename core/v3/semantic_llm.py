@@ -222,7 +222,7 @@ def _candidate_payload(fact: FactUnit, graph: FactGraph) -> dict[str, Any]:
 
 def _batches(payloads: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
     max_chars = max(1000, int(os.getenv("V3_SEMANTIC_BATCH_CHARS", "9000")))
-    max_items = max(1, int(os.getenv("V3_SEMANTIC_BATCH_FACTS", "28")))
+    max_items = max(1, int(os.getenv("V3_SEMANTIC_BATCH_FACTS", "14")))
     batches: list[list[dict[str, Any]]] = []
     current: list[dict[str, Any]] = []
     current_chars = 0
@@ -605,7 +605,7 @@ def _call_semantic_batches(
     except ValueError:
         configured = 2
     workers = max(1, min(configured, len(requests)))
-    requested_max_tokens = max(1024, int(os.getenv("V3_SEMANTIC_MAX_TOKENS", "4096")))
+    requested_max_tokens = max(1024, int(os.getenv("V3_SEMANTIC_MAX_TOKENS", "6144")))
     import logging as _logging
     _sem_logger = _logging.getLogger("v3.semantic_telemetry")
 
