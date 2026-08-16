@@ -93,6 +93,40 @@ _YEAR_RANGE = re.compile(r"\d{4}\s*[年./-]")
 _REPLY_CONCISE_MAX = 600
 _REPLY_OVERLONG = 900
 
+# Evaluator-audit detectors (blind-judge divergence 2026-08-17): the judge saw
+# deterministic-path defects the STAR/compact proxies missed — bullets split
+# mid-word, leading fragments, unclosed brackets and stray artifacts.
+_FRAGMENT_START = re.compile(r"^\s*[，。、；：,;·）)\]】》」』>』」]")
+_UNCLOSED_PAIRS = (("（", "）"), ("(", ")"), ("【", "】"), ("「", "」"), ("《", "》"))
+_SUMMARY_LEADING_FRAGMENT = re.compile(r"^\s*[的了吗和与及或并，。、；：,;]")
+
+
+def _fragment_signals(bullet_texts: list[str]) -> dict[str, Any]:
+    fragments = 0
+    unclosed = 0
+    details: list[str] = []
+    for text in bullet_texts:
+        value = text.strip()
+        if not value:
+            continue
+        is_fragment = bool(_FRAGMENT_START.match(value))
+        opens = sum(value.count(left) for left, _ in _UNCLOSED_PAIRS)
+        closes = sum(value.count(right) for _, right in _UNCLOSED_PAIRS)
+        if opens > closes:
+            unclosed += 1
+            is_fragment = True
+        if is_fragment:
+            fragments += 1
+            if len(details) < 5:
+                details.append(value[:30])
+    total = max(1, len([text for text in bullet_texts if text.strip()]))
+    return {
+        "fragment_bullet_count": fragments,
+        "fragment_bullet_rate": round(fragments / total, 4),
+        "unclosed_bracket_bullets": unclosed,
+        "examples": details,
+    }
+
 
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
@@ -380,12 +414,17 @@ def assess_case_components(
             len(segments) >= 4 and compact_chars > 100
         )
         checks = [present, within_limit, present and not concatenated]
+        # Evaluator-audit: a summary opening mid-clause is a truncation
+        # fragment, not a complete source-backed summary.
+        leading_fragment = bool(present and _SUMMARY_LEADING_FRAGMENT.match(summary_text))
+        checks.append(present and not leading_fragment)
         entry["score01"] = round(sum(checks) / len(checks), 4)
         entry["evidence"] = {
             "present": present,
             "chars": compact_chars,
             "within_100_chars": within_limit,
             "timeline_concatenation": concatenated,
+            "leading_fragment": leading_fragment,
         }
 
     # ---- expression ------------------------------------------------------
@@ -397,9 +436,15 @@ def assess_case_components(
             _na(subs[name], "no experience bullets in response")
     else:
         entry = subs["professional_writing"]
-        entry["score01"] = round(max(0.0, 1.0 - float(compact_rate or 0.0)), 4)
+        fragment = _fragment_signals(bullet_texts)
+        compact_component = max(0.0, 1.0 - float(compact_rate or 0.0))
+        fragment_component = max(0.0, 1.0 - float(fragment["fragment_bullet_rate"]))
+        entry["score01"] = round(compact_component * fragment_component, 4)
         entry["evidence"] = {
             "compact_bullet_rate": compact_rate,
+            "fragment_bullet_rate": fragment["fragment_bullet_rate"],
+            "unclosed_bracket_bullets": fragment["unclosed_bracket_bullets"],
+            "fragment_examples": fragment["examples"],
             "avg_chars": bullets_info.get("avg_chars"),
             "bullet_count": bullets_info.get("count"),
         }

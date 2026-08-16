@@ -81,6 +81,9 @@ class SummaryCompilationResult:
 
 
 _TENURE_RE = re.compile(r"\d+(?:\.\d+)?\s*年(?:半|以上|多|余)?")
+# A summary opening mid-clause ("的国际市场经验。…") is a truncation
+# fragment, never a complete source-backed summary.
+_LEADING_FRAGMENT_RE = re.compile(r"^\s*[的了吗和与及或并，。、；：,;]")
 # A single range ("2019年1月 - 2021年6月") is legitimate evidence; stitching
 # two or more ranges into one summary is timeline concatenation.
 _RANGE_PAIR_RE = re.compile(
@@ -205,6 +208,8 @@ def validate_summary_sentences(
                 sentence_violations.append(f"{label}:unsupported_comparative:{word}")
         if len(_RANGE_PAIR_RE.findall(text)) >= 2:
             sentence_violations.append(f"{label}:timeline_concatenation")
+        if _LEADING_FRAGMENT_RE.match(text):
+            sentence_violations.append(f"{label}:leading_fragment")
         total_chars += _compact_len(text)
         if sentence_violations:
             violations.extend(sentence_violations)
