@@ -909,7 +909,7 @@ def _collect_projects_from_experience(experience: Any) -> list[dict[str, Any]]:
         if not isinstance(exp, dict):
             continue
 
-        company = str(exp.get("company", "")).strip()
+        company = str(exp.get("company") or exp.get("organization") or "").strip()
         role = str(exp.get("role", "")).strip()
         period = str(exp.get("period", "")).strip()
         affiliation = " | ".join(part for part in [company, role, period] if part)
@@ -955,7 +955,7 @@ def _collect_projects_from_top_level(resume_data: Any) -> list[dict[str, Any]]:
                 continue
             name = str(proj.get("name", "项目")).strip() or "项目"
             period = str(proj.get("period", "")).strip()
-            company = str(proj.get("company", "")).strip()
+            company = str(proj.get("company") or proj.get("organization") or "").strip()
             role = str(proj.get("role", "")).strip()
             affiliation = " | ".join(part for part in (company, role, period) if part)
 
@@ -1052,7 +1052,7 @@ def _collect_all_experience(resume_data: Any) -> list[dict[str, Any]]:
         for record in records:
             if not isinstance(record, dict):
                 continue
-            company = str(record.get("company", "")).strip()
+            company = str(record.get("company") or record.get("organization") or "").strip()
             role = str(record.get("role", "")).strip()
             period = str(record.get("period", "")).strip()
             dedupe_key = (company, role, period)
@@ -1125,7 +1125,7 @@ def _build_resume_html(resume_data: dict[str, Any], template: str = "classic") -
         for exp in experience:
             if not isinstance(exp, dict):
                 continue
-            company = _html_escape(exp.get("company", ""))
+            company = _html_escape(exp.get("company") or exp.get("organization") or "")
             role = _html_escape(exp.get("role", ""))
             period = _html_escape(exp.get("period", ""))
             head_parts = [part for part in [company, role, period] if part]
@@ -1208,7 +1208,9 @@ def _build_resume_html(resume_data: dict[str, Any], template: str = "classic") -
             "natural_languages": "语言能力",
             "others": "其他专业技能",
         }
-        for key, label in labels.items():
+        for key, label in list(labels.items()) + [
+            (key, key) for key in skills if key not in labels
+        ]:
             items = skills.get(key, [])
             if isinstance(items, list) and items:
                 tags = "".join(
@@ -2559,7 +2561,7 @@ def _render_docx_minimal(doc: DocxDocument, resume_data: dict[str, Any]) -> None
         for exp in experience:
             if not isinstance(exp, dict):
                 continue
-            head = " | ".join([x for x in [exp.get("company", ""), exp.get("role", ""), exp.get("period", "")] if x])
+            head = " | ".join([x for x in [exp.get("company") or exp.get("organization") or "", exp.get("role", ""), exp.get("period", "")] if x])
             if head:
                 doc.add_paragraph(head)
             for bullet in _collect_experience_bullets(exp):
@@ -2609,12 +2611,16 @@ def _render_docx_minimal(doc: DocxDocument, resume_data: dict[str, Any]) -> None
     skills = resume_data.get("skills", {}) if isinstance(resume_data, dict) else {}
     if isinstance(skills, dict) and any(skills.values()):
         _add_section_heading(doc, "专业技能", "minimal")
-        for key, label in {
+        for key, label in list({
             "languages": "编程语言", "frameworks": "框架工具", "tools": "工具",
             "domains": "专业领域", "methodologies": "方法与流程",
             "certifications": "证书与资质", "natural_languages": "语言能力",
             "others": "其他专业技能",
-        }.items():
+        }.items()) + [
+            (key, key) for key in skills
+            if key not in {"languages", "frameworks", "tools", "domains",
+                           "methodologies", "certifications", "natural_languages", "others"}
+        ]:
             values = skills.get(key, [])
             if isinstance(values, list) and values:
                 doc.add_paragraph(f"{label}：" + " · ".join(str(value) for value in values))
@@ -2667,21 +2673,30 @@ def _render_docx_classic(doc: DocxDocument, resume_data: dict[str, Any]) -> None
             if not isinstance(exp, dict):
                 continue
 
-            p_company = doc.add_paragraph()
-            run = p_company.add_run(exp.get("company", ""))
-            run.bold = True
-            run.font.size = Pt(11.5)
-            run.font.color.rgb = RGBColor(0x0F, 0x34, 0x60)
+            company = str(exp.get("company") or exp.get("organization") or "").strip()
+            role = str(exp.get("role") or "").strip()
+            period = str(exp.get("period") or "").strip()
+            if company or role or period:
+                # Skip the header row entirely when every part is empty —
+                # otherwise the render leaves a bare "  |  " remnant line.
+                p_company = doc.add_paragraph()
+                if company:
+                    run = p_company.add_run(company)
+                    run.bold = True
+                    run.font.size = Pt(11.5)
+                    run.font.color.rgb = RGBColor(0x0F, 0x34, 0x60)
 
-            run = p_company.add_run(f"  |  {exp.get('role', '')}")
-            run.font.size = Pt(10.5)
+                if role:
+                    run = p_company.add_run(("  |  " if company else "") + role)
+                    run.font.size = Pt(10.5)
 
-            run = p_company.add_run(f"    {exp.get('period', '')}")
-            run.font.size = Pt(9.5)
-            run.font.color.rgb = RGBColor(0x88, 0x88, 0x88)
-            run.italic = True
-            p_company.space_before = Pt(6)
-            p_company.space_after = Pt(2)
+                if period:
+                    run = p_company.add_run(("    " if company or role else "") + period)
+                    run.font.size = Pt(9.5)
+                    run.font.color.rgb = RGBColor(0x88, 0x88, 0x88)
+                    run.italic = True
+                p_company.space_before = Pt(6)
+                p_company.space_after = Pt(2)
 
             exp_bullets = _collect_experience_bullets(exp)
             for bullet in exp_bullets:
@@ -2777,7 +2792,10 @@ def _render_docx_classic(doc: DocxDocument, resume_data: dict[str, Any]) -> None
             "others": "其他专业技能",
         }
 
-        for key, label in label_map.items():
+        ordered_items = list(label_map.items()) + [
+            (key, key) for key in skills if key not in label_map
+        ]
+        for key, label in ordered_items:
             items = skills.get(key, [])
             if isinstance(items, list) and items:
                 p_skill = doc.add_paragraph()
@@ -2851,7 +2869,7 @@ def _render_docx_modern(doc: DocxDocument, resume_data: dict[str, Any]) -> None:
                 continue
 
             p_head = doc.add_paragraph()
-            run = p_head.add_run(exp.get("company", ""))
+            run = p_head.add_run(exp.get("company") or exp.get("organization") or "")
             run.bold = True
             run.font.size = Pt(11)
             run.font.color.rgb = RGBColor(0x00, 0x5A, 0x64)
@@ -2947,7 +2965,7 @@ def _render_docx_modern(doc: DocxDocument, resume_data: dict[str, Any]) -> None:
 
     if isinstance(skills, dict) and any(skills.values()):
         _add_section_heading(doc, "专业技能", "modern")
-        for key, label in {
+        for key, label in list({
             "languages": "编程语言",
             "frameworks": "框架工具",
             "tools": "开发工具",
@@ -2956,7 +2974,11 @@ def _render_docx_modern(doc: DocxDocument, resume_data: dict[str, Any]) -> None:
             "certifications": "证书与资质",
             "natural_languages": "语言能力",
             "others": "其他专业技能",
-        }.items():
+        }.items()) + [
+            (key, key) for key in skills
+            if key not in {"languages", "frameworks", "tools", "domains",
+                           "methodologies", "certifications", "natural_languages", "others"}
+        ]:
             items = skills.get(key, [])
             if isinstance(items, list) and items:
                 p_skill = doc.add_paragraph()
@@ -3526,7 +3548,7 @@ def _build_renderable_sections(resume_data: dict[str, Any]) -> list[tuple[str, l
         for exp in experience:
             if not isinstance(exp, dict):
                 continue
-            exp_heading = f"{exp.get('company', '')} - {exp.get('role', '')}"
+            exp_heading = f"{exp.get('company') or exp.get('organization') or ''} - {exp.get('role', '')}"
             exp_parts = []
             if exp.get("period"):
                 exp_parts.append(exp["period"])
@@ -3601,15 +3623,23 @@ def _build_renderable_sections(resume_data: dict[str, Any]) -> list[tuple[str, l
     skills = resume_data.get("skills", {})
     if isinstance(skills, dict) and any(skills.values()):
         skill_items = []
+        fixed_keys = []
         for key, label in [("languages", "编程语言"), ("frameworks", "框架"),
                            ("tools", "工具"), ("domains", "领域"),
                            ("methodologies", "方法与流程"),
                            ("certifications", "证书与资质"),
                            ("natural_languages", "语言能力"),
                            ("others", "其他专业技能")]:
+            fixed_keys.append(key)
             items = skills.get(key, [])
             if isinstance(items, list) and items:
                 skill_items.append(f"{label}: " + " · ".join(str(x) for x in items))
+        # Categorized skills outside the fixed taxonomy keep their own label
+        # instead of being dropped from template renders.
+        for key, items in skills.items():
+            if key in fixed_keys or not isinstance(items, list) or not items:
+                continue
+            skill_items.append(f"{key}: " + " · ".join(str(x) for x in items))
         if skill_items:
             sections.append(("专业技能", skill_items))
 
@@ -3793,7 +3823,7 @@ def _fallback_render_pdf(resume_data: dict[str, Any], output_path: Path, templat
         for exp in experience:
             if not isinstance(exp, dict):
                 continue
-            head = " | ".join([x for x in [exp.get("company", ""), exp.get("role", ""), exp.get("period", "")] if x])
+            head = " | ".join([x for x in [exp.get("company") or exp.get("organization") or "", exp.get("role", ""), exp.get("period", "")] if x])
             if head:
                 lines.append(("item_head", head))
             for bullet in _collect_experience_bullets(exp):
@@ -3833,7 +3863,7 @@ def _fallback_render_pdf(resume_data: dict[str, Any], output_path: Path, templat
     skills = resume_data.get("skills", {}) if isinstance(resume_data, dict) else {}
     if isinstance(skills, dict) and any(skills.values()):
         lines.append(("section", "专业技能"))
-        for key, label in {
+        for key, label in list({
             "languages": "编程语言",
             "frameworks": "框架工具",
             "tools": "开发工具",
@@ -3842,7 +3872,11 @@ def _fallback_render_pdf(resume_data: dict[str, Any], output_path: Path, templat
             "certifications": "证书与资质",
             "natural_languages": "语言能力",
             "others": "其他专业技能",
-        }.items():
+        }.items()) + [
+            (key, key) for key in skills
+            if key not in {"languages", "frameworks", "tools", "domains",
+                           "methodologies", "certifications", "natural_languages", "others"}
+        ]:
             items = skills.get(key, [])
             if isinstance(items, list) and items:
                 lines.append(("body", f"{label}: " + " · ".join(str(x) for x in items)))
