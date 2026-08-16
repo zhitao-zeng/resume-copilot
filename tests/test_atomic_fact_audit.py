@@ -7,7 +7,7 @@ from atomic_fact_audit import audit_atomic_facts
 from evidence_binding import bind_resume_evidence
 from quality_report import build_quality_report
 from source_adapter import build_source_bundle
-from v2_schemas import CanonicalResume
+from v2_schemas import CanonicalResume, EvidenceBinding
 
 
 def _audit(cv_text: str, resume_data: dict, *, query: str = "", jd: str = "") -> dict:
@@ -204,6 +204,54 @@ def test_ownership_audit_detects_cross_record_bullet_swap():
         ("resume:experience:0", "resume:experience:1"),
         ("resume:experience:1", "resume:experience:0"),
     }
+
+
+def test_global_candidate_retry_separates_factuality_from_wrong_ownership():
+    source = build_source_bundle(
+        "工作经历\n甲公司｜岗位甲｜2022.01-2023.01\n负责甲事项。\n"
+        "乙公司｜岗位乙｜2020.01-2021.01\n负责乙事项。",
+        "",
+        "",
+    )
+    facts = {fact.verbatim_text: fact for fact in source.fact_units}
+    resume = CanonicalResume.model_validate({
+        "experience": [{
+            "organization": "甲公司",
+            "role": "岗位乙",
+            "period": "2022.01-2023.01",
+        }],
+    })
+
+    def binding(path: str, source_text: str, claim: str) -> EvidenceBinding:
+        fact = facts[source_text]
+        return EvidenceBinding(
+            path=path,
+            block_id=fact.block_id,
+            block_ids=[fact.block_id],
+            fact_ids=[fact.fact_id],
+            quote=source_text,
+            claim=claim,
+            source_claim=source_text,
+            mode="normalized",
+            similarity=0.5,
+        )
+
+    audit = audit_atomic_facts(
+        source=source,
+        resume=resume,
+        evidence_bindings=[
+            binding("experience[0].organization", "甲公司", "甲公司"),
+            # Intentionally retain the expected-record binding.  The exact
+            # generated role exists only in the other candidate record.
+            binding("experience[0].role", "岗位甲", "岗位乙"),
+            binding("experience[0].period", "2022.01-2023.01", "2022.01-2023.01"),
+        ],
+    )
+
+    assert audit["atomic_factuality"]["unsupported_atom_count"] == 0
+    assert audit["structural_invariants"]["role"]["added_count"] == 0
+    assert audit["ownership_integrity"]["incorrect_assignment_count"] == 1
+    assert audit["ownership_integrity"]["issues"][0]["canonical_field_path"] == "experience[0].role"
 
 
 def test_distributed_header_fields_represent_one_source_fact():

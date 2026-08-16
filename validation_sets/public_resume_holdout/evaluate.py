@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-EVALUATOR_VERSION = "public-holdout-evaluator-1.0"
+EVALUATOR_VERSION = "public-holdout-evaluator-1.2"
 ROOT = Path(__file__).resolve().parent
 REPO_ROOT = ROOT.parents[1]
 ACCEPTANCE_ROOT = REPO_ROOT / "acceptance_testset"
@@ -38,6 +38,13 @@ if str(CORE_ROOT) not in sys.path:
 
 from atomic_fact_audit import audit_atomic_facts  # noqa: E402
 from evidence_binding import bind_resume_evidence  # noqa: E402
+from quality_report import (  # noqa: E402
+    _ACTION_SIGNAL,
+    _METHOD_SIGNAL,
+    _OUTPUT_SIGNAL,
+    _QUANTIFIED_SIGNAL,
+    build_quality_report,
+)
 from resume_copilot_service import _canonical_resume_from_render_data  # noqa: E402
 from source_adapter import build_source_bundle  # noqa: E402
 from v2_schemas import SourceBundle, SourceSpan  # noqa: E402
@@ -208,6 +215,168 @@ def audit_response(
     return audit
 
 
+def _case_jd_text(case: dict[str, Any]) -> str:
+    """Load only explicit JD text for the deterministic quality probe."""
+
+    value = str(case.get("target_jd") or "")
+    if value.strip():
+        return value
+    path_value = case.get("target_jd_file_path")
+    if not path_value:
+        return ""
+    path = _resolve_case_file(str(path_value))
+    if path.suffix.casefold() not in {".txt", ".md", ".text"}:
+        return ""
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def _resume_bullets(resume_data: dict[str, Any]) -> list[str]:
+    bullets: list[str] = []
+    for section in ("experience", "projects", "research", "activities", "teaching"):
+        records = resume_data.get(section)
+        if not isinstance(records, list):
+            continue
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            values = record.get("bullets")
+            if not isinstance(values, list):
+                continue
+            bullets.extend(
+                str(value).strip()
+                for value in values
+                if str(value or "").strip()
+            )
+    return bullets
+
+
+def assess_generation_quality(
+    case: dict[str, Any],
+    annotation: dict[str, Any],
+    response: dict[str, Any],
+) -> dict[str, Any]:
+    """Return a deterministic generation-quality vector, not a single score.
+
+    Factuality remains in ``external_audit``.  This vector measures expression
+    and usefulness separately so a candidate cannot trade unsupported content
+    for a better-looking quality number.  The STAR signals are deliberately
+    generic linguistic cues; they are a reproducible proxy and not a
+    replacement for blinded human review.
+    """
+
+    resume_data = response.get("resume_data")
+    resume_data = resume_data if isinstance(resume_data, dict) else {}
+    source = build_annotated_source(annotation)
+    resume = _canonical_resume_from_render_data(resume_data)
+    bindings = bind_resume_evidence(resume, source)
+    quality_report = build_quality_report(
+        source=source,
+        resume=resume,
+        evidence_bindings=bindings,
+        missing_fields=response.get("missing_fields") or [],
+        jd_text=_case_jd_text(case),
+        jd_supplied=bool(case.get("target_jd") or case.get("target_jd_file_path")),
+        target_role=str(case.get("target_role") or ""),
+        framework_mode=bool(resume_data.get("framework")),
+    )
+
+    bullets = _resume_bullets(resume_data)
+    bullet_details: list[dict[str, Any]] = []
+    for bullet in bullets:
+        action = bool(_ACTION_SIGNAL.search(bullet))
+        method = bool(_METHOD_SIGNAL.search(bullet))
+        result = bool(_OUTPUT_SIGNAL.search(bullet) or _QUANTIFIED_SIGNAL.search(bullet))
+        dimensions = sum((action, method, result))
+        # A very short bullet is a fragmentation signal only; it is never
+        # considered factually wrong by this layer.
+        compact = len(re.sub(r"\s+", "", bullet)) <= 12
+        bullet_details.append({
+            "chars": len(bullet),
+            "action": action,
+            "method": method,
+            "result": result,
+            "dimension_count": dimensions,
+            "compact": compact,
+        })
+
+    reply = str(response.get("reply_text") or "")
+    alignment = quality_report.get("job_alignment") or {}
+    requirements = alignment.get("requirements") or []
+    missing_fields = response.get("missing_fields")
+    missing_fields = missing_fields if isinstance(missing_fields, list) else []
+    report = response.get("user_report")
+    report = report if isinstance(report, dict) else {}
+    recommendations = report.get("targeted_suggestions")
+    recommendations = recommendations if isinstance(recommendations, list) else []
+    if not recommendations:
+        generated_alignment = quality_report.get("job_alignment")
+        generated_alignment = (
+            generated_alignment if isinstance(generated_alignment, dict) else {}
+        )
+        recommendations = generated_alignment.get("recommendations")
+        recommendations = recommendations if isinstance(recommendations, list) else []
+
+    return {
+        "proxy_version": "generation-quality-proxy-1.0",
+        "blinded_human_review_required": True,
+        "bullets": {
+            "count": len(bullet_details),
+            "avg_chars": round(
+                sum(item["chars"] for item in bullet_details) / len(bullet_details), 2
+            ) if bullet_details else 0.0,
+            "star_complete_count": sum(
+                item["action"] and item["method"] and item["result"]
+                for item in bullet_details
+            ),
+            "star_complete_rate": round(
+                sum(
+                    item["action"] and item["method"] and item["result"]
+                    for item in bullet_details
+                ) / len(bullet_details), 4
+            ) if bullet_details else 1.0,
+            "two_or_more_dimension_rate": round(
+                sum(item["dimension_count"] >= 2 for item in bullet_details)
+                / len(bullet_details), 4
+            ) if bullet_details else 1.0,
+            "compact_bullet_rate": round(
+                sum(item["compact"] for item in bullet_details) / len(bullet_details), 4
+            ) if bullet_details else 0.0,
+            "details": bullet_details[:40],
+        },
+        "job_alignment": {
+            "available": bool(alignment.get("job_description_available")),
+            "requirement_count": len(requirements),
+            "supported_count": int(alignment.get("supported_requirement_count") or 0),
+            "partial_count": int(alignment.get("partial_requirement_count") or 0),
+            "missing_count": int(alignment.get("missing_requirement_count") or 0),
+            "support_rate": round(
+                (
+                    int(alignment.get("supported_requirement_count") or 0)
+                    + 0.5 * int(alignment.get("partial_requirement_count") or 0)
+                ) / len(requirements), 4
+            ) if requirements else None,
+        },
+        "reply_detail": {
+            "chars": len(reply.strip()),
+            "missing_field_count": len(missing_fields),
+            "recommendation_count": len(recommendations),
+            "component_coverage": sum(
+                bool(value) for value in _reply_components(response, case).values()
+            ),
+        },
+        "quality_report_opportunities": {
+            "claim_improvement_count": len(
+                quality_report.get("claim_improvement_opportunities") or []
+            ),
+            "unrepresented_source_count": int(
+                (quality_report.get("source_preservation") or {}).get(
+                    "unrepresented_item_count", 0
+                )
+            ),
+        },
+    }
+
+
 def _part_text(boundary: str, name: str, value: str) -> bytes:
     return (
         f"--{boundary}\r\n"
@@ -359,7 +528,29 @@ def _reported_but_written(response: dict[str, Any]) -> list[str]:
         text = json.dumps(entry, ensure_ascii=False) if isinstance(entry, dict) else str(entry)
         if not re.search(r"未提供|缺失|为空|没有提供|待补充", text):
             continue
+        if isinstance(entry, dict):
+            field = str(entry.get("field") or "").casefold()
+            structured_labels = {
+                "name": {"姓名"},
+                "contact": {"电话", "邮箱"},
+                "phone": {"电话"},
+                "email": {"邮箱"},
+                "education": {"教育"},
+                "experience": {"经历"},
+                "work_experience": {"经历"},
+                "projects": {"经历"},
+                "skills": {"技能"},
+            }.get(field)
+            if structured_labels is not None:
+                for label in structured_labels:
+                    if values.get(label, False):
+                        contradictions.append(label)
+                continue
         for label, written in values.items():
+            # ``教育经历缺失`` cannot contradict a written work/project
+            # experience merely because both contain the substring ``经历``.
+            if label == "经历" and re.search(r"教育\s*经历", text):
+                continue
             if written and label in text:
                 contradictions.append(label)
     return list(dict.fromkeys(contradictions))
@@ -437,6 +628,14 @@ def run_case(
         row["audit_ok"] = True
     except Exception as exc:
         row["audit_error"] = f"{type(exc).__name__}:{exc}"
+    try:
+        row["generation_quality"] = assess_generation_quality(
+            case, annotation, response,
+        )
+        row["generation_quality_error"] = ""
+    except Exception as exc:
+        row["generation_quality"] = {}
+        row["generation_quality_error"] = f"{type(exc).__name__}:{exc}"
     return row
 
 
@@ -517,6 +716,29 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         for component in REPLY_COMPONENTS
     }
 
+    quality_rows = [
+        row.get("generation_quality") or {}
+        for row in rows
+        if row.get("generation_quality")
+    ]
+    bullet_rows = [item.get("bullets") or {} for item in quality_rows]
+    alignment_rows = [item.get("job_alignment") or {} for item in quality_rows]
+    reply_detail_rows = [item.get("reply_detail") or {} for item in quality_rows]
+    quality_bullet_count = sum(int(item.get("count") or 0) for item in bullet_rows)
+    quality_star_count = sum(int(item.get("star_complete_count") or 0) for item in bullet_rows)
+    quality_two_dim_count = sum(
+        round(float(item.get("two_or_more_dimension_rate") or 0.0) * int(item.get("count") or 0))
+        for item in bullet_rows
+    )
+    quality_compact_count = sum(
+        round(float(item.get("compact_bullet_rate") or 0.0) * int(item.get("count") or 0))
+        for item in bullet_rows
+    )
+    requirement_count = sum(int(item.get("requirement_count") or 0) for item in alignment_rows)
+    supported_count = sum(int(item.get("supported_count") or 0) for item in alignment_rows)
+    partial_count = sum(int(item.get("partial_count") or 0) for item in alignment_rows)
+    alignment_available_count = sum(bool(item.get("available")) for item in alignment_rows)
+
     return {
         "case_count": len(rows),
         "request_success_count": len(request_ok),
@@ -564,6 +786,48 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "reported_but_written_count": sum(
                 len(item.get("reported_but_written") or []) for item in contracts
             ),
+        },
+        "generation_quality": {
+            "proxy_version": "generation-quality-proxy-1.0",
+            "human_review_required": True,
+            "quality_case_count": len(quality_rows),
+            "bullets": {
+                "count": quality_bullet_count,
+                "avg_chars": _mean(
+                    float(item.get("avg_chars") or 0.0) for item in bullet_rows
+                ),
+                "star_complete_rate": _ratio(quality_star_count, quality_bullet_count),
+                "two_or_more_dimension_rate": _ratio(
+                    quality_two_dim_count, quality_bullet_count,
+                ),
+                "compact_bullet_rate": _ratio(
+                    quality_compact_count, quality_bullet_count, 0.0,
+                ),
+            },
+            "job_alignment": {
+                "cases_with_jd": alignment_available_count,
+                "requirement_count": requirement_count,
+                "supported_count": supported_count,
+                "partial_count": partial_count,
+                "support_rate": _ratio(
+                    supported_count + 0.5 * partial_count,
+                    requirement_count,
+                    0.0,
+                ) if requirement_count else None,
+            },
+            "reply_detail": {
+                "avg_chars": _mean(
+                    float(item.get("chars") or 0.0) for item in reply_detail_rows
+                ),
+                "avg_missing_field_count": _mean(
+                    float(item.get("missing_field_count") or 0.0)
+                    for item in reply_detail_rows
+                ),
+                "avg_recommendation_count": _mean(
+                    float(item.get("recommendation_count") or 0.0)
+                    for item in reply_detail_rows
+                ),
+            },
         },
     }
 

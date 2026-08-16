@@ -633,6 +633,28 @@ def audit_atomic_facts(
             fact_by_id,
         )
         match = _match_atom(claim, candidates, binding)
+        # Factuality and ownership answer different questions.  A claim can
+        # be verbatim candidate evidence yet be attached to the wrong output
+        # record.  The owner-scoped pass above is still the preferred match,
+        # but an unsupported result must be retried against the complete
+        # candidate-only ledger so that ownership (below), rather than the
+        # fabrication detector, reports a cross-record placement.  JD facts
+        # remain excluded by ``eligible_facts`` and the global retry receives
+        # no legacy binding provenance.
+        if (
+            match.status != "supported"
+            and {fact.fact_id for fact in candidates}
+            != {fact.fact_id for fact in eligible_facts}
+        ):
+            global_match = _match_atom(claim, eligible_facts, None)
+            if global_match.status == "supported":
+                match = AtomicMatch(
+                    status=global_match.status,
+                    fact_ids=global_match.fact_ids,
+                    confidence=global_match.confidence,
+                    reason=f"candidate_ledger_{global_match.reason}",
+                    unmatched_anchors=global_match.unmatched_anchors,
+                )
         matches[claim.atom_id] = match
         if claim.record_key:
             generated_by_owner[owners.get(claim.record_key, claim.record_key)].append(claim.text)

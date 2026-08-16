@@ -520,6 +520,7 @@ def call_llm_typed(
     temperature: float = 0.2,
     max_tokens: int = 4096,
     prefill: str = "{",
+    allow_repair: bool = True,
 ) -> dict[str, Any]:
     with _llm_inflight_slot():
         return get_llm_gateway().call_typed(
@@ -529,6 +530,30 @@ def call_llm_typed(
             temperature=temperature,
             max_tokens=max_tokens,
             prefill=prefill,
+            allow_repair=allow_repair,
+        )
+
+
+def call_llm_schema_json(
+    output_model: type[BaseModel],
+    system_prompt: str,
+    user_prompt: str,
+    temperature: float = 0.2,
+    max_tokens: int = 4096,
+    prefill: str = "{",
+    allow_repair: bool = True,
+) -> dict[str, Any]:
+    """Call a strict-schema prompt while leaving item validation to the caller."""
+
+    with _llm_inflight_slot():
+        return get_llm_gateway().call_schema_json(
+            output_model=output_model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            prefill=prefill,
+            allow_repair=allow_repair,
         )
 
 

@@ -67,6 +67,26 @@ def test_ordered_blocks_uses_block_order_and_ignores_empty_content():
     assert ppstructure_runtime.text_from_predictions([prediction]) == "个人简历\n第三段"
 
 
+def test_blocks_from_predictions_preserves_unknown_fields_and_page():
+    predictions = [
+        {"res": {"parsing_res_list": [{
+            "block_order": 1,
+            "block_id": 3,
+            "block_label": "text",
+            "block_content": "经历",
+            "region_id": "r1",
+            "confidence": 0.91,
+            "custom_layout_signal": {"column": 2},
+        }]}},
+    ]
+
+    blocks = ppstructure_runtime.blocks_from_predictions(predictions)
+
+    assert blocks[0]["page"] == 1
+    assert blocks[0]["region_id"] == "r1"
+    assert blocks[0]["custom_layout_signal"] == {"column": 2}
+
+
 def test_prediction_payload_accepts_json_string():
     prediction = SimpleNamespace(
         json=json.dumps(
@@ -137,6 +157,28 @@ def test_external_paddle_environment_is_used_when_configured(tmp_path, monkeypat
     assert captured["command"][0] == str(interpreter)
     assert "--worker-input" in captured["command"]
     assert captured["kwargs"]["timeout"] == 45.0
+
+
+def test_external_worker_can_return_lossless_blocks(tmp_path, monkeypatch):
+    interpreter = tmp_path / "python"
+    interpreter.touch()
+
+    def fake_run(command, **_kwargs):
+        output_path = Path(command[command.index("--worker-output") + 1])
+        output_path.write_text(
+            json.dumps([{"page": 1, "block_content": "结构块", "region_id": "r"}]),
+            encoding="utf-8",
+        )
+        return SimpleNamespace(returncode=0, stdout="")
+
+    monkeypatch.setenv("PPSTRUCTURE_PYTHON", str(interpreter))
+    monkeypatch.setattr(ppstructure_runtime.subprocess, "run", fake_run)
+
+    blocks = ppstructure_runtime.extract_ppstructure_blocks(
+        b"image-bytes", filename="resume.png"
+    )
+
+    assert blocks == [{"page": 1, "block_content": "结构块", "region_id": "r"}]
 
 
 def test_external_venv_symlink_is_not_mistaken_for_main_python(

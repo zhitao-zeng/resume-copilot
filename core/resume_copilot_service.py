@@ -1295,6 +1295,10 @@ async def _resume_copilot_service_impl(
     )
     ctx = await stage_classify(ctx)
 
+    requested_pipeline = os.getenv("RESUME_PIPELINE_VERSION", "v2").strip().casefold()
+    if requested_pipeline == "v3":
+        return await _resume_copilot_v3_from_context(ctx, stage_render=stage_render)
+
     # V2 pipeline — synchronous call (handles both CV and no-CV cases)
     t_v2 = time.perf_counter()
     from v2_pipeline import run_v2_pipeline
@@ -1475,6 +1479,117 @@ async def _resume_copilot_service_impl(
     )
     logger.info("stage_render done in %.1fs", time.perf_counter() - t_render)
 
+    return ResumeCopilotResponse(
+        files=ctx.files,
+        reply_text=ctx.reply_text,
+        score=ctx.score,
+        score_breakdown=ctx.score_breakdown,
+        missing_fields=_dicts(ctx.missing_fields),
+        conflicts=_dicts(ctx.conflicts),
+        scenario=ctx.scenario,
+        industry=ctx.industry,
+        user_stage=ctx.user_stage,
+        perf=ctx.perf,
+        ocr_warnings=ctx.ocr_warnings,
+        user_report=ctx.user_report,
+        resume_data=ctx.resume_data,
+        draft_id=ctx.draft_id,
+        version=ctx.version,
+    )
+
+
+async def _resume_copilot_v3_from_context(
+    ctx: Any,
+    *,
+    stage_render: Any,
+) -> ResumeCopilotResponse:
+    """Run the opt-in V3 compiler while sharing only the stable renderer."""
+
+    from resume_renderer import detect_docx_template_mode
+    from v3.pipeline import run_v3_pipeline
+
+    template_mode = "none"
+    template_path = Path(str(ctx.template_path or ""))
+    if template_path.is_file() and template_path.suffix.casefold() == ".docx":
+        template_mode = detect_docx_template_mode(template_path)
+    started = time.perf_counter()
+    result = await asyncio.to_thread(
+        run_v3_pipeline,
+        cv_content=ctx.cv_content,
+        cv_filename=ctx.cv_filename,
+        cv_text=ctx.cv_text,
+        query_text=ctx.query_text,
+        jd_text=ctx.jd_text,
+        template_mode=template_mode,
+        target_role=ctx.target_role,
+        use_llm=llm_enabled(),
+        candidate_cv_allowed=not ctx._low_ocr_quality,
+        cv_document_graph=ctx.cv_document_graph,
+    )
+    ctx.pipeline_version = "v3"
+    ctx.resume_data = result.resume_data
+    ctx.quality_report = result.quality_report
+    ctx.missing_fields = result.missing_fields
+    ctx.conflicts = result.conflicts
+    ctx.changes = result.changes
+    ctx.reply_text = result.reply_text
+    ctx.fabrication_report = FabricationReport()
+    ctx.audit_report = result.output.audit.model_dump(mode="json")
+    ctx._has_audit = True
+    ctx.score = 0.0
+    ctx.score_breakdown = {}
+    ctx.perf.update({
+        "v3_pipeline_s": round(time.perf_counter() - started, 3),
+        "v3_fact_count": float(len(result.output.graph.facts)),
+        "v3_eligible_fact_count": float(len(result.output.graph.eligible_fact_ids)),
+        "v3_written_fact_count": float(len(result.output.audit.written_fact_ids)),
+        "v3_semantic_fallback_count": float(len(result.semantic_report.fallback_fact_ids)),
+        "v3_semantic_fail_closed_count": float(len(result.semantic_report.fail_closed_fact_ids)),
+    })
+    if result.training_trace_path:
+        ctx.perf["v3_training_trace_written"] = 1.0
+    framework_mode = isinstance(ctx.resume_data.get("framework"), dict)
+    ctx.user_report = {
+        "generation_direction": (
+            f"未收到可写入简历的个人事实，已按{ctx.target_role or '目标岗位'}方向生成待填写框架。"
+            if framework_mode
+            else "按精确源事实、经历归属和目标岗位优先级编译简历。"
+        ),
+        "missing_fields": result.missing_fields,
+        "conflicts": result.conflicts,
+        "quality_report": result.quality_report,
+        "changes": result.changes,
+        "framework_mode": framework_mode,
+        "schema_version": result.semantic_report.schema_version,
+        "model_contract": result.quality_report.get("model_contract", {}),
+    }
+    ctx._write_debug("06_v3_fact_graph.json", result.output.graph.model_dump(mode="json"))
+    ctx._write_debug("07_v3_plan.json", result.output.plan.model_dump(mode="json"))
+    ctx._write_debug("08_v3_frozen.json", result.output.frozen.model_dump(mode="json"))
+    ctx._write_debug("08_v3_audit.json", result.output.audit.model_dump(mode="json"))
+    ctx._write_debug("08_v3_model_contract.json", {
+        "semantic": result.semantic_report.to_dict(),
+        "realization": result.realization_report.to_dict(),
+    })
+    trace_event(
+        "service_v3_result",
+        resume_data=ctx.resume_data,
+        fact_graph=result.output.graph,
+        plan=result.output.plan,
+        frozen=result.output.frozen,
+        audit=result.output.audit,
+        quality_report=ctx.quality_report,
+    )
+    render_started = time.perf_counter()
+    ctx = await stage_render(ctx)
+    logger.info(
+        "V3 pipeline rendered in %.1fs | semantic=%s realization=%s facts=%d written=%d",
+        time.perf_counter() - render_started,
+        result.semantic_report.status,
+        result.realization_report.status,
+        len(result.output.graph.eligible_fact_ids),
+        len(result.output.audit.written_fact_ids),
+    )
     return ResumeCopilotResponse(
         files=ctx.files,
         reply_text=ctx.reply_text,

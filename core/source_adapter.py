@@ -801,7 +801,33 @@ def _looks_like_record_header(value: str, section: str) -> bool:
     return False
 
 
-def _assign_record_ids(blocks: list[SourceBlock]) -> None:
+def _has_blank_line_between(
+    previous: SourceBlock | None,
+    current: SourceBlock,
+    source_text: str,
+) -> bool:
+    """Return whether exact source spans contain an empty paragraph boundary."""
+
+    if not previous or not source_text:
+        return False
+    if previous.source_id != current.source_id:
+        return False
+    if not previous.source_spans or not current.source_spans:
+        return False
+    previous_end = max(span.char_end for span in previous.source_spans)
+    current_start = min(span.char_start for span in current.source_spans)
+    if not (0 <= previous_end <= current_start <= len(source_text)):
+        return False
+    return bool(re.search(
+        r"\r?\n[^\S\r\n]*\r?\n", source_text[previous_end:current_start],
+    ))
+
+
+def _assign_record_ids(
+    blocks: list[SourceBlock],
+    *,
+    source_text: str = "",
+) -> None:
     """Attach conservative record boundaries without using an industry lexicon."""
 
     current_section = ""
@@ -898,8 +924,39 @@ def _assign_record_ids(blocks: list[SourceBlock]) -> None:
         previous_same_section = (
             index > 0 and (blocks[index - 1].section_hint or "") == section
         )
+        paragraph_break_before = _has_blank_line_between(
+            blocks[index - 1] if index > 0 else None,
+            block,
+            source_text,
+        )
+        next_value = blocks[index + 1].text.strip() if index + 1 < len(blocks) else ""
+        next_same_section = (
+            index + 1 < len(blocks)
+            and (blocks[index + 1].section_hint or "") == section
+        )
+        paragraph_record_title = bool(
+            paragraph_break_before
+            and next_same_section
+            and len(value) <= 100
+            and not re.match(r"^[-*•·▪◦]", value)
+            and not is_body
+            and not has_date
+            and not placeholder_only
+            and not re.search(r"[。；;!?！？]$", value)
+            and (
+                bool(_RECORD_DATE.search(next_value))
+                or bool(_RECORD_ENTITY_TOKEN.search(next_value))
+                or len(re.split(r"[|｜\t]", next_value)) >= 2
+            )
+        )
+        if paragraph_record_title:
+            # A blank paragraph followed by an organization/date row is an
+            # explicit layout boundary.  The intervening short line is the
+            # new record title, regardless of industry or occupation words.
+            is_header = True
         continuation_from_previous = bool(
             previous_same_section
+            and not paragraph_break_before
             and previous_value
             and not _RECORD_LAYOUT_ORDINAL.fullmatch(previous_value)
             and not re.search(r"[。；;!?！？]$", previous_value)
@@ -928,11 +985,31 @@ def _assign_record_ids(blocks: list[SourceBlock]) -> None:
             # tail itself looks like a short header (for example “月销售率…”).
             is_body = True
             is_header = False
-        next_value = blocks[index + 1].text.strip() if index + 1 < len(blocks) else ""
-        next_same_section = (
-            index + 1 < len(blocks)
-            and (blocks[index + 1].section_hint or "") == section
+        bullet_record_title = bool(
+            next_same_section
+            and re.match(r"^[-*•·▪◦]\s*\S", value)
+            and len(re.sub(r"[*_`]", "", value).strip(" \t-*•·▪◦")) <= 140
+            and (
+                bool(re.match(r"^[-*•·▪◦]\s*(?:\*\*|__)", value))
+                # In an education section, a list item followed by school
+                # metadata is structurally a degree/program title.  In work
+                # sections the same pattern is unsafe: the last duty of one
+                # job is frequently followed by the next anonymized company.
+                # Require explicit emphasis there instead of guessing a role.
+                or (
+                    section == "education"
+                    and _source_placeholder_only(next_value)
+                )
+            )
         )
+        if bullet_record_title:
+            # Markdown and anonymized resumes commonly encode a role, degree
+            # or project title as a bullet followed by placeholder metadata.
+            # The bullet marker is presentation, not a duty signal.  This
+            # layout-only boundary keeps the title, date and body in one
+            # record without relying on an occupation vocabulary.
+            is_body = False
+            is_header = True
         short_header_before_role = bool(
             next_same_section
             and len(value) <= 32
@@ -959,6 +1036,10 @@ def _assign_record_ids(blocks: list[SourceBlock]) -> None:
         starts_record = current_id is None
         if current_id is not None:
             if is_project_title:
+                starts_record = True
+            elif bullet_record_title and (
+                saw_body or saw_entity_header or record_has_date
+            ):
                 starts_record = True
             elif (
                 section == "projects"
@@ -1089,7 +1170,7 @@ def _assign_record_ids(blocks: list[SourceBlock]) -> None:
         saw_body = saw_body or (is_body and not is_project_title)
         if item_number is not None:
             last_number = item_number
-        saw_entity_header = saw_entity_header or is_entity or (
+        saw_entity_header = saw_entity_header or bullet_record_title or is_entity or (
             is_header and len(re.split(r"[|｜\t]", value)) >= 2
         )
         saw_dated_header = saw_dated_header or bool(
@@ -1106,7 +1187,11 @@ def _assign_record_ids(blocks: list[SourceBlock]) -> None:
         previous_was_project_title = is_project_title
 
 
-def _coalesce_wrapped_blocks(blocks: list[SourceBlock]) -> list[SourceBlock]:
+def _coalesce_wrapped_blocks(
+    blocks: list[SourceBlock],
+    *,
+    source_text: str = "",
+) -> list[SourceBlock]:
     """Join physical OCR wraps before they enter Composer/evidence checks."""
 
     merged: list[SourceBlock] = []
@@ -1125,6 +1210,7 @@ def _coalesce_wrapped_blocks(blocks: list[SourceBlock]) -> list[SourceBlock]:
         )
         continuation = bool(
             same_context
+            and not _has_blank_line_between(previous, block, source_text)
             and previous_value
             and not re.search(r"[。；;!?！？]$", previous_value)
             and _looks_like_record_body(previous_value)
@@ -1375,8 +1461,11 @@ def _split_into_blocks(
             origin_block_ids=[block_id],
             section_hint=assigned_section,
         ))
-    _assign_record_ids(blocks)
-    return _coalesce_wrapped_blocks(blocks) if source_type == "resume" else blocks
+    _assign_record_ids(blocks, source_text=text)
+    return (
+        _coalesce_wrapped_blocks(blocks, source_text=text)
+        if source_type == "resume" else blocks
+    )
 
 
 def _build_fact_units(
@@ -1584,7 +1673,7 @@ def build_source_bundle(
             )
         # Inline hints are assigned after the initial line split, so rebuild
         # record boundaries once the compact clauses have been classified.
-        _assign_record_ids(query_blocks)
+        _assign_record_ids(query_blocks, source_text=query_text)
         blocks.extend(query_blocks)
 
     # JD is still target context only, but section hints help the model avoid

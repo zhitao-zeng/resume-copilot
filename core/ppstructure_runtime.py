@@ -180,8 +180,8 @@ def _safe_order(value: Any, fallback: int) -> int:
         return fallback
 
 
-def ordered_blocks(prediction: Any) -> list[dict[str, Any]]:
-    """Return non-empty parsing blocks in StructureV3 reading order."""
+def ordered_blocks(prediction: Any, *, page: int | None = None) -> list[dict[str, Any]]:
+    """Return non-empty parsing blocks without dropping StructureV3 fields."""
 
     root = _prediction_payload(prediction)
     rows = root.get("parsing_res_list") or []
@@ -202,15 +202,30 @@ def ordered_blocks(prediction: Any) -> list[dict[str, Any]]:
         content = str(row.get("block_content") or "").strip()
         if not content:
             continue
-        blocks.append(
-            {
-                "block_order": _safe_order(row.get("block_order"), index + 1),
-                "block_id": _safe_order(row.get("block_id"), index),
-                "block_label": str(row.get("block_label") or ""),
-                "block_bbox": _plain(row.get("block_bbox")),
-                "block_content": content,
-            }
-        )
+        block = _plain(row)
+        if not isinstance(block, dict):
+            block = {}
+        # Normalized keys are guaranteed while every additional PaddleX field
+        # remains available to the V3 graph adapter and offline diagnostics.
+        block.update({
+            "block_order": _safe_order(row.get("block_order"), index + 1),
+            "block_id": _safe_order(row.get("block_id"), index),
+            "block_label": str(row.get("block_label") or ""),
+            "block_bbox": _plain(row.get("block_bbox")),
+            "block_content": content,
+        })
+        if page is not None:
+            block["page"] = page
+        blocks.append(block)
+    return blocks
+
+
+def blocks_from_predictions(predictions: Iterable[Any]) -> list[dict[str, Any]]:
+    """Flatten page predictions into lossless, page-qualified block rows."""
+
+    blocks: list[dict[str, Any]] = []
+    for page_index, prediction in enumerate(predictions, start=1):
+        blocks.extend(ordered_blocks(prediction, page=page_index))
     return blocks
 
 
@@ -238,6 +253,13 @@ def _extract_path_in_process(path: Path) -> str:
         return text_from_predictions(predictions)
 
 
+def _extract_blocks_path_in_process(path: Path) -> list[dict[str, Any]]:
+    pipeline = _get_pipeline()
+    with _RUN_LOCK:
+        predictions = pipeline.predict(str(path), **_pipeline_options())
+        return blocks_from_predictions(predictions)
+
+
 def _worker_timeout_seconds() -> float:
     try:
         value = float(os.getenv("PPSTRUCTURE_WORKER_TIMEOUT_SECONDS", "45"))
@@ -251,11 +273,12 @@ def _extract_with_external_python(
     *,
     filename: str,
     interpreter: Path,
-) -> str:
+    output_format: str = "text",
+) -> str | list[dict[str, Any]]:
     with tempfile.TemporaryDirectory(prefix="resume-structure-") as temp_dir:
         root = Path(temp_dir)
         input_path = root / ("input" + _safe_suffix(filename))
-        output_path = root / "output.txt"
+        output_path = root / ("output.json" if output_format == "blocks" else "output.txt")
         input_path.write_bytes(content)
         completed = subprocess.run(
             [
@@ -265,6 +288,8 @@ def _extract_with_external_python(
                 str(input_path),
                 "--worker-output",
                 str(output_path),
+                "--worker-format",
+                output_format,
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -279,7 +304,13 @@ def _extract_with_external_python(
             )
         if not output_path.is_file():
             raise RuntimeError("PP-StructureV3 worker produced no output file")
-        return output_path.read_text(encoding="utf-8").strip()
+        payload = output_path.read_text(encoding="utf-8").strip()
+        if output_format == "blocks":
+            decoded = json.loads(payload or "[]")
+            if not isinstance(decoded, list) or not all(isinstance(item, dict) for item in decoded):
+                raise RuntimeError("PP-StructureV3 worker produced invalid block JSON")
+            return decoded
+        return payload
 
 
 def extract_ppstructure_text(content: bytes, *, filename: str) -> str:
@@ -294,11 +325,12 @@ def extract_ppstructure_text(content: bytes, *, filename: str) -> str:
         return ""
     external_python = _configured_external_python()
     if external_python is not None:
-        return _extract_with_external_python(
+        result = _extract_with_external_python(
             content,
             filename=filename,
             interpreter=external_python,
         )
+        return str(result)
     suffix = _safe_suffix(filename)
     # A path follows the exact, validated PaddleX image decode path and avoids
     # RGB/BGR ambiguity in its ndarray input contract.
@@ -306,6 +338,27 @@ def extract_ppstructure_text(content: bytes, *, filename: str) -> str:
         handle.write(content)
         handle.flush()
         return _extract_path_in_process(Path(handle.name))
+
+
+def extract_ppstructure_blocks(content: bytes, *, filename: str) -> list[dict[str, Any]]:
+    """Extract raw StructureV3 blocks for the provenance-preserving V3 path."""
+
+    if not content:
+        return []
+    external_python = _configured_external_python()
+    if external_python is not None:
+        result = _extract_with_external_python(
+            content,
+            filename=filename,
+            interpreter=external_python,
+            output_format="blocks",
+        )
+        return list(result) if isinstance(result, list) else []
+    suffix = _safe_suffix(filename)
+    with tempfile.NamedTemporaryFile(prefix="resume-structure-", suffix=suffix) as handle:
+        handle.write(content)
+        handle.flush()
+        return _extract_blocks_path_in_process(Path(handle.name))
 
 
 def release_ppstructure_runtime() -> None:
@@ -325,6 +378,8 @@ def release_ppstructure_runtime() -> None:
 
 
 __all__ = [
+    "blocks_from_predictions",
+    "extract_ppstructure_blocks",
     "extract_ppstructure_text",
     "ordered_blocks",
     "ppstructure_enabled",
@@ -337,9 +392,16 @@ def _worker_main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--worker-input", type=Path, required=True)
     parser.add_argument("--worker-output", type=Path, required=True)
+    parser.add_argument("--worker-format", choices=("text", "blocks"), default="text")
     args = parser.parse_args()
-    text = _extract_path_in_process(args.worker_input)
-    args.worker_output.write_text(text, encoding="utf-8")
+    if args.worker_format == "blocks":
+        blocks = _extract_blocks_path_in_process(args.worker_input)
+        args.worker_output.write_text(
+            json.dumps(blocks, ensure_ascii=False), encoding="utf-8"
+        )
+    else:
+        text = _extract_path_in_process(args.worker_input)
+        args.worker_output.write_text(text, encoding="utf-8")
 
 
 if __name__ == "__main__":

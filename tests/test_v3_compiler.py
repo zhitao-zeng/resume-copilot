@@ -199,7 +199,11 @@ def test_records_do_not_cross_contaminate():
     records = {record.record_id: record for record in result.graph.records}
     assert len(records) == 2
     record_claims = [claim for claim in result.frozen.claims if claim.record_id]
-    assert len(record_claims) == 2
+    # Deterministic realization is now atomic at the source-unit boundary:
+    # each header/action remains independently bindable instead of becoming
+    # one giant record paragraph.
+    assert len(record_claims) == 4
+    assert {claim.record_id for claim in record_claims} == set(records)
     for claim in record_claims:
         assert all(result.graph.fact_map()[fact_id].record_id == claim.record_id for fact_id in claim.fact_ids)
 

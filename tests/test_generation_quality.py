@@ -759,6 +759,81 @@ def test_source_record_boundaries_keep_company_header_with_following_period():
     assert records[0][1] != records[3][1]
 
 
+def test_source_records_treat_emphasized_bullets_as_record_titles():
+    bundle = build_source_bundle(
+        "工作经历\n"
+        "- **岗位甲**\n"
+        "[公司], [城市]\n"
+        "2020年1月 - 2022年1月\n"
+        "- 负责用户访谈\n"
+        "- **岗位乙**\n"
+        "[公司], [城市]\n"
+        "2018年1月 - 2019年12月\n"
+        "- 负责活动复盘",
+        "",
+        "",
+    )
+    by_text = {block.text: block for block in bundle.blocks}
+
+    assert by_text["- **岗位甲**"].record_id == by_text["2020年1月 - 2022年1月"].record_id
+    assert by_text["- **岗位甲**"].record_id == by_text["- 负责用户访谈"].record_id
+    assert by_text["- **岗位乙**"].record_id == by_text["2018年1月 - 2019年12月"].record_id
+    assert by_text["- **岗位乙**"].record_id == by_text["- 负责活动复盘"].record_id
+    assert by_text["- **岗位甲**"].record_id != by_text["- **岗位乙**"].record_id
+
+
+def test_source_records_keep_bulleted_degree_with_its_school_and_period():
+    bundle = build_source_bundle(
+        "教育经历\n"
+        "- **机械工程学士**\n"
+        "[学校], [城市]\n"
+        "2016年9月 - 2020年6月\n"
+        "GPA: 3.8\n"
+        "- **工商管理硕士**\n"
+        "[学校], [城市]\n"
+        "2020年9月 - 2022年6月\n"
+        "GPA: 3.9",
+        "",
+        "",
+    )
+    by_text = {block.text: block for block in bundle.blocks}
+
+    assert by_text["- **机械工程学士**"].record_id == by_text["2016年9月 - 2020年6月"].record_id
+    assert by_text["- **机械工程学士**"].record_id == by_text["GPA: 3.8"].record_id
+    assert by_text["- **工商管理硕士**"].record_id == by_text["2020年9月 - 2022年6月"].record_id
+    assert by_text["- **工商管理硕士**"].record_id == by_text["GPA: 3.9"].record_id
+    assert by_text["- **机械工程学士**"].record_id != by_text["- **工商管理硕士**"].record_id
+
+
+def test_blank_paragraph_keeps_plain_next_role_out_of_previous_bullet():
+    bundle = build_source_bundle(
+        "专业经验\n"
+        "物业协调员\n"
+        "[公司] 停车解决方案 | 2021年1月 - 2022年6月\n"
+        "- 编制并提交详细报告\n\n"
+        "餐饮服务专员\n"
+        "[公司] 家庭餐厅 | 2018年4月 - 2021年1月\n"
+        "- 提供高标准客户服务\n\n"
+        "行政助理\n"
+        "[公司] Renovations | 2015年3月 - 2018年4月\n"
+        "- 管理公司网站",
+        "",
+        "",
+    )
+    by_text = {block.text: block for block in bundle.blocks}
+
+    assert "- 编制并提交详细报告餐饮服务专员" not in by_text
+    assert "- 提供高标准客户服务行政助理" not in by_text
+    assert by_text["餐饮服务专员"].record_id == by_text[
+        "[公司] 家庭餐厅 | 2018年4月 - 2021年1月"
+    ].record_id
+    assert by_text["餐饮服务专员"].record_id == by_text[
+        "- 提供高标准客户服务"
+    ].record_id
+    assert by_text["餐饮服务专员"].record_id != by_text["物业协调员"].record_id
+    assert by_text["行政助理"].record_id != by_text["餐饮服务专员"].record_id
+
+
 def test_multicolumn_ocr_dates_and_qualifications_stay_in_two_records():
     cv_text = (
         "教育背景\n"

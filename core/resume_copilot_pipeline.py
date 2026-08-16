@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import asyncio
 import json
+import os
 import re
 import time
 import threading
@@ -270,6 +271,10 @@ class PipelineContext:
     # Stage 0 (Ingest) output
     query_text: str = ""
     cv_text: str = ""
+    cv_content: bytes = b""
+    cv_filename: str = ""
+    cv_media_type: str = ""
+    cv_document_graph: Any = None
     jd_text: str = ""
     template_path: str = ""
     ocr_warnings: list = field(default_factory=list)
@@ -319,6 +324,7 @@ class PipelineContext:
     reply_text: str = ""
     draft_id: str = ""
     version: str = ""
+    pipeline_version: str = "v2"
 
     # Debug output (only set when DEBUG_OUTPUT_DIR env is set)
     _debug_dir: str = ""
@@ -345,9 +351,9 @@ class PipelineContext:
 # Shared helpers (moved from resume_copilot_service.py)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _dicts(items: list[Any]) -> list[dict[str, Any]]:
+def _dicts(items: list[Any] | None) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
-    for item in items:
+    for item in items or []:
         if hasattr(item, "model_dump"):
             result.append(item.model_dump())
         elif isinstance(item, dict):
@@ -408,7 +414,46 @@ def _check_ocr_quality(text: str) -> Optional[dict[str, Any]]:
             "noise_ratio": round(noise_ratio, 3), "reason": "OCR质量过低" if not acceptable else ""}
 
 
-async def _extract_upload_text(upload: UploadFile, purpose: str, perf: dict[str, float], warnings: list[dict[str, Any]]) -> str:
+def _cv_text_requires_ocr_quality_gate(
+    filename: str,
+    document_graph: Any = None,
+) -> bool:
+    """Return whether CV text actually came through an OCR text channel.
+
+    The quality heuristic is deliberately conservative and Chinese-oriented;
+    applying it to native TXT, Markdown or DOCX content can discard perfectly
+    valid English resumes.  Images always require the gate.  V3 PDFs expose
+    their page engines, so native text-layer PDFs bypass it while scanned or
+    mixed PDFs retain it.  A legacy PDF without extraction provenance remains
+    gated rather than being trusted blindly.
+    """
+
+    ext = _file_ext(filename)
+    if ext in IMAGE_EXTENSIONS:
+        return True
+    if ext != ".pdf":
+        return False
+    if document_graph is None:
+        return True
+    engine = str(getattr(document_graph, "extraction_engine", "") or "").casefold()
+    metadata = getattr(document_graph, "metadata", {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+    page_engines = metadata.get("page_engines")
+    if isinstance(page_engines, (list, tuple)) and page_engines:
+        return any(str(item).casefold() == "ppstructure" for item in page_engines)
+    if engine in {"ocr", "ppstructure"}:
+        return True
+    return metadata.get("native") is False
+
+
+async def _extract_upload_text(
+    upload: UploadFile,
+    purpose: str,
+    perf: dict[str, float],
+    warnings: list[dict[str, Any]],
+    capture: dict[str, Any] | None = None,
+) -> str:
     started = time.perf_counter()
     try:
         raw = await read_upload_limited(upload, MAX_FILE_SIZE)
@@ -416,13 +461,85 @@ async def _extract_upload_text(upload: UploadFile, purpose: str, perf: dict[str,
         raise HTTPException(status_code=400, detail=f"{purpose} file too large (> {MAX_FILE_SIZE // (1024 * 1024)} MB)")
     filename = upload.filename or f"{purpose}.bin"
     ext = _file_ext(filename)
+    if capture is not None:
+        capture.update({
+            "content": raw,
+            "filename": filename,
+            "extension": ext,
+            "media_type": str(getattr(upload, "content_type", "") or ""),
+        })
     if ext in IMAGE_EXTENSIONS:
         warnings.append({
             "source": purpose, "filename": filename,
             "message": "已对图片执行本地 OCR；如识别不完整，请补充清晰图片或文本。",
         })
     try:
-        text = await asyncio.to_thread(extract_text_from_bytes, raw, filename)
+        text = ""
+        v3_cv = (
+            purpose == "cv"
+            and os.getenv("RESUME_PIPELINE_VERSION", "v2").strip().casefold()
+            == "v3"
+        )
+        layout_engine = os.getenv(
+            "LAYOUT_ORDER_ENGINE", "bbox",
+        ).strip().casefold()
+        # Raster BBOX/hybrid modes must recognize text first.  Building the
+        # graph eagerly used to call full PP-Structure and silently replace
+        # PP-OCRv6 text, making the advertised hybrid A/B identical to the
+        # full-replacement candidate.
+        defer_v3_raster_graph = (
+            v3_cv and ext in IMAGE_EXTENSIONS and layout_engine != "ppstructure"
+        )
+        # V3 consumes the structured graph directly.  Build it once during
+        # ingest so scan/image PP-Structure OCR is not repeated after scenario
+        # classification; the same canonical text also feeds quality checks.
+        if v3_cv and not defer_v3_raster_graph:
+            try:
+                from v3.input_adapters import build_input_document_graph
+
+                document_graph = await asyncio.to_thread(
+                    build_input_document_graph,
+                    raw,
+                    filename=filename,
+                    fallback_text="",
+                    source_id="cv",
+                    source_type="cv",
+                )
+                text = document_graph.source_text
+                if capture is not None:
+                    capture["document_graph"] = document_graph
+            except Exception as adapter_exc:
+                warnings.append({
+                    "source": purpose,
+                    "filename": filename,
+                    "message": f"V3布局解析不可用，已回退文本提取（{type(adapter_exc).__name__}）。",
+                })
+        if not text:
+            text = await asyncio.to_thread(extract_text_from_bytes, raw, filename)
+        if defer_v3_raster_graph and text:
+            try:
+                from v3.input_adapters import build_input_document_graph
+
+                document_graph = await asyncio.to_thread(
+                    build_input_document_graph,
+                    raw,
+                    filename=filename,
+                    fallback_text=text,
+                    source_id="cv",
+                    source_type="cv",
+                )
+                text = document_graph.source_text
+                if capture is not None:
+                    capture["document_graph"] = document_graph
+            except Exception as adapter_exc:
+                warnings.append({
+                    "source": purpose,
+                    "filename": filename,
+                    "message": (
+                        "V3栅格文本图构建不可用，已保留OCR文本"
+                        f"（{type(adapter_exc).__name__}）。"
+                    ),
+                })
     except HTTPException as exc:
         if ext in IMAGE_EXTENSIONS:
             warnings.append({
@@ -1573,14 +1690,23 @@ async def stage_ingest(
     ctx.cv_text = ""
     ctx.cv_uploaded = cv is not None
     if cv is not None:
-        ctx.cv_text = await _extract_upload_text(cv, "cv", ctx.perf, ctx.ocr_warnings)
+        cv_capture: dict[str, Any] = {}
+        ctx.cv_text = await _extract_upload_text(
+            cv, "cv", ctx.perf, ctx.ocr_warnings, capture=cv_capture,
+        )
+        ctx.cv_content = bytes(cv_capture.get("content") or b"")
+        ctx.cv_filename = str(cv_capture.get("filename") or "")
+        ctx.cv_media_type = str(cv_capture.get("media_type") or "")
+        ctx.cv_document_graph = cv_capture.get("document_graph")
 
     # OCR quality gate
     ctx._write_debug("02_cv_text.txt", ctx.cv_text)
     ctx._low_ocr_quality = False
     ctx.cv_extraction_failed = False
     ctx.ocr_quality = None
-    if ctx.cv_text:
+    if ctx.cv_text and _cv_text_requires_ocr_quality_gate(
+        ctx.cv_filename, ctx.cv_document_graph,
+    ):
         ctx.ocr_quality = _check_ocr_quality(ctx.cv_text)
         if ctx.ocr_quality is not None and not ctx.ocr_quality.get("acceptable"):
             ctx._low_ocr_quality = True
@@ -2226,20 +2352,20 @@ async def stage_render(ctx: PipelineContext) -> PipelineContext:
     # itself remained grounded.  Build the public reply exclusively from the
     # validated structured report; this is also faster and keeps every role,
     # omission and conflict traceable to the final document.
-    reply_text = build_reply_text(
-        scenario=ctx.scenario, industry=ctx.industry,
-        user_stage=ctx.user_stage, missing_fields=missing_dict,
-        conflicts=conflict_dict, ocr_warnings=ctx.ocr_warnings,
-        direction=ctx.user_report.get("generation_direction", ""),
-        score_total=ctx.score,
-        changes=ctx.changes,
-        targeted_suggestions=ctx.user_report.get("targeted_suggestions", []),
-        quality_report=ctx.quality_report,
-        resume_data=ctx.resume_data,
-        framework_mode=bool(ctx.user_report.get("framework_mode")),
-        template_notes=ctx.template_notes,
-    )
-    ctx.reply_text = reply_text
+    if ctx.pipeline_version != "v3" or not ctx.reply_text.strip():
+        ctx.reply_text = build_reply_text(
+            scenario=ctx.scenario, industry=ctx.industry,
+            user_stage=ctx.user_stage, missing_fields=missing_dict,
+            conflicts=conflict_dict, ocr_warnings=ctx.ocr_warnings,
+            direction=ctx.user_report.get("generation_direction", ""),
+            score_total=ctx.score,
+            changes=ctx.changes,
+            targeted_suggestions=ctx.user_report.get("targeted_suggestions", []),
+            quality_report=ctx.quality_report,
+            resume_data=ctx.resume_data,
+            framework_mode=bool(ctx.user_report.get("framework_mode")),
+            template_notes=ctx.template_notes,
+        )
 
     t_export = time.perf_counter()
     ctx.files = await asyncio.to_thread(
@@ -2265,7 +2391,7 @@ async def stage_render(ctx: PipelineContext) -> PipelineContext:
     ctx._debug_prefix = "09"
     ctx._write_debug("09_reply_context.json", {
         "reply_text": ctx.reply_text,
-        "missing_fields": [{"field": m.field, "label": m.label, "reason": m.reason, "source": m.source} for m in ctx.missing_fields] if ctx.missing_fields else [],
+        "missing_fields": missing_dict,
         "fabrication_found": ctx.fabrication_report.fabrication_found if hasattr(ctx.fabrication_report, "fabrication_found") else False,
         "score": ctx.score,
         "user_stage": ctx.user_stage,

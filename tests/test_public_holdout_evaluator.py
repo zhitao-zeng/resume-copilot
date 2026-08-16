@@ -118,3 +118,63 @@ def test_summary_is_micro_aggregated_and_ignores_candidate_score() -> None:
 def test_shadow_split_is_rejected_by_cli_contract() -> None:
     source = EVALUATOR_PATH.read_text(encoding="utf-8")
     assert '"shadow_v3" in cases_path.parts' in source
+
+
+def test_reported_but_written_uses_structured_missing_field_identity() -> None:
+    response = {
+        "resume_data": {
+            "experience": [{"role": "产品经理", "bullets": ["负责用户访谈"]}],
+            "education": [],
+        },
+        "missing_fields": [{
+            "field": "education",
+            "label": "教育经历",
+            "reason": "未提供教育经历",
+        }],
+    }
+
+    assert EVALUATOR._reported_but_written(response) == []
+
+    response["missing_fields"] = [{
+        "field": "experience",
+        "label": "工作经历",
+        "reason": "未提供工作经历",
+    }]
+    assert EVALUATOR._reported_but_written(response) == ["经历"]
+
+
+def test_generation_quality_is_reported_separately_from_factuality(tmp_path: Path) -> None:
+    annotation = _annotation(tmp_path)
+    case = {
+        "id": "fixture",
+        "scenario": "scenario1",
+        "target_role": "产品经理",
+        "target_jd": "负责用户研究并输出产品方案",
+        "expected_output": {"reply_text_must_cover": []},
+    }
+    response = {
+        "resume_data": {
+            "meta": {"name": "张三"},
+            "experience": [{
+                "company": "甲公司",
+                "role": "产品经理",
+                "period": "2022-2024",
+                "bullets": [
+                    "负责用户调研，通过访谈输出PRD并提升转化率30%",
+                    "客户沟通",
+                ],
+            }],
+        },
+        "reply_text": "已生成简历，并列出缺失信息和岗位建议。",
+        "missing_fields": [{"field": "education", "label": "教育经历"}],
+    }
+
+    quality = EVALUATOR.assess_generation_quality(case, annotation, response)
+
+    assert quality["proxy_version"] == "generation-quality-proxy-1.0"
+    assert quality["blinded_human_review_required"] is True
+    assert quality["bullets"]["count"] == 2
+    assert quality["bullets"]["star_complete_count"] == 1
+    assert quality["bullets"]["compact_bullet_rate"] == 0.5
+    assert quality["job_alignment"]["available"] is True
+    assert "score" not in quality

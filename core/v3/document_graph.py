@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 from .contracts import DocumentGraph, LayoutNode, SourceAsset, SourceSpan
+from .section_ontology import is_document_title, is_section_heading
 
 
 @dataclass(frozen=True)
@@ -46,16 +47,12 @@ def _line_kind(line: str) -> str:
     value = line.strip()
     if not value:
         return "paragraph"
-    # Heading detection is intentionally generic and structural, not an
-    # industry vocabulary.  Semantic section mapping happens later.
-    common_heading = {
-        "个人信息", "基本信息", "联系方式", "个人总结", "个人简介", "教育经历",
-        "教育背景", "教育", "工作经历", "工作经验", "实习经历", "项目经历",
-        "项目经验", "项目", "科研经历", "研究经历", "校园经历", "技能",
-        "专业技能", "证书", "资质", "认证", "contact", "summary", "education",
-        "experience", "projects", "skills", "certifications",
-    }
-    if len(value) <= 40 and (value.casefold() in {item.casefold() for item in common_heading} or value.endswith((":", "：")) or value.startswith(("#", "一、", "二、", "三、"))):
+    # Only a known, domain-neutral resume section (or explicit Markdown title)
+    # is promoted to a top-level heading.  A record-local label such as
+    # ``主要成就：`` must not reset section or record ownership.
+    if len(value) <= 80 and (
+        is_section_heading(value) or is_document_title(value) or value.startswith("#")
+    ):
         return "heading"
     return "paragraph"
 

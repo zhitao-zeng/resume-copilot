@@ -6,6 +6,7 @@ import re
 import signal
 import threading
 import time
+import unicodedata
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -26,10 +27,12 @@ from docx import Document as DocxDocument
 from docx.oxml.ns import qn
 from http_compat import HTTPException
 from experimental_model_candidates import (
+    OCR_LAYOUT_REGION_SEPARATOR,
     cached_layout_regions,
     region_aware_ocr_order,
 )
 from ppstructure_runtime import (
+    extract_ppstructure_blocks,
     extract_ppstructure_text,
     ppstructure_enabled,
     release_ppstructure_runtime,
@@ -811,12 +814,13 @@ def _rapid_result_to_text(
     img_width: int,
     img_height: int,
     source_content: bytes = b"",
+    layout_regions: Optional[list[dict[str, Any]]] = None,
 ) -> str:
     boxes = result.boxes if hasattr(result, "boxes") else (result[0] if isinstance(result, (tuple, list)) else None)
     txts = result.txts if hasattr(result, "txts") else (result[1] if isinstance(result, (tuple, list)) and len(result) > 1 else None)
     if boxes is None or len(boxes) == 0:
         return ""
-    regions = cached_layout_regions(
+    regions = layout_regions if layout_regions is not None else cached_layout_regions(
         source_content,
         width=img_width,
         height=img_height,
@@ -828,6 +832,9 @@ def _rapid_result_to_text(
         height=img_height,
         regions=regions,
         baseline_order=_reconstruct_ocr_reading_order,
+        group_separator=(
+            OCR_LAYOUT_REGION_SEPARATOR if layout_regions is not None else ""
+        ),
     ) if regions else None
     if ordered_texts is None:
         ordered_texts = _reconstruct_ocr_reading_order(
@@ -850,6 +857,15 @@ def _run_rapid_ocr(np_img):
 def _ocr_numeric_signature(text: object) -> tuple[str, ...]:
     repaired = _repair_ocr_text_artifacts(str(text or ""))
     return tuple(re.findall(r"\d+(?:\.\d+)?", repaired))
+
+
+def _ocr_lexical_signature(text: object) -> str:
+    """Normalize OCR prose for exact cross-recognizer comparison."""
+
+    value = unicodedata.normalize(
+        "NFKC", _repair_ocr_text_artifacts(str(text or "")),
+    ).casefold()
+    return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", value)
 
 
 def _suppress_disputed_numeric_anchors(text: object) -> str:
@@ -902,6 +918,10 @@ def _apply_numeric_ocr_consensus(np_img, result: Any) -> Any:
             secondary_s = time.perf_counter() - secondary_started
             if secondary.txts is None or len(secondary.txts) != len(result.txts):
                 return result
+            # Retain the already-paid independent recognition head for the
+            # later layout lexical vote.  Structure text is never copied into
+            # the resume; it may only choose between two PP-OCR readings.
+            result.ocr_secondary_txts = tuple(secondary.txts)
             numeric_indexes = [
                 index
                 for index, (primary_text, secondary_text) in enumerate(
@@ -970,7 +990,171 @@ def _apply_numeric_ocr_consensus(np_img, result: Any) -> Any:
     return result
 
 
-def _ocr_image_with_rapid(content: bytes, *, prepared_image=None) -> str:
+def _apply_layout_lexical_witness(
+    result: Any,
+    layout_regions: Optional[list[dict[str, Any]]],
+) -> Any:
+    """Select a PP-OCR reading only when an independent 2/3 vote agrees.
+
+    Primary and secondary PP-OCR heads occasionally differ by one or two CJK
+    glyphs.  PP-Structure may break that tie only when its overlapping region
+    contains the complete secondary reading and does not contain the primary
+    reading.  The selected text still comes from PP-OCR; Structure remains a
+    geometry/abstaining-witness channel.  Numeric lines are excluded because
+    their stricter three-head consensus runs separately.
+    """
+
+    secondary_txts = getattr(result, "ocr_secondary_txts", None)
+    if (
+        result is None
+        or not layout_regions
+        or getattr(result, "boxes", None) is None
+        or getattr(result, "txts", None) is None
+        or secondary_txts is None
+        or len(secondary_txts) != len(result.txts)
+    ):
+        return result
+    try:
+        import numpy as np  # noqa: F811
+
+        reconciled = list(result.txts)
+        replaced = 0
+        for index, (primary_text, secondary_text) in enumerate(
+            zip(result.txts, secondary_txts)
+        ):
+            if (
+                _ocr_numeric_signature(primary_text)
+                or _ocr_numeric_signature(secondary_text)
+            ):
+                continue
+            primary = _ocr_lexical_signature(primary_text)
+            secondary = _ocr_lexical_signature(secondary_text)
+            if (
+                not primary
+                or not secondary
+                or primary == secondary
+                or len(primary) != len(secondary)
+                or len(primary) < 4
+            ):
+                continue
+            difference_count = sum(
+                left != right for left, right in zip(primary, secondary)
+            )
+            difference_limit = min(2, max(1, len(primary) // 20))
+            if difference_count > difference_limit:
+                continue
+
+            points = np.asarray(result.boxes[index], dtype=float)
+            if points.ndim != 2 or points.shape[1] < 2:
+                continue
+            x1, x2 = float(points[:, 0].min()), float(points[:, 0].max())
+            y1, y2 = float(points[:, 1].min()), float(points[:, 1].max())
+            line_area = max(1.0, (x2 - x1) * (y2 - y1))
+            ranked: list[tuple[float, dict[str, Any]]] = []
+            for region in layout_regions:
+                bbox = region.get("bbox")
+                if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+                    continue
+                rx1, ry1, rx2, ry2 = (float(value) for value in bbox)
+                overlap = max(0.0, min(x2, rx2) - max(x1, rx1)) * max(
+                    0.0, min(y2, ry2) - max(y1, ry1)
+                )
+                ranked.append((overlap / line_area, region))
+            if not ranked:
+                continue
+            overlap_ratio, region = max(ranked, key=lambda item: item[0])
+            if overlap_ratio < 0.50:
+                continue
+            structure = _ocr_lexical_signature(region.get("text", ""))
+            if not structure or secondary not in structure or primary in structure:
+                continue
+            reconciled[index] = _repair_ocr_text_artifacts(secondary_text)
+            replaced += 1
+        if replaced:
+            result.txts = tuple(reconciled)
+            logger.info(
+                "OCR layout lexical witness selected secondary readings | lines=%s",
+                replaced,
+            )
+    except Exception as exc:
+        logger.warning("OCR layout lexical witness failed; keeping primary OCR: %s", exc)
+    return result
+
+
+def _apply_layout_numeric_witness(
+    result: Any,
+    layout_regions: Optional[list[dict[str, Any]]],
+) -> Any:
+    """Suppress a number when independent Structure OCR explicitly disagrees.
+
+    StructureV3 remains an abstaining witness: its text is never copied into
+    the resume.  Only an overlapping region with a different numeric signature
+    can remove PP-OCRv6 digits.  Missing Structure digits do not veto the
+    existing three-head consensus, which avoids recall loss from ordinary OCR
+    omissions.
+    """
+
+    if (
+        result is None
+        or not layout_regions
+        or getattr(result, "boxes", None) is None
+        or getattr(result, "txts", None) is None
+    ):
+        return result
+    try:
+        import numpy as np  # noqa: F811
+
+        reconciled = list(result.txts)
+        disputed = 0
+        for index, raw_text in enumerate(result.txts):
+            rapid_signature = _ocr_numeric_signature(raw_text)
+            if not rapid_signature:
+                continue
+            points = np.asarray(result.boxes[index], dtype=float)
+            if points.ndim != 2 or points.shape[1] < 2:
+                continue
+            x1, x2 = float(points[:, 0].min()), float(points[:, 0].max())
+            y1, y2 = float(points[:, 1].min()), float(points[:, 1].max())
+            line_area = max(1.0, (x2 - x1) * (y2 - y1))
+            ranked: list[tuple[float, dict[str, Any]]] = []
+            for region in layout_regions:
+                bbox = region.get("bbox")
+                if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+                    continue
+                rx1, ry1, rx2, ry2 = (float(value) for value in bbox)
+                overlap = max(0.0, min(x2, rx2) - max(x1, rx1)) * max(
+                    0.0, min(y2, ry2) - max(y1, ry1)
+                )
+                ranked.append((overlap / line_area, region))
+            if not ranked:
+                continue
+            overlap_ratio, region = max(ranked, key=lambda item: item[0])
+            if overlap_ratio < 0.50:
+                continue
+            structure_signature = _ocr_numeric_signature(region.get("text", ""))
+            if not structure_signature:
+                continue
+            if set(rapid_signature).issubset(set(structure_signature)):
+                continue
+            reconciled[index] = _suppress_disputed_numeric_anchors(raw_text)
+            disputed += 1
+        if disputed:
+            result.txts = tuple(reconciled)
+            logger.info(
+                "OCR layout numeric witness suppressed disputed lines | lines=%s",
+                disputed,
+            )
+    except Exception as exc:
+        logger.warning("OCR layout numeric witness failed; keeping consensus text: %s", exc)
+    return result
+
+
+def _ocr_image_with_rapid(
+    content: bytes,
+    *,
+    prepared_image=None,
+    layout_regions: Optional[list[dict[str, Any]]] = None,
+) -> str:
     """Extract text from image using global RapidOCR (single engine call).
 
     PP-OCRv6 was trained for RGB document input; collapsing it to one channel
@@ -1014,11 +1198,14 @@ def _ocr_image_with_rapid(content: bytes, *, prepared_image=None) -> str:
         else:
             return ""
     result = _apply_numeric_ocr_consensus(np_img, result)
+    result = _apply_layout_numeric_witness(result, layout_regions)
+    result = _apply_layout_lexical_witness(result, layout_regions)
     return _rapid_result_to_text(
         result,
         img_width=np_img.shape[1],
         img_height=np_img.shape[0],
         source_content=content,
+        layout_regions=layout_regions,
     )
 
 
@@ -2026,6 +2213,62 @@ def _extract_text_from_pdf_bytes(content: bytes) -> str:
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif", ".tif", ".tiff"}
 
 
+def _ppstructure_hybrid_enabled() -> bool:
+    return os.getenv("LAYOUT_ORDER_ENGINE", "bbox").strip().lower() == "ppstructure_hybrid"
+
+
+def _ppstructure_regions_for_prepared_image(
+    prepared_image: Any,
+    *,
+    filename: str,
+) -> list[dict[str, Any]]:
+    """Return StructureV3 geometry while discarding its recognized text.
+
+    Both engines see the exact prepared image, so their coordinates share one
+    frame even when an oversized upload was downscaled.  PP-OCRv6 remains the
+    only text source; StructureV3 contributes region BBOX and reading order.
+    """
+
+    payload = io.BytesIO()
+    prepared_image.save(payload, format="PNG")
+    blocks = extract_ppstructure_blocks(
+        payload.getvalue(),
+        filename=f"{Path(filename).stem or 'resume'}-prepared.png",
+    )
+    width, height = prepared_image.size
+    regions: list[dict[str, Any]] = []
+    for index, block in enumerate(blocks):
+        bbox = block.get("block_bbox", block.get("bbox"))
+        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+            continue
+        try:
+            x1, y1, x2, y2 = (float(value) for value in bbox)
+        except (TypeError, ValueError):
+            continue
+        x1, x2 = max(0.0, x1), min(float(width), x2)
+        y1, y2 = max(0.0, y1), min(float(height), y2)
+        if x2 <= x1 or y2 <= y1:
+            continue
+        try:
+            order = int(block.get("block_order", index))
+        except (TypeError, ValueError):
+            order = index
+        try:
+            confidence = float(block.get("confidence", block.get("score", 1.0)))
+        except (TypeError, ValueError):
+            confidence = 1.0
+        regions.append({
+            "bbox": [x1, y1, x2, y2],
+            "confidence": max(0.0, min(1.0, confidence)),
+            "order": order,
+            "label": str(block.get("block_label", block.get("label", "")) or ""),
+            # Used only as an independent disagreement witness for numbers;
+            # never selected as generated text in the hybrid route.
+            "text": str(block.get("block_content", block.get("text", "")) or ""),
+        })
+    return regions
+
+
 def _validate_upload_signature(content: bytes, filename: str) -> None:
     """Reject extension spoofing and compressed document bombs early."""
     ext = _detect_extension(filename)
@@ -2072,6 +2315,7 @@ def extract_text_from_image_bytes(content: bytes, filename: str) -> str:
     )
 
     text = ""
+    layout_regions: Optional[list[dict[str, Any]]] = None
     if ppstructure_enabled():
         stage_started = time.perf_counter()
         try:
@@ -2090,6 +2334,29 @@ def extract_text_from_image_bytes(content: bytes, filename: str) -> str:
         )
         if not text.strip():
             release_ppstructure_runtime()
+    elif _ppstructure_hybrid_enabled():
+        stage_started = time.perf_counter()
+        try:
+            layout_regions = _ppstructure_regions_for_prepared_image(
+                prepared_image,
+                filename=filename,
+            )
+        except Exception as exc:
+            # Geometry is advisory.  Any model/runtime/pressure failure keeps
+            # the exact existing PP-OCRv6+BBOX path.
+            logger.warning(
+                "PP-StructureV3 layout oracle failed; using OCR+BBOX: %s", exc,
+            )
+            release_ppstructure_runtime()
+            layout_regions = None
+        logger.info(
+            "PP-StructureV3 layout oracle finished | device=%s elapsed_s=%.3f regions=%s",
+            os.getenv("PPSTRUCTURE_DEVICE", "gpu:0"),
+            time.perf_counter() - stage_started,
+            len(layout_regions or []),
+        )
+        if not layout_regions:
+            release_ppstructure_runtime()
 
     # StructureV3 is the default raster parser. RapidOCR keeps its previous
     # detection/recognition plus BBOX ordering role as the bounded fallback.
@@ -2098,7 +2365,14 @@ def extract_text_from_image_bytes(content: bytes, filename: str) -> str:
 
     if not text.strip() and _RAPID_OCR is not None:
         stage_started = time.perf_counter()
-        text = _ocr_image_with_rapid(content, prepared_image=prepared_image)
+        if layout_regions:
+            text = _ocr_image_with_rapid(
+                content,
+                prepared_image=prepared_image,
+                layout_regions=layout_regions,
+            )
+        else:
+            text = _ocr_image_with_rapid(content, prepared_image=prepared_image)
         logger.info(
             "OCR primary finished | provider=%s model=%s elapsed_s=%.3f chars=%s",
             _RAPID_OCR_PROVIDER,

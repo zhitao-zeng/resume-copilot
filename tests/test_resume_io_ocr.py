@@ -103,6 +103,133 @@ def test_ppstructure_failure_falls_back_to_existing_ocr_bbox(tmp_path, monkeypat
     assert released
 
 
+def test_ppstructure_hybrid_uses_only_geometry_with_rapidocr_text(
+    tmp_path, monkeypatch
+):
+    image_path = tmp_path / "resume.png"
+    Image.new("RGB", (200, 100), "white").save(image_path)
+    regions = [
+        {"bbox": [0, 0, 80, 100], "confidence": 1.0, "order": 1},
+        {"bbox": [120, 0, 200, 100], "confidence": 1.0, "order": 2},
+    ]
+    captured = {}
+    monkeypatch.setattr(resume_io, "ppstructure_enabled", lambda: False)
+    monkeypatch.setattr(resume_io, "_ppstructure_hybrid_enabled", lambda: True)
+    monkeypatch.setattr(
+        resume_io,
+        "_ppstructure_regions_for_prepared_image",
+        lambda _image, *, filename: regions,
+    )
+    monkeypatch.setattr(resume_io, "_RAPID_OCR_INITED", True)
+    monkeypatch.setattr(resume_io, "_RAPID_OCR", object())
+
+    def rapid_text(_content, *, prepared_image, layout_regions=None):
+        captured["regions"] = layout_regions
+        return "PP-OCRv6 保留文本"
+
+    monkeypatch.setattr(resume_io, "_ocr_image_with_rapid", rapid_text)
+
+    text = resume_io.extract_text_from_image_bytes(
+        image_path.read_bytes(), image_path.name
+    )
+
+    assert text == "PP-OCRv6 保留文本"
+    assert captured["regions"] == regions
+
+
+def test_layout_numeric_witness_only_suppresses_explicit_disagreement():
+    boxes = np.asarray([
+        [[0, 0], [100, 0], [100, 20], [0, 20]],
+        [[0, 30], [100, 30], [100, 50], [0, 50]],
+    ], dtype=float)
+    result = SimpleNamespace(
+        boxes=boxes,
+        txts=("日均处理超过5个预约", "管理1.1亿美元业务"),
+    )
+    regions = [
+        {
+            "bbox": [0, 0, 100, 20],
+            "text": "日均处理超过50个预约",
+            "confidence": 1.0,
+        },
+        {
+            "bbox": [0, 30, 100, 50],
+            "text": "管理1.1亿美元业务",
+            "confidence": 1.0,
+        },
+    ]
+
+    reconciled = resume_io._apply_layout_numeric_witness(result, regions)
+
+    assert reconciled.txts[0] == "日均处理超过个预约"
+    assert reconciled.txts[1] == "管理1.1亿美元业务"
+
+
+def test_layout_numeric_witness_abstains_when_structure_has_no_number():
+    result = SimpleNamespace(
+        boxes=np.asarray([[[0, 0], [100, 0], [100, 20], [0, 20]]], dtype=float),
+        txts=("完成10次访谈",),
+    )
+
+    reconciled = resume_io._apply_layout_numeric_witness(result, [{
+        "bbox": [0, 0, 100, 20],
+        "text": "完成用户访谈",
+        "confidence": 1.0,
+    }])
+
+    assert reconciled.txts == ("完成10次访谈",)
+
+
+def test_layout_lexical_witness_uses_secondary_only_on_independent_two_of_three_vote():
+    result = SimpleNamespace(
+        boxes=np.asarray([
+            [[0, 0], [100, 0], [100, 20], [0, 20]],
+            [[0, 30], [100, 30], [100, 50], [0, 50]],
+            [[0, 60], [100, 60], [100, 80], [0, 80]],
+        ], dtype=float),
+        txts=(
+            "檀长招聘、培养团队",
+            "分析国内市场",
+            "完成10次访谈",
+        ),
+        ocr_secondary_txts=(
+            "擅长招聘、培养团队",
+            "分折国内市场",
+            "完成11次访谈",
+        ),
+    )
+    regions = [
+        {"bbox": [0, 0, 100, 20], "text": "擅长招聘、培养团队"},
+        # Structure agrees with the primary, so the secondary is rejected.
+        {"bbox": [0, 30, 100, 50], "text": "分析国内市场"},
+        # Numeric lines remain under the stricter numeric consensus.
+        {"bbox": [0, 60, 100, 80], "text": "完成11次访谈"},
+    ]
+
+    reconciled = resume_io._apply_layout_lexical_witness(result, regions)
+
+    assert reconciled.txts == (
+        "擅长招聘、培养团队",
+        "分析国内市场",
+        "完成10次访谈",
+    )
+
+
+def test_layout_lexical_witness_abstains_on_large_or_unaligned_disagreement():
+    result = SimpleNamespace(
+        boxes=np.asarray([[[0, 0], [100, 0], [100, 20], [0, 20]]], dtype=float),
+        txts=("负责客户运营管理",),
+        ocr_secondary_txts=("主导平台架构设计",),
+    )
+
+    reconciled = resume_io._apply_layout_lexical_witness(result, [{
+        "bbox": [0, 0, 100, 20],
+        "text": "主导平台架构设计",
+    }])
+
+    assert reconciled.txts == ("负责客户运营管理",)
+
+
 def _png_bytes(image: Image.Image) -> bytes:
     output = io.BytesIO()
     image.save(output, format="PNG")
@@ -468,6 +595,9 @@ def test_numeric_consensus_skips_medium_when_small_heads_already_disagree(monkey
 
     assert medium.crop_markers == [1]
     assert result.txts == ("负责个项目", "覆盖20名用户", "无数字")
+    assert result.ocr_secondary_txts == (
+        "负责11个项目", "覆盖20名用户", "无数字",
+    )
 
 
 def test_tensorrt_result_does_not_run_cpu_consensus_twice(monkeypatch):

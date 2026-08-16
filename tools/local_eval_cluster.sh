@@ -10,6 +10,7 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+SOURCE_ROOT="${LOCAL_EVAL_SOURCE_ROOT:-$REPO_ROOT}"
 
 PYTHON_BIN="${LOCAL_EVAL_PYTHON:-$REPO_ROOT/.venv/bin/python}"
 INSTANCE_COUNT="${LOCAL_EVAL_INSTANCE_COUNT:-4}"
@@ -18,6 +19,53 @@ MODEL_PORT_BASE="${LOCAL_EVAL_MODEL_PORT_BASE:-8007}"
 GPU_IDS="${LOCAL_EVAL_GPU_IDS:-3,4,5,6}"
 PIPELINE_PROFILE="${LOCAL_EVAL_PIPELINE_PROFILE:-current_control}"
 FACT_COMPILER_MODE="${LOCAL_EVAL_FACT_COMPILER_MODE:-on}"
+RESUME_PIPELINE_VERSION="${LOCAL_EVAL_RESUME_PIPELINE_VERSION:-v2}"
+MODEL_PROVIDER="${LOCAL_EVAL_MODEL_PROVIDER:-qwen27b}"
+V3_TRAINING_TRACE_ENABLED="${LOCAL_EVAL_V3_TRAINING_TRACE_ENABLED:-0}"
+V3_REALIZER_MIN_REMAINING_SECONDS="${LOCAL_EVAL_V3_REALIZER_MIN_REMAINING_SECONDS:-240}"
+V3_SEMANTIC_CONCURRENCY="${LOCAL_EVAL_V3_SEMANTIC_CONCURRENCY:-2}"
+V3_SEMANTIC_BATCH_FACTS="${LOCAL_EVAL_V3_SEMANTIC_BATCH_FACTS:-28}"
+V3_SEMANTIC_BATCH_CHARS="${LOCAL_EVAL_V3_SEMANTIC_BATCH_CHARS:-9000}"
+LAYOUT_ORDER_ENGINE="${LOCAL_EVAL_LAYOUT_ORDER_ENGINE:-bbox}"
+PPSTRUCTURE_PYTHON="${LOCAL_EVAL_PPSTRUCTURE_PYTHON:-}"
+PPSTRUCTURE_MODEL_DIR="${LOCAL_EVAL_PPSTRUCTURE_MODEL_DIR:-$SOURCE_ROOT/models_slim/ppstructure-v3/official_models}"
+# Production Docker explicitly selects its GPU.  Local evaluation defaults to
+# CPU so it never steals GPU 0--2 from unrelated services.
+PPSTRUCTURE_DEVICE="${LOCAL_EVAL_PPSTRUCTURE_DEVICE:-cpu}"
+PPSTRUCTURE_WORKER_TIMEOUT_SECONDS="${LOCAL_EVAL_PPSTRUCTURE_WORKER_TIMEOUT_SECONDS:-90}"
+PPSTRUCTURE_DOCKER_IMAGE="${LOCAL_EVAL_PPSTRUCTURE_DOCKER_IMAGE:-}"
+PPSTRUCTURE_DOCKER_ALLOWED_GPUS="${LOCAL_EVAL_PPSTRUCTURE_DOCKER_ALLOWED_GPUS:-$GPU_IDS}"
+
+# Optional credentials are loaded only into the evaluator process environment.
+# They are never written to the cluster manifest or evaluation artifacts.
+SECRET_ENV_FILE="${LOCAL_EVAL_SECRET_ENV_FILE:-}"
+if [[ -n "$SECRET_ENV_FILE" ]]; then
+  if [[ ! -r "$SECRET_ENV_FILE" ]]; then
+    printf '[local-eval] ERROR: secret env file is not readable: %s\n' "$SECRET_ENV_FILE" >&2
+    exit 1
+  fi
+  set -a
+  # shellcheck disable=SC1090
+  . "$SECRET_ENV_FILE"
+  set +a
+fi
+
+case "$MODEL_PROVIDER" in
+  qwen27b)
+    MODEL_BASE_URL=""
+    MODEL_NAME="${LOCAL_EVAL_MODEL_NAME:-Qwen3.5-27B-AWQ}"
+    MODEL_API_KEY="${LOCAL_EVAL_MODEL_API_KEY:-not-needed}"
+    ;;
+  deepseek-local)
+    MODEL_BASE_URL="${LOCAL_EVAL_MODEL_BASE_URL:-http://172.28.4.52:8888/v1}"
+    MODEL_NAME="${LOCAL_EVAL_MODEL_NAME:-DeepSeek-V4-Flash-0731}"
+    MODEL_API_KEY="${LOCAL_EVAL_MODEL_API_KEY:-${DEEPSEEK_V4_FLASH_LOCAL_API_KEY:-}}"
+    ;;
+  *)
+    printf '[local-eval] ERROR: invalid LOCAL_EVAL_MODEL_PROVIDER: %s\n' "$MODEL_PROVIDER" >&2
+    exit 1
+    ;;
+esac
 
 WORKSPACE_ROOT="${LOCAL_EVAL_WORKSPACE_ROOT:-/mnt/disk1/zengzhitao}"
 TOKENIZER_DIR="${LOCAL_EVAL_TOKENIZER_DIR:-$WORKSPACE_ROOT/models/Qwen3.5-27B-AWQ}"
@@ -33,8 +81,10 @@ MODEL_WAIT_SECONDS="${LOCAL_EVAL_MODEL_WAIT_SECONDS:-1800}"
 
 RUNTIME_DIR="${LOCAL_EVAL_RUNTIME_DIR:-$REPO_ROOT/.codex/research-loop/runtime/local-eval-cluster}"
 ARTIFACT_ROOT="${LOCAL_EVAL_ARTIFACT_ROOT:-$REPO_ROOT/.codex/research-loop/artifacts/local-eval-cluster}"
+V3_TRAINING_TRACE_DIR="${LOCAL_EVAL_V3_TRAINING_TRACE_DIR:-$RUNTIME_DIR/training-traces}"
 CASES_PATH="${LOCAL_EVAL_CASES:-$REPO_ROOT/validation_sets/public_resume_holdout/holdout_v2/cases.jsonl}"
 ANNOTATIONS_PATH="${LOCAL_EVAL_ANNOTATIONS:-$REPO_ROOT/validation_sets/public_resume_holdout/holdout_v2/annotations.jsonl}"
+EXPECTED_CASE_COUNT="${LOCAL_EVAL_EXPECTED_CASE_COUNT:-60}"
 EVALUATOR="$REPO_ROOT/validation_sets/public_resume_holdout/evaluate.py"
 MERGER="$REPO_ROOT/validation_sets/public_resume_holdout/merge_results.py"
 
@@ -64,17 +114,39 @@ Environment and lifecycle:
 Evaluation:
   eval-case CASE_ID [INDEX] Run one case on managed API INDEX (default: 0)
   eval-subset RUN_ID IDS    Run comma-separated case IDs across managed APIs
-  eval-plan                 Print the deterministic four-way case assignment
-  eval-full [RUN_ID]        Run the frozen 60 cases in four modulo shards and merge
+  eval-plan                 Print the deterministic modulo case assignment
+  eval-full [RUN_ID]        Run the complete frozen dataset and merge all shards
   summary RESULT.json       Print promotion metrics from an evaluator result
   logs [INDEX]              Follow one managed API log (default: 0)
 
 Common overrides:
   LOCAL_EVAL_GPU_IDS=3,4,5,6
+  LOCAL_EVAL_SOURCE_ROOT=/path/to/immutable/source/worktree
   LOCAL_EVAL_PIPELINE_PROFILE=current_control|f507_compatible|ledger_shadow|local_repair|fact_compiler|candidate|quality_v2
   LOCAL_EVAL_FACT_COMPILER_MODE=legacy|shadow|on
+  LOCAL_EVAL_RESUME_PIPELINE_VERSION=v2|v3
+  LOCAL_EVAL_MODEL_PROVIDER=qwen27b|deepseek-local
+  LOCAL_EVAL_SECRET_ENV_FILE=/path/to/private/env
+  LOCAL_EVAL_MODEL_BASE_URL=http://host:port/v1
+  LOCAL_EVAL_MODEL_NAME=model-name
   LOCAL_EVAL_VLLM_IMAGE=immutable-image-tag
   LOCAL_EVAL_ARTIFACT_ROOT=/durable/output/path
+  LOCAL_EVAL_CASES=/path/to/frozen/cases.jsonl
+  LOCAL_EVAL_ANNOTATIONS=/path/to/frozen/annotations.jsonl
+  LOCAL_EVAL_EXPECTED_CASE_COUNT=60
+  LOCAL_EVAL_V3_TRAINING_TRACE_ENABLED=0|1
+  LOCAL_EVAL_V3_TRAINING_TRACE_DIR=/private/evaluation/trace/path
+  LOCAL_EVAL_V3_REALIZER_MIN_REMAINING_SECONDS=240
+  LOCAL_EVAL_V3_SEMANTIC_CONCURRENCY=2
+  LOCAL_EVAL_V3_SEMANTIC_BATCH_FACTS=28
+  LOCAL_EVAL_V3_SEMANTIC_BATCH_CHARS=9000
+  LOCAL_EVAL_LAYOUT_ORDER_ENGINE=bbox|ppstructure|ppstructure_hybrid
+  LOCAL_EVAL_PPSTRUCTURE_PYTHON=/path/to/isolated/venv/bin/python
+  LOCAL_EVAL_PPSTRUCTURE_MODEL_DIR=/path/to/official_models
+  LOCAL_EVAL_PPSTRUCTURE_DEVICE=cpu
+  LOCAL_EVAL_PPSTRUCTURE_WORKER_TIMEOUT_SECONDS=90
+  LOCAL_EVAL_PPSTRUCTURE_DOCKER_IMAGE=resume-copilot:ppstructure-gpu-sharedcuda-local
+  LOCAL_EVAL_PPSTRUCTURE_DOCKER_ALLOWED_GPUS=3,4,5,6
 
 Safety:
   api-up never kills or adopts an existing listener. api-down only kills a
@@ -112,10 +184,12 @@ parse_gpu_ids() {
 
 code_digest() {
   (
-    cd "$REPO_ROOT"
+    cd "$SOURCE_ROOT"
     {
       printf '%s\0' main.py
-      find core -maxdepth 1 -type f -name '*.py' -print0
+      find core -type f -name '*.py' -print0
+      [[ ! -f tools/ppstructure_docker_python.sh ]] || \
+        printf '%s\0' tools/ppstructure_docker_python.sh
     } | sort -z | xargs -0 sha256sum
   ) | sha256sum | awk '{print $1}'
 }
@@ -147,7 +221,7 @@ read_manifest_value() {
 process_matches_repo_api() {
   local pid="$1"
   [[ -r "/proc/$pid/cmdline" ]] || return 1
-  tr '\0' ' ' <"/proc/$pid/cmdline" | grep -Fq "$REPO_ROOT/main.py"
+  tr '\0' ' ' <"/proc/$pid/cmdline" | grep -Fq "$SOURCE_ROOT/main.py"
 }
 
 managed_api_pid() {
@@ -181,6 +255,30 @@ model_is_ready() {
   direct_curl -fsS --max-time 2 "http://127.0.0.1:$1/health" >/dev/null 2>&1
 }
 
+external_model_is_ready() {
+  [[ -n "$MODEL_API_KEY" ]] || return 1
+  direct_curl -fsS --max-time 10 \
+    -H "Authorization: Bearer $MODEL_API_KEY" \
+    "${MODEL_BASE_URL%/}/models" \
+    | jq -e --arg model "$MODEL_NAME" 'any(.data[]?; .id == $model)' >/dev/null 2>&1
+}
+
+external_model_id() {
+  direct_curl -fsS --max-time 10 \
+    -H "Authorization: Bearer $MODEL_API_KEY" \
+    "${MODEL_BASE_URL%/}/models" 2>/dev/null \
+    | jq -r '.data[0].id // "-"' 2>/dev/null || printf '-'
+}
+
+model_base_url_for_index() {
+  local index="$1"
+  if [[ "$MODEL_PROVIDER" == deepseek-local ]]; then
+    printf '%s' "$MODEL_BASE_URL"
+  else
+    printf 'http://127.0.0.1:%s/v1' "$((MODEL_PORT_BASE + index))"
+  fi
+}
+
 model_id() {
   direct_curl -fsS --max-time 3 "http://127.0.0.1:$1/v1/models" 2>/dev/null \
     | jq -r '.data[0].id // "-"' 2>/dev/null || printf '-'
@@ -192,8 +290,17 @@ preflight_files() {
     require_command "$command_name"
   done
   require_file "$PYTHON_BIN"
-  require_dir "$TOKENIZER_DIR"
-  require_file "$TOKENIZER_DIR/tokenizer_config.json"
+  require_file "$SOURCE_ROOT/main.py"
+  require_dir "$SOURCE_ROOT/core"
+  if [[ "$MODEL_PROVIDER" == qwen27b ]]; then
+    require_dir "$TOKENIZER_DIR"
+    require_file "$TOKENIZER_DIR/tokenizer_config.json"
+  else
+    [[ -n "$MODEL_API_KEY" ]] || die \
+      "deepseek-local requires DEEPSEEK_V4_FLASH_LOCAL_API_KEY or LOCAL_EVAL_MODEL_API_KEY"
+    external_model_is_ready || die \
+      "external model is unavailable or does not expose $MODEL_NAME at $MODEL_BASE_URL"
+  fi
   require_dir "$OCR_SITE"
   require_dir "$OCR_PRIMARY_DIR"
   require_file "$OCR_PRIMARY_DIR/det.onnx"
@@ -205,23 +312,79 @@ preflight_files() {
   require_file "$ANNOTATIONS_PATH"
   require_file "$EVALUATOR"
   require_file "$MERGER"
-  parse_gpu_ids
+  if [[ "$MODEL_PROVIDER" == qwen27b ]]; then
+    parse_gpu_ids
+  fi
   [[ "$PIPELINE_PROFILE" =~ ^(current_control|f507_compatible|ledger_shadow|local_repair|fact_compiler|candidate|quality_v2)$ ]] || die \
     "invalid LOCAL_EVAL_PIPELINE_PROFILE: $PIPELINE_PROFILE"
   [[ "$FACT_COMPILER_MODE" =~ ^(legacy|shadow|on)$ ]] || die \
     "invalid LOCAL_EVAL_FACT_COMPILER_MODE: $FACT_COMPILER_MODE"
+  [[ "$RESUME_PIPELINE_VERSION" =~ ^(v2|v3)$ ]] || die \
+    "invalid LOCAL_EVAL_RESUME_PIPELINE_VERSION: $RESUME_PIPELINE_VERSION"
+  [[ "$V3_TRAINING_TRACE_ENABLED" =~ ^(0|1)$ ]] || die \
+    "invalid LOCAL_EVAL_V3_TRAINING_TRACE_ENABLED: $V3_TRAINING_TRACE_ENABLED"
+  [[ "$V3_REALIZER_MIN_REMAINING_SECONDS" =~ ^[0-9]+([.][0-9]+)?$ ]] || die \
+    "invalid LOCAL_EVAL_V3_REALIZER_MIN_REMAINING_SECONDS: $V3_REALIZER_MIN_REMAINING_SECONDS"
+  [[ "$V3_SEMANTIC_CONCURRENCY" =~ ^[1-9][0-9]*$ ]] || die \
+    "invalid LOCAL_EVAL_V3_SEMANTIC_CONCURRENCY: $V3_SEMANTIC_CONCURRENCY"
+  [[ "$V3_SEMANTIC_BATCH_FACTS" =~ ^[1-9][0-9]*$ ]] || die \
+    "invalid LOCAL_EVAL_V3_SEMANTIC_BATCH_FACTS: $V3_SEMANTIC_BATCH_FACTS"
+  [[ "$V3_SEMANTIC_BATCH_CHARS" =~ ^[1-9][0-9]*$ ]] || die \
+    "invalid LOCAL_EVAL_V3_SEMANTIC_BATCH_CHARS: $V3_SEMANTIC_BATCH_CHARS"
+  [[ "$LAYOUT_ORDER_ENGINE" =~ ^(bbox|ppstructure|ppstructure_hybrid)$ ]] || die \
+    "invalid LOCAL_EVAL_LAYOUT_ORDER_ENGINE: $LAYOUT_ORDER_ENGINE"
+  [[ "$PPSTRUCTURE_WORKER_TIMEOUT_SECONDS" =~ ^[0-9]+([.][0-9]+)?$ ]] || die \
+    "invalid LOCAL_EVAL_PPSTRUCTURE_WORKER_TIMEOUT_SECONDS: $PPSTRUCTURE_WORKER_TIMEOUT_SECONDS"
+  if [[ "$LAYOUT_ORDER_ENGINE" != bbox ]]; then
+    [[ -x "$PPSTRUCTURE_PYTHON" ]] || die \
+      "ppstructure evaluation requires executable LOCAL_EVAL_PPSTRUCTURE_PYTHON"
+    require_dir "$PPSTRUCTURE_MODEL_DIR"
+    local ppstructure_model required_file
+    for ppstructure_model in \
+      PP-DocLayout_plus-L \
+      PP-OCRv5_server_det \
+      PP-LCNet_x1_0_textline_ori \
+      PP-OCRv5_server_rec; do
+      for required_file in config.json inference.json inference.pdiparams inference.yml; do
+        require_file "$PPSTRUCTURE_MODEL_DIR/$ppstructure_model/$required_file"
+      done
+    done
+    if [[ "$PPSTRUCTURE_DEVICE" == gpu* ]]; then
+      parse_gpu_ids
+      [[ -n "$PPSTRUCTURE_DOCKER_IMAGE" ]] || die \
+        "local GPU ppstructure requires LOCAL_EVAL_PPSTRUCTURE_DOCKER_IMAGE"
+      docker image inspect "$PPSTRUCTURE_DOCKER_IMAGE" >/dev/null 2>&1 || die \
+        "PP-Structure GPU image is not local: $PPSTRUCTURE_DOCKER_IMAGE"
+    fi
+  fi
 
   local case_count annotation_count
   case_count="$(wc -l <"$CASES_PATH" | tr -d ' ')"
   annotation_count="$(wc -l <"$ANNOTATIONS_PATH" | tr -d ' ')"
-  [[ "$case_count" -eq 60 ]] || die "expected frozen holdout_v2 to contain 60 cases; found $case_count"
-  [[ "$annotation_count" -eq 60 ]] || die "expected 60 annotations; found $annotation_count"
+  [[ "$EXPECTED_CASE_COUNT" =~ ^[1-9][0-9]*$ ]] || die \
+    "invalid LOCAL_EVAL_EXPECTED_CASE_COUNT: $EXPECTED_CASE_COUNT"
+  [[ "$case_count" -eq "$EXPECTED_CASE_COUNT" ]] || die \
+    "expected frozen dataset to contain $EXPECTED_CASE_COUNT cases; found $case_count"
+  [[ "$annotation_count" -eq "$EXPECTED_CASE_COUNT" ]] || die \
+    "expected frozen dataset to contain $EXPECTED_CASE_COUNT annotations; found $annotation_count"
 
-  PYTHONPATH="$OCR_SITE:$REPO_ROOT/core:$REPO_ROOT" "$PYTHON_BIN" -c \
+  PYTHONPATH="$OCR_SITE:$SOURCE_ROOT/core:$SOURCE_ROOT" "$PYTHON_BIN" -c \
     'import rapidocr; from resume_io import extract_text_from_bytes' >/dev/null
 }
 
 status_models() {
+  if [[ "$MODEL_PROVIDER" == deepseek-local ]]; then
+    local health id
+    health=down
+    id=-
+    if external_model_is_ready; then
+      health=ready
+      id="$(external_model_id)"
+    fi
+    printf 'provider=%s endpoint=%s state=%s model=%s\n' \
+      "$MODEL_PROVIDER" "$MODEL_BASE_URL" "$health" "$id"
+    return 0
+  fi
   parse_gpu_ids
   printf '%-5s %-8s %-34s %-10s %-24s\n' GPU PORT CONTAINER STATE MODEL
   local index gpu_id port name running state health id
@@ -278,6 +441,7 @@ status_apis() {
   done
   printf 'current_code_digest=%s\n' "$current_digest"
   printf 'loaded_code_digest=%s\n' "${loaded_digest:--}"
+  printf 'model_provider=%s model_name=%s\n' "$MODEL_PROVIDER" "$MODEL_NAME"
 }
 
 command_preflight() {
@@ -288,6 +452,10 @@ command_preflight() {
 }
 
 models_all_ready() {
+  if [[ "$MODEL_PROVIDER" == deepseek-local ]]; then
+    external_model_is_ready
+    return
+  fi
   local index port
   for ((index = 0; index < INSTANCE_COUNT; index++)); do
     port=$((MODEL_PORT_BASE + index))
@@ -297,6 +465,10 @@ models_all_ready() {
 
 command_models_up() {
   preflight_files
+  if [[ "$MODEL_PROVIDER" == deepseek-local ]]; then
+    log "external model $MODEL_NAME is ready at $MODEL_BASE_URL; no local model container started"
+    return 0
+  fi
   docker image inspect "$VLLM_IMAGE" >/dev/null 2>&1 || die \
     "vLLM image is not local: $VLLM_IMAGE"
   local index gpu_id port name running mapped_port used_mib
@@ -359,6 +531,10 @@ command_models_up() {
 }
 
 command_models_down() {
+  if [[ "$MODEL_PROVIDER" == deepseek-local ]]; then
+    log "external model provider is not owned by this helper; nothing stopped"
+    return 0
+  fi
   parse_gpu_ids
   local gpu_id name
   for gpu_id in "${PARSED_GPU_IDS[@]}"; do
@@ -371,10 +547,12 @@ command_models_down() {
 }
 
 managed_cluster_is_current() {
-  local expected_digest loaded_digest index port pid
+  local expected_digest loaded_digest loaded_provider index port pid expected_base
   expected_digest="$(code_digest)"
   loaded_digest="$(read_manifest_value CODE_DIGEST || true)"
   [[ -n "$loaded_digest" && "$loaded_digest" == "$expected_digest" ]] || return 1
+  loaded_provider="$(read_manifest_value MODEL_PROVIDER || true)"
+  [[ "$loaded_provider" == "$MODEL_PROVIDER" ]] || return 1
   for ((index = 0; index < INSTANCE_COUNT; index++)); do
     port=$((API_PORT_BASE + index))
     pid="$(managed_api_pid "$port" || true)"
@@ -384,6 +562,28 @@ managed_cluster_is_current() {
     [[ "$(process_env_value "$pid" LLM_CONTEXT_WINDOW || true)" == 16384 ]] || return 1
     [[ "$(process_env_value "$pid" PIPELINE_PROFILE || true)" == "$PIPELINE_PROFILE" ]] || return 1
     [[ "$(process_env_value "$pid" FACT_COMPILER_MODE || true)" == "$FACT_COMPILER_MODE" ]] || return 1
+    [[ "$(process_env_value "$pid" RESUME_PIPELINE_VERSION || true)" == "$RESUME_PIPELINE_VERSION" ]] || return 1
+    [[ "$(process_env_value "$pid" V3_TRAINING_TRACE_ENABLED || true)" == "$V3_TRAINING_TRACE_ENABLED" ]] || return 1
+    [[ "$(process_env_value "$pid" V3_TRAINING_TRACE_DIR || true)" == "$V3_TRAINING_TRACE_DIR" ]] || return 1
+    [[ "$(process_env_value "$pid" V3_REALIZER_MIN_REMAINING_SECONDS || true)" == "$V3_REALIZER_MIN_REMAINING_SECONDS" ]] || return 1
+    [[ "$(process_env_value "$pid" V3_SEMANTIC_CONCURRENCY || true)" == "$V3_SEMANTIC_CONCURRENCY" ]] || return 1
+    [[ "$(process_env_value "$pid" V3_SEMANTIC_BATCH_FACTS || true)" == "$V3_SEMANTIC_BATCH_FACTS" ]] || return 1
+    [[ "$(process_env_value "$pid" V3_SEMANTIC_BATCH_CHARS || true)" == "$V3_SEMANTIC_BATCH_CHARS" ]] || return 1
+    [[ "$(process_env_value "$pid" LAYOUT_ORDER_ENGINE || true)" == "$LAYOUT_ORDER_ENGINE" ]] || return 1
+    [[ "$(process_env_value "$pid" PPSTRUCTURE_PYTHON || true)" == "$PPSTRUCTURE_PYTHON" ]] || return 1
+    [[ "$(process_env_value "$pid" PPSTRUCTURE_MODEL_DIR || true)" == "$PPSTRUCTURE_MODEL_DIR" ]] || return 1
+    [[ "$(process_env_value "$pid" PPSTRUCTURE_DEVICE || true)" == "$PPSTRUCTURE_DEVICE" ]] || return 1
+    [[ "$(process_env_value "$pid" PPSTRUCTURE_WORKER_TIMEOUT_SECONDS || true)" == "$PPSTRUCTURE_WORKER_TIMEOUT_SECONDS" ]] || return 1
+    [[ "$(process_env_value "$pid" PPSTRUCTURE_DOCKER_IMAGE || true)" == "$PPSTRUCTURE_DOCKER_IMAGE" ]] || return 1
+    [[ "$(process_env_value "$pid" PPSTRUCTURE_DOCKER_ALLOWED_GPUS || true)" == "$PPSTRUCTURE_DOCKER_ALLOWED_GPUS" ]] || return 1
+    if [[ "$LAYOUT_ORDER_ENGINE" != bbox && "$PPSTRUCTURE_DEVICE" == gpu* ]]; then
+      [[ "$(process_env_value "$pid" PPSTRUCTURE_DOCKER_GPU_ID || true)" == "${PARSED_GPU_IDS[$index]}" ]] || return 1
+    fi
+    [[ "$(process_env_value "$pid" LOCAL_EVAL_MODEL_PROVIDER || true)" == "$MODEL_PROVIDER" ]] || return 1
+    [[ "$(process_env_value "$pid" LOCAL_EVAL_SOURCE_ROOT || true)" == "$SOURCE_ROOT" ]] || return 1
+    expected_base="$(model_base_url_for_index "$index")"
+    [[ "$(process_env_value "$pid" MODELHUB_BASE_URL || true)" == "$expected_base" ]] || return 1
+    [[ "$(process_env_value "$pid" MODELHUB_MODEL_NAME || true)" == "$MODEL_NAME" ]] || return 1
   done
 }
 
@@ -401,6 +601,24 @@ write_manifest() {
     printf 'LLM_CONTEXT_WINDOW=16384\n'
     printf 'PIPELINE_PROFILE=%s\n' "$PIPELINE_PROFILE"
     printf 'FACT_COMPILER_MODE=%s\n' "$FACT_COMPILER_MODE"
+    printf 'RESUME_PIPELINE_VERSION=%s\n' "$RESUME_PIPELINE_VERSION"
+    printf 'V3_TRAINING_TRACE_ENABLED=%s\n' "$V3_TRAINING_TRACE_ENABLED"
+    printf 'V3_TRAINING_TRACE_DIR=%s\n' "$V3_TRAINING_TRACE_DIR"
+    printf 'V3_REALIZER_MIN_REMAINING_SECONDS=%s\n' "$V3_REALIZER_MIN_REMAINING_SECONDS"
+    printf 'V3_SEMANTIC_CONCURRENCY=%s\n' "$V3_SEMANTIC_CONCURRENCY"
+    printf 'V3_SEMANTIC_BATCH_FACTS=%s\n' "$V3_SEMANTIC_BATCH_FACTS"
+    printf 'V3_SEMANTIC_BATCH_CHARS=%s\n' "$V3_SEMANTIC_BATCH_CHARS"
+    printf 'LAYOUT_ORDER_ENGINE=%s\n' "$LAYOUT_ORDER_ENGINE"
+    printf 'PPSTRUCTURE_PYTHON=%s\n' "$PPSTRUCTURE_PYTHON"
+    printf 'PPSTRUCTURE_MODEL_DIR=%s\n' "$PPSTRUCTURE_MODEL_DIR"
+    printf 'PPSTRUCTURE_DEVICE=%s\n' "$PPSTRUCTURE_DEVICE"
+    printf 'PPSTRUCTURE_WORKER_TIMEOUT_SECONDS=%s\n' "$PPSTRUCTURE_WORKER_TIMEOUT_SECONDS"
+    printf 'PPSTRUCTURE_DOCKER_IMAGE=%s\n' "$PPSTRUCTURE_DOCKER_IMAGE"
+    printf 'PPSTRUCTURE_DOCKER_ALLOWED_GPUS=%s\n' "$PPSTRUCTURE_DOCKER_ALLOWED_GPUS"
+    printf 'MODEL_PROVIDER=%s\n' "$MODEL_PROVIDER"
+    printf 'SOURCE_ROOT=%s\n' "$SOURCE_ROOT"
+    printf 'MODEL_NAME=%s\n' "$MODEL_NAME"
+    printf 'MODEL_BASE_URL=%s\n' "${MODEL_BASE_URL:-local-sharded}"
     printf 'OCR_PRIMARY_DIR=%s\n' "$OCR_PRIMARY_DIR"
   } >"$temporary"
   mv "$temporary" "$(manifest_path)"
@@ -470,33 +688,59 @@ command_api_up() {
   started_at="$(date +%Y%m%d-%H%M%S)"
   write_manifest "$digest"
 
-  local model_port output_dir log_path pid
+  local output_dir log_path pid model_base_url tokenizer_path ppstructure_gpu_id
   local -a started_pids=()
   for ((index = 0; index < INSTANCE_COUNT; index++)); do
     port=$((API_PORT_BASE + index))
-    model_port=$((MODEL_PORT_BASE + index))
+    model_base_url="$(model_base_url_for_index "$index")"
+    tokenizer_path=""
+    if [[ "$MODEL_PROVIDER" == qwen27b ]]; then
+      tokenizer_path="$TOKENIZER_DIR"
+    fi
+    ppstructure_gpu_id=""
+    if [[ "$LAYOUT_ORDER_ENGINE" != bbox && "$PPSTRUCTURE_DEVICE" == gpu* ]]; then
+      ppstructure_gpu_id="${PARSED_GPU_IDS[$index]}"
+    fi
     output_dir="$(api_output_dir "$port")"
     log_path="$RUNTIME_DIR/logs/api-${port}-${started_at}.log"
     mkdir -p "$output_dir"
     nohup setsid env \
-      PYTHONPATH="$OCR_SITE:$REPO_ROOT/core:$REPO_ROOT" \
+      PYTHONPATH="$OCR_SITE:$SOURCE_ROOT/core:$SOURCE_ROOT" \
       HOST=127.0.0.1 PORT="$port" \
-      MODELHUB_BASE_URL="http://127.0.0.1:$model_port/v1" \
-      MODELHUB_API_KEY=not-needed MODELHUB_MODEL_NAME=Qwen3.5-27B-AWQ \
-      MAX_MODEL_LEN=16384 LLM_CONTEXT_WINDOW=16384 LLM_TOKENIZER_PATH="$TOKENIZER_DIR" \
+      MODELHUB_BASE_URL="$model_base_url" \
+      MODELHUB_API_KEY="$MODEL_API_KEY" MODELHUB_MODEL_NAME="$MODEL_NAME" \
+      LOCAL_EVAL_MODEL_PROVIDER="$MODEL_PROVIDER" \
+      LOCAL_EVAL_SOURCE_ROOT="$SOURCE_ROOT" \
+      MAX_MODEL_LEN=16384 LLM_CONTEXT_WINDOW=16384 LLM_TOKENIZER_PATH="$tokenizer_path" \
+      NO_PROXY="${NO_PROXY:-},127.0.0.1,localhost,172.28.4.52" \
+      no_proxy="${no_proxy:-},127.0.0.1,localhost,172.28.4.52" \
       OUTPUT_DIR="$output_dir" DEFAULT_OUTPUT_FORMAT=docx MAX_REQUEST_SIZE_BYTES=67108864 \
       REQUEST_TIMEOUT_SECONDS=480 TASK_DEADLINE_SECONDS=475 TASK_FINALIZATION_RESERVE_SECONDS=30 \
       LLM_TIMEOUT_SECONDS=300 REQUEST_CONCURRENCY=1 REQUEST_QUEUE_LIMIT=2 LLM_INFLIGHT_LIMIT=2 \
       LLM_COMPOSER_CONCURRENCY=2 LLM_COMPOSER_MAX_TOKENS=6144 LLM_COMPOSER_MAX_FACT_BLOCKS=50 \
       ENABLE_HEURISTIC_AUDIT_FALLBACK=0 \
       PIPELINE_PROFILE="$PIPELINE_PROFILE" FACT_COMPILER_MODE="$FACT_COMPILER_MODE" \
+      RESUME_PIPELINE_VERSION="$RESUME_PIPELINE_VERSION" \
+      V3_TRAINING_TRACE_ENABLED="$V3_TRAINING_TRACE_ENABLED" \
+      V3_TRAINING_TRACE_DIR="$V3_TRAINING_TRACE_DIR" \
+      V3_REALIZER_MIN_REMAINING_SECONDS="$V3_REALIZER_MIN_REMAINING_SECONDS" \
+      V3_SEMANTIC_CONCURRENCY="$V3_SEMANTIC_CONCURRENCY" \
+      V3_SEMANTIC_BATCH_FACTS="$V3_SEMANTIC_BATCH_FACTS" \
+      V3_SEMANTIC_BATCH_CHARS="$V3_SEMANTIC_BATCH_CHARS" \
+      PPSTRUCTURE_PYTHON="$PPSTRUCTURE_PYTHON" \
+      PPSTRUCTURE_MODEL_DIR="$PPSTRUCTURE_MODEL_DIR" \
+      PPSTRUCTURE_DEVICE="$PPSTRUCTURE_DEVICE" \
+      PPSTRUCTURE_WORKER_TIMEOUT_SECONDS="$PPSTRUCTURE_WORKER_TIMEOUT_SECONDS" \
+      PPSTRUCTURE_DOCKER_IMAGE="$PPSTRUCTURE_DOCKER_IMAGE" \
+      PPSTRUCTURE_DOCKER_ALLOWED_GPUS="$PPSTRUCTURE_DOCKER_ALLOWED_GPUS" \
+      PPSTRUCTURE_DOCKER_GPU_ID="$ppstructure_gpu_id" \
       PPOCRV6_MODEL_DIR="$OCR_PRIMARY_DIR" PPOCR_NUMERIC_CONSENSUS=1 \
       PPOCRV6_SECONDARY_REC_MODEL_PATH="$OCR_SECONDARY_REC" \
       PPOCRV6_NUMERIC_REC_MODEL_PATH="$OCR_NUMERIC_REC" \
       RAPID_OCR_MODEL=small RAPID_OCR_CPU_THREADS=2 RAPID_OCR_MAX_LONG_EDGE=3000 \
-      OCR_HARD_TIMEOUT_SECONDS=60 LAYOUT_ORDER_ENGINE=bbox \
+      OCR_HARD_TIMEOUT_SECONDS=60 LAYOUT_ORDER_ENGINE="$LAYOUT_ORDER_ENGINE" \
       OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 MALLOC_ARENA_MAX=2 \
-      "$PYTHON_BIN" "$REPO_ROOT/main.py" >"$log_path" 2>&1 </dev/null &
+      "$PYTHON_BIN" "$SOURCE_ROOT/main.py" >"$log_path" 2>&1 </dev/null &
     pid="$!"
     started_pids+=("$pid")
     printf '%s\n' "$pid" >"$(api_pid_file "$port")"
@@ -553,8 +797,8 @@ new_run_dir() {
 eval_identity() {
   local digest
   digest="$(code_digest)"
-  EVAL_VERSION="${LOCAL_EVAL_VERSION:-local-${digest:0:12}-${PIPELINE_PROFILE}}"
-  EVAL_IMAGE_DIGEST="${LOCAL_EVAL_IMAGE_DIGEST:-local27b-$digest}"
+  EVAL_VERSION="${LOCAL_EVAL_VERSION:-local-${digest:0:12}-${RESUME_PIPELINE_VERSION}-${PIPELINE_PROFILE}-${MODEL_PROVIDER}}"
+  EVAL_IMAGE_DIGEST="${LOCAL_EVAL_IMAGE_DIGEST:-${MODEL_PROVIDER}-$digest}"
 }
 
 validate_case_ids() {
@@ -577,7 +821,7 @@ command_eval_case() {
     "API index must be between 0 and $((INSTANCE_COUNT - 1))"
   # ``jq -e select(...)`` on a JSONL stream returns status 4 when the match is
   # not the final row, even though it emitted a valid earlier object. Slurp the
-  # frozen 60-row manifest and evaluate one explicit boolean instead.
+  # frozen manifest and evaluate one explicit boolean instead.
   jq -s -e --arg id "$case_id" 'any(.[]; .id == $id)' "$CASES_PATH" >/dev/null || die \
     "unknown holdout case: $case_id"
   require_current_cluster
@@ -602,7 +846,8 @@ command_eval_plan() {
   require_file "$CASES_PATH"
   require_command jq
   mapfile -t all_case_ids < <(jq -r '.id' "$CASES_PATH")
-  [[ "${#all_case_ids[@]}" -eq 60 ]] || die "expected 60 case IDs"
+  [[ "${#all_case_ids[@]}" -eq "$EXPECTED_CASE_COUNT" ]] || die \
+    "expected $EXPECTED_CASE_COUNT case IDs; found ${#all_case_ids[@]}"
   local index position port csv count
   for ((index = 0; index < INSTANCE_COUNT; index++)); do
     csv=""
@@ -690,9 +935,10 @@ command_eval_full() {
   flock -n 9 || die "another managed full evaluation holds $RUNTIME_DIR/eval.lock"
 
   local run_dir
-  run_dir="$(new_run_dir "${requested_run_id:-full60-$(date +%Y%m%d-%H%M%S)}")"
+  run_dir="$(new_run_dir "${requested_run_id:-full${EXPECTED_CASE_COUNT}-$(date +%Y%m%d-%H%M%S)}")"
   mapfile -t all_case_ids < <(jq -r '.id' "$CASES_PATH")
-  [[ "${#all_case_ids[@]}" -eq 60 ]] || die "expected 60 case IDs"
+  [[ "${#all_case_ids[@]}" -eq "$EXPECTED_CASE_COUNT" ]] || die \
+    "expected $EXPECTED_CASE_COUNT case IDs; found ${#all_case_ids[@]}"
 
   local index position port csv count shard log_path
   local -a shard_paths=() evaluator_pids=()

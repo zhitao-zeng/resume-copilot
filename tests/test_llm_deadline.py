@@ -167,6 +167,35 @@ def test_typed_json_repair_is_skipped_when_request_budget_is_low():
     assert len(completions.calls) == 1
 
 
+def test_typed_json_repair_can_be_disabled_for_schema_training_boundary():
+    completions = _FakeCompletions(["not-json", '{"ok": true}'])
+    gateway = _gateway(
+        completions,
+        enable_json_repair=True,
+        call_timeout_seconds=20,
+        request_time_remaining=lambda: 50,
+    )
+
+    assert gateway.call_typed(_Payload, "system", "user", allow_repair=False) == {}
+    assert len(completions.calls) == 1
+
+
+def test_schema_guided_json_retains_parseable_payload_for_item_validation():
+    completions = _FakeCompletions(['{"unexpected": 1}'])
+    gateway = _gateway(
+        completions,
+        enable_json_repair=True,
+        call_timeout_seconds=20,
+        request_time_remaining=lambda: 50,
+    )
+
+    assert gateway.call_schema_json(
+        _Payload, "system", "user", allow_repair=False,
+    ) == {"unexpected": 1}
+    assert len(completions.calls) == 1
+    assert '"ok"' in completions.calls[0]["messages"][0]["content"]
+
+
 def test_nested_deadline_never_extends_outer_budget():
     outer_at = time.monotonic() + 30
     outer_token = set_request_deadline(deadline_at=outer_at)

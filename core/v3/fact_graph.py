@@ -12,21 +12,28 @@ from collections import defaultdict
 from typing import Iterable
 
 from .contracts import Anchor, DocumentGraph, FactGraph, FactUnit, RecordNode, SectionNode, SourcePolicy, SourceSpan
+from .section_ontology import section_type
 
-
-_SECTION_ALIASES: dict[str, tuple[str, ...]] = {
-    "contact": ("个人信息", "基本信息", "联系方式", "contact", "personal information"),
-    "summary": ("个人总结", "个人简介", "职业概述", "summary", "objective"),
-    "education": ("教育经历", "教育背景", "教育", "education"),
-    "experience": ("工作经历", "工作经验", "实习经历", "职业经历", "experience", "employment"),
-    "projects": ("项目经历", "项目经验", "项目", "projects", "project experience"),
-    "research": ("科研经历", "研究经历", "research"),
-    "activities": ("校园经历", "社会实践", "志愿经历", "activities", "campus"),
-    "skills": ("专业技能", "技能", "技术能力", "skills", "technical skills"),
-    "credentials": ("证书", "资质", "认证", "certifications", "licenses"),
-}
-_DATE_RE = re.compile(r"(?:19|20)\d{2}\s*[./年-]\s*\d{1,2}|(?:19|20)\d{2}|至今|present", re.I)
-_CONTACT_RE = re.compile(r"(?:[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|1\d{10}|(?:电话|手机|邮箱|email|phone)\s*[:：])", re.I)
+_YEAR_MONTH_TOKEN = (
+    r"(?:(?:19|20)\d{2}(?:\s*[./年]\s*(?:0?[1-9]|1[0-2])(?:\s*月)?)?"
+    # A two-digit year is accepted only with ``/``.  Treating ``2.85`` as a
+    # month/year date incorrectly split GPA and decimal metrics into records.
+    r"|(?:0?[1-9]|1[0-2])\s*/\s*(?:\d{2}|(?:19|20)\d{2}))"
+)
+_PRESENT_TOKEN = r"(?:至今|现在|目前|present|current)"
+_DATE_RE = re.compile(rf"{_YEAR_MONTH_TOKEN}|{_PRESENT_TOKEN}", re.I)
+_DATE_RANGE_RE = re.compile(
+    rf"(?P<start>{_YEAR_MONTH_TOKEN})\s*(?:-|–|—|~|至|到)\s*"
+    rf"(?P<end>{_YEAR_MONTH_TOKEN}|{_PRESENT_TOKEN})",
+    re.I,
+)
+_DATE_PLACEHOLDER_RANGE_RE = re.compile(
+    rf"(?:年\s*月|\[\s*日期\s*\]|【\s*日期\s*】)\s*"
+    rf"(?:-|–|—|~|至|到)+\s*"
+    rf"(?:年\s*月|\[\s*日期\s*\]|【\s*日期\s*】|{_PRESENT_TOKEN})",
+    re.I,
+)
+_CONTACT_RE = re.compile(r"(?:[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|1\d{10})", re.I)
 _METRIC_RE = re.compile(
     r"(?:\d+(?:\.\d+)?\s*(?:%|％|万元|万|千|百|人次|个|件|天|月|年|秒|毫秒|ms)"
     r"|(?:同比|提升|降低|增长|减少)\s*\d+(?:\.\d+)?(?:%|％)?)",
@@ -36,20 +43,62 @@ _METRIC_RE = re.compile(
 # vocabulary.  This keeps the ontology applicable to doctors, teachers,
 # operators, researchers and other professions without an industry dictionary.
 _ACTION_RE = re.compile(r"^(?:负责|参与|主导|协助|支持|完成|推动|推进|组织|设计|开发|构建|实现|制定|管理|运营|分析|研究|撰写|输出|交付|维护|优化|搭建|建立|开展|承担|提供|跟进|协调|带领|执行)")
-_ORG_ROLE_SEP_RE = re.compile(r"(?:\||｜|·|,|，|\s{2,}|\s[-—–]\s)")
+# A comma is ordinary narrative punctuation and cannot establish a record
+# boundary.  Keep only separators that are structurally strong in compact
+# organization/role headers.
+_ORG_ROLE_SEP_RE = re.compile(
+    # A leading middle dot is a list bullet.  Only an internal middle dot
+    # between non-space tokens can mean a compact organization/role header.
+    r"(?:\||｜|(?<=\S)·(?=\S)|\s{2,}|\s[-—–]\s)"
+)
 _QUERY_SPLIT_RE = re.compile(r"(?<=[。！？!?；;])|\n|(?=请帮我|帮我|我的简历|我在|本人|曾在|目前)")
+_PLACEHOLDER_ONLY_RE = re.compile(
+    r"(?:\[[^\]\n]{1,80}\]|【[^】\n]{1,80}】)"
+    r"(?:\s*[,，|｜/]\s*(?:\[[^\]\n]{1,80}\]|【[^】\n]{1,80}】))*"
+)
+_LIST_PREFIX_RE = re.compile(r"^(?:[•·]\s*|-\s+|\*\s+)")
+_STRUCTURAL_PLACEHOLDER_RE = re.compile(
+    r"(?:\[[^\]\n]{1,80}(?:\]|$)|【[^】\n]{1,80}(?:】|$))"
+)
+_PURE_FIELD_LABEL_RE = re.compile(r"^[^\n:：]{1,48}\s*[:：]\s*$")
 
 
-def _norm(value: str) -> str:
-    return re.sub(r"[\s:：|｜/\\【】\[\]()（）*#\d.]+", "", value or "").casefold()
+def _is_pure_field_label(value: str) -> bool:
+    """Identify syntax-only labels without using a field-name vocabulary."""
+
+    text = str(value or "").strip()
+    return bool(
+        _PURE_FIELD_LABEL_RE.fullmatch(text)
+        and not _DATE_RE.search(text)
+        and not _CONTACT_RE.search(text)
+    )
 
 
-def section_type(title: str) -> str:
-    value = _norm(title)
-    for name, aliases in _SECTION_ALIASES.items():
-        if any(_norm(alias) == value or _norm(alias) in value for alias in aliases):
-            return name
-    return "other"
+def is_date_placeholder_range(value: str) -> bool:
+    """Return whether ``value`` is a date-shaped template placeholder.
+
+    These strings are useful layout boundaries but are not candidate facts.
+    Keeping that distinction in the graph prevents a semantic model from
+    publishing ``年月-年月`` as an employment period.
+    """
+
+    return bool(_DATE_PLACEHOLDER_RANGE_RE.fullmatch(str(value or "").strip()))
+
+
+def _has_compact_placeholder_header(value: str) -> bool:
+    """Return whether a compact record line combines text and a placeholder.
+
+    A role plus an anonymised organization (for example ``岗位，[公司]``) is
+    structural evidence even when OCR removed its dates.  Placeholder-only
+    location/contact rows stay false, and no occupation vocabulary is used.
+    """
+
+    matches = list(_STRUCTURAL_PLACEHOLDER_RE.finditer(value))
+    if not matches or len(value) > 120:
+        return False
+    outside = _STRUCTURAL_PLACEHOLDER_RE.sub("", value)
+    substantive = re.sub(r"[\s,，|｜/;；:：()（）\-—–]+", "", outside)
+    return len(substantive) >= 2
 
 
 def _pattern_anchors(
@@ -97,6 +146,14 @@ def _fact_type(text: str, section: str) -> str:
         return "education"
     if section == "credentials":
         return "credential"
+    if section == "awards":
+        return "award"
+    if section == "publications":
+        return "publication"
+    if section == "training":
+        return "training"
+    if section == "teaching":
+        return "teaching"
     if section == "skills":
         return "skill"
     if _DATE_RE.search(text):
@@ -109,17 +166,103 @@ def _fact_type(text: str, section: str) -> str:
 
 
 def _looks_like_record_header(text: str, section: str, previous: str = "") -> bool:
-    if section not in {"experience", "projects", "research", "education", "activities"}:
-        return False
-    if _ACTION_RE.search(text.strip()):
-        return False
-    if _DATE_RE.search(text):
+    record_section = section in {"experience", "projects", "research", "education", "activities"}
+    # Indentation is layout, not an organization/role separator.  Searching
+    # the raw line made every indented responsibility look like a new record
+    # because ``\s{2,}`` matched its leading spaces.
+    value = text.strip()
+    # A date *range* at either edge is a domain-neutral record boundary even
+    # when the source omitted its "工作经历" heading.  This is common in
+    # Query-only profiles and translated plain-text resumes.  Requiring an
+    # edge range avoids turning narrative mentions such as "在2021年至2022年
+    # 期间参与..." into a new job merely because they contain dates.
+    date_range = _DATE_RANGE_RE.search(value) or _DATE_PLACEHOLDER_RANGE_RE.search(value)
+    if date_range and (
+        date_range.start() <= 8 or len(value) - date_range.end() <= 4
+    ):
         return True
-    if _ORG_ROLE_SEP_RE.search(text) and len(text) <= 120:
+    if record_section and _has_compact_placeholder_header(value):
+        return True
+    # A company or project name may itself begin with a verb-like token (for
+    # example "运营IT支持").  Test the stronger date-range boundary first;
+    # only verb-led lines without such a boundary are treated as narrative.
+    if _ACTION_RE.search(value):
+        return False
+    if not record_section:
+        return False
+    # Education and other explicitly-labelled record sections also use a
+    # single year (for example "2000 甲大学") as a compact record header.
+    if _DATE_RE.search(value):
+        return True
+    if _ORG_ROLE_SEP_RE.search(value) and len(value) <= 120:
         return True
     if previous and previous.strip().endswith((":", "：")):
         return True
     return False
+
+
+def _record_prefix_candidates(recent_nodes: list[object], date_node: object) -> list[object]:
+    """Return compact header fragments immediately preceding a date range.
+
+    Many resumes order a record as ``role -> organization -> period``.  A
+    forward-only parser otherwise leaves the first role unowned and attaches
+    every later role to the previous job.  This look-behind is intentionally
+    structural: at most three adjacent short lines, never an action sentence,
+    heading, earlier date, or content across a preserved blank line.
+    """
+
+    selected: list[object] = []
+    right = date_node
+    # Two lines cover the dominant lossless layouts (role + organization, or
+    # degree + school).  Looking back farther can steal a preceding compact
+    # achievement when OCR has dropped its bullet marker.
+    for candidate in reversed(recent_nodes[-2:]):
+        if getattr(candidate, "kind", "") in {"heading", "header", "footer"}:
+            break
+        text = str(getattr(candidate, "text", "") or "").strip()
+        if not text or len(text) > 120 or _DATE_RE.search(text):
+            break
+        has_bullet = bool(_LIST_PREFIX_RE.match(text))
+        explicit_header_bullet = bool(
+            re.match(r"^(?:[•·]\s*|-\s+|\*\s+)(?:\*\*|__|`).+(?:\*\*|__|`)$", text)
+            or _PLACEHOLDER_ONLY_RE.fullmatch(
+                _LIST_PREFIX_RE.sub("", text).strip()
+            )
+            # A short bullet immediately followed by a placeholder row is a
+            # compact role/degree header, not a responsibility belonging to
+            # the previous record.  The placeholder supplies the structural
+            # evidence; no occupation word list is involved.
+            or (
+                bool(selected)
+                and _PLACEHOLDER_ONLY_RE.fullmatch(
+                    _LIST_PREFIX_RE.sub(
+                        "", str(getattr(right, "text", "") or "").strip()
+                    ).strip()
+                )
+                is not None
+                and len(_LIST_PREFIX_RE.sub("", text).strip()) <= 40
+            )
+        )
+        if has_bullet and not explicit_header_bullet:
+            break
+        cleaned = _LIST_PREFIX_RE.sub("", text).strip()
+        cleaned = re.sub(r"^(?:\*\*|__|`)+|(?:\*\*|__|`)+$", "", cleaned).strip()
+        if not cleaned or _ACTION_RE.search(cleaned):
+            break
+        if cleaned.endswith(("。", "！", "？", "!", "?", "；", ";")):
+            break
+        left_spans = getattr(candidate, "source_spans", []) or []
+        right_spans = getattr(right, "source_spans", []) or []
+        if left_spans and right_spans:
+            left_span, right_span = left_spans[-1], right_spans[0]
+            if (
+                left_span.source_id == right_span.source_id
+                and right_span.char_start - left_span.char_end > 1
+            ):
+                break
+        selected.append(candidate)
+        right = candidate
+    return list(reversed(selected))
 
 
 def _explicit_layout_key(node: object) -> tuple[str, str] | None:
@@ -149,6 +292,7 @@ def _region_key(node: object) -> tuple[str, str, str, str] | None:
 def build_document_structure(graph: DocumentGraph) -> tuple[list[SectionNode], list[RecordNode], dict[str, str]]:
     """Create section/record boundaries without semantic guessing."""
 
+    authoritative_layout_order = bool(graph.metadata.get("hybrid_layout"))
     sections: list[SectionNode] = []
     records: list[RecordNode] = []
     node_to_section: dict[str, str] = {}
@@ -157,16 +301,37 @@ def build_document_structure(graph: DocumentGraph) -> tuple[list[SectionNode], l
     current_record: RecordNode | None = None
     explicit_records: dict[tuple[str, str, str], RecordNode] = {}
     region_records: dict[tuple[str, tuple[str, str, str, str]], RecordNode] = {}
+    recent_nodes: list[object] = []
+    next_record_number = 0
     for node in graph.ordered_nodes():
+        if node.kind in {"header", "footer"}:
+            # Story parts are structurally independent of the last body
+            # section.  Inheriting (for example) a footer into "skills" would
+            # lock the semantic compiler to a false section.
+            section_id = f"{graph.source_id}:section:{len(sections)}"
+            current_section = SectionNode(
+                section_id=section_id,
+                source_id=graph.source_id,
+                title="",
+                section_type="other",
+                node_ids=[node.node_id],
+                order=len(sections),
+            )
+            sections.append(current_section)
+            node_to_section[node.node_id] = current_section.section_id
+            current_record = None
+            recent_nodes = []
+            continue
         if node.kind == "heading":
             candidate = section_type(node.text)
             # Generic or unknown headings are still represented as sections;
             # their content is never silently thrown away.
-            if current_section is None or candidate != "other" or _norm(node.text) != _norm(current_section.title):
+            if current_section is None or candidate != "other" or node.text.strip().casefold() != current_section.title.strip().casefold():
                 section_id = f"{graph.source_id}:section:{len(sections)}"
                 current_section = SectionNode(section_id=section_id, source_id=graph.source_id, title=node.text.strip(), section_type=candidate, node_ids=[node.node_id], order=len(sections))
                 sections.append(current_section)
                 current_record = None
+                recent_nodes = []
             else:
                 current_section.node_ids.append(node.node_id)
             node_to_section[node.node_id] = current_section.section_id
@@ -180,6 +345,26 @@ def build_document_structure(graph: DocumentGraph) -> tuple[list[SectionNode], l
         explicit_key = _explicit_layout_key(node)
         region_key = _region_key(node)
         is_header = _looks_like_record_header(node.text, current_section.section_type, current_record.title if current_record else "")
+        strong_date_header = bool(
+            (match := (
+                _DATE_RANGE_RE.search(node.text.strip())
+                or _DATE_PLACEHOLDER_RANGE_RE.search(node.text.strip())
+            ))
+            and (match.start() <= 8 or len(node.text.strip()) - match.end() <= 4)
+        )
+        date_tokens = list(_DATE_RE.finditer(node.text.strip()))
+        prefix_date_header = bool(
+            strong_date_header
+            or (
+                current_section.section_type in {
+                    "experience", "projects", "research", "education", "activities",
+                }
+                and (
+                    len(date_tokens) >= 2
+                    or (current_section.section_type == "education" and date_tokens)
+                )
+            )
+        )
         record: RecordNode | None = None
         if explicit_key is not None:
             record = explicit_records.get((current_section.section_id, *explicit_key))
@@ -187,12 +372,28 @@ def build_document_structure(graph: DocumentGraph) -> tuple[list[SectionNode], l
             record = region_records.get((current_section.section_id, region_key))
         if record is None and (is_header or explicit_key is not None):
             record_counter[current_section.section_id] += 1
+            next_record_number += 1
+            prefix_nodes = (
+                _record_prefix_candidates(recent_nodes, node)
+                if prefix_date_header and explicit_key is None
+                else []
+            )
+            prefix_ids = [item.node_id for item in prefix_nodes]
+            if prefix_ids:
+                for prior_record in records:
+                    prior_record.node_ids = [
+                        node_id for node_id in prior_record.node_ids
+                        if node_id not in prefix_ids
+                    ]
             record = RecordNode(
-                record_id=f"{graph.source_id}:record:{record_counter[current_section.section_id]}",
+                # Record IDs are document-global.  A per-section counter alone
+                # produces duplicate IDs as soon as both work and education
+                # sections contain a record.
+                record_id=f"{graph.source_id}:record:{next_record_number}",
                 source_id=graph.source_id,
                 section_id=current_section.section_id,
                 title=node.text.strip(),
-                node_ids=[node.node_id],
+                node_ids=[*prefix_ids, node.node_id],
                 period="".join(_DATE_RE.findall(node.text))[:80],
             )
             records.append(record)
@@ -204,7 +405,17 @@ def build_document_structure(graph: DocumentGraph) -> tuple[list[SectionNode], l
             # Adjacency is the weakest boundary.  It is safe only when the
             # node has no conflicting region/column; a new region abstains.
             current_layout = next((key for key, item in region_records.items() if item.record_id == current_record.record_id), None)
-            if region_key is None or (current_layout is not None and current_layout[1] == region_key):
+            if (
+                region_key is None
+                or (current_layout is not None and current_layout[1] == region_key)
+                # In the hybrid route PP-Structure supplies only a validated
+                # region order while PP-OCRv6 supplies every line.  Adjacent
+                # non-header regions may be continuation blocks of the same
+                # record (notably when a two-column job header and its bullets
+                # occupy separate regions).  A later date/placeholder header
+                # still opens a new record and moves its bounded look-behind.
+                or authoritative_layout_order
+            ):
                 record = current_record
         if record is not None:
             if node.node_id not in record.node_ids:
@@ -217,6 +428,11 @@ def build_document_structure(graph: DocumentGraph) -> tuple[list[SectionNode], l
         # A standalone line in an experience section does not establish a
         # cross-record relation; it remains section-scoped until an explicit
         # new record header appears.
+        recent_nodes.append(node)
+    # A compact header can initially form a record through a separator and be
+    # moved to the following date-anchored record.  Do not expose the emptied
+    # intermediate node as an allowed ownership target.
+    records = [record for record in records if record.node_ids]
     return sections, records, node_to_section
 
 
@@ -249,7 +465,15 @@ def facts_from_graph(graph: DocumentGraph, policy: SourcePolicy | None = None) -
         eligible = policy.source_can_support_facts(graph.source_type)
         if graph.source_type == "query" and policy.query_clause_kind(text) == "intent":
             classification, eligible = "intent", False
-        ftype = _fact_type(text, section_type(next((section.title for section in sections if section.section_id == node_to_section.get(node.node_id)), "")))
+        if is_date_placeholder_range(text):
+            classification, eligible = "ineligible", False
+        source_section = next(
+            (section.section_type for section in sections if section.section_id == node_to_section.get(node.node_id)),
+            "other",
+        )
+        if _is_pure_field_label(text):
+            classification, eligible = "ineligible", False
+        ftype = _fact_type(text, source_section)
         record_id = record_by_node.get(node.node_id)
         anchors = _pattern_anchors(
             source_id=graph.source_id,
@@ -329,7 +553,7 @@ def build_fact_graph(graphs: Iterable[DocumentGraph], policy: SourcePolicy | Non
                 record.fact_ids.clear()
             query_fact_index = 0
             for node in graph.ordered_nodes():
-                if not node.text.strip() or not node.source_spans:
+                if not node.text.strip() or node.kind == "heading" or not node.source_spans:
                     continue
                 parent = node.source_spans[0]
                 base_fact = base_fact_by_node.get(parent.node_id)
@@ -337,6 +561,8 @@ def build_fact_graph(graphs: Iterable[DocumentGraph], policy: SourcePolicy | Non
                     start = parent.char_start + relative_start
                     end = parent.char_start + relative_end
                     is_fact = policy.query_clause_kind(clause) == "fact"
+                    if _is_pure_field_label(clause):
+                        is_fact = False
                     clause_span = SourceSpan(
                         source_id=graph.source_id,
                         char_start=start,
@@ -346,11 +572,19 @@ def build_fact_graph(graphs: Iterable[DocumentGraph], policy: SourcePolicy | Non
                     )
                     fact_id = f"{graph.source_id}:query-fact:{query_fact_index}"
                     query_fact_index += 1
+                    base_section = next(
+                        (
+                            section.section_type
+                            for section in sections
+                            if base_fact is not None and section.section_id == base_fact.section_id
+                        ),
+                        "other",
+                    )
                     query_fact = FactUnit(
                         fact_id=fact_id,
                         source_id=graph.source_id,
                         source_type="query",
-                        fact_type=_fact_type(clause, "other"),  # type: ignore[arg-type]
+                        fact_type=_fact_type(clause, base_section),  # type: ignore[arg-type]
                         text=clause,
                         spans=[clause_span],
                         section_id=base_fact.section_id if base_fact else None,
@@ -364,7 +598,11 @@ def build_fact_graph(graphs: Iterable[DocumentGraph], policy: SourcePolicy | Non
                         ),
                         eligible=is_fact,
                         confidence=base_fact.confidence if base_fact else node.confidence,
-                        classification="fact" if is_fact else "intent",
+                        classification=(
+                            "fact" if is_fact
+                            else "ineligible" if _is_pure_field_label(clause)
+                            else "intent"
+                        ),
                     )
                     all_facts.append(query_fact)
                     if query_fact.record_id and query_fact.eligible:

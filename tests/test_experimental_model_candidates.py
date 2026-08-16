@@ -4,9 +4,12 @@ import hashlib
 import json
 
 from experimental_model_candidates import (
+    OCR_LAYOUT_REGION_SEPARATOR,
     cached_layout_regions,
     cached_query_spans,
+    region_aware_ocr_order,
 )
+from resume_io import _reconstruct_ocr_reading_order
 from source_adapter import build_source_bundle, candidate_blocks
 
 
@@ -87,3 +90,42 @@ def test_candidate_hooks_are_disabled_by_default(monkeypatch, tmp_path) -> None:
 
     assert cached_query_spans("anything") == []
     assert cached_layout_regions(b"anything", width=1, height=1) == []
+
+
+def test_structure_order_reorders_regions_without_replacing_ocr_text() -> None:
+    boxes = [
+        [[20, 20], [180, 20], [180, 50], [20, 50]],
+        [[20, 80], [180, 80], [180, 110], [20, 110]],
+        [[620, 20], [780, 20], [780, 50], [620, 50]],
+        [[620, 80], [780, 80], [780, 110], [620, 110]],
+    ]
+    texts = ["左一", "左二", "右一", "右二"]
+    regions = [
+        {"bbox": [0, 0, 400, 900], "confidence": 0.9, "order": 2},
+        {"bbox": [600, 0, 1000, 900], "confidence": 0.9, "order": 1},
+    ]
+
+    ordered = region_aware_ocr_order(
+        boxes,
+        texts,
+        width=1000,
+        height=1000,
+        regions=regions,
+        baseline_order=_reconstruct_ocr_reading_order,
+    )
+
+    assert ordered == ["右一", "右二", "左一", "左二"]
+    assert sorted(ordered) == sorted(texts)
+
+    grouped = region_aware_ocr_order(
+        boxes,
+        texts,
+        width=1000,
+        height=1000,
+        regions=regions,
+        baseline_order=_reconstruct_ocr_reading_order,
+        group_separator=OCR_LAYOUT_REGION_SEPARATOR,
+    )
+    assert grouped == [
+        "右一", "右二", OCR_LAYOUT_REGION_SEPARATOR, "左一", "左二",
+    ]

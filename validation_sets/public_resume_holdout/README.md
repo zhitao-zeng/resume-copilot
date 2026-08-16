@@ -87,5 +87,9 @@ To run a small subset against a local API:
 
 `annotations.jsonl` stores canonical source text hashes and exact source spans.
 The automatic line-level annotations are suitable for deterministic integrity
-checks. Atomic semantic labels and subjective expression/STAR judgments still
-require blinded human review and are explicitly marked as such.
+checks. The evaluator also emits a separate `generation_quality` vector for
+expression proxies: bullet length/fragmentation, generic action-method-result
+(STAR) signals, JD support states, and reply detail. It is deliberately not
+collapsed into the factuality metrics or a synthetic 100-point score. Atomic
+semantic labels and subjective expression/STAR judgments still require blinded
+human review and are explicitly marked as such.

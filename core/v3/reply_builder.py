@@ -39,7 +39,7 @@ def build_reply(audit: Audit, fact_graph: FactGraph, requirements: RequirementGr
     else:
         lines.append("待确认的潜在冲突：未发现结构化冲突。")
     if requirements and requirements.requirements:
-        lines.append("岗位方向建议：")
+        lines.append("岗位建议：")
         considered = requirements.requirements[:8]
         covered = [item.text for item in considered if _requirement_supported(item.text, written)]
         unsupported = [item.text for item in considered if item.text not in covered]
@@ -49,7 +49,7 @@ def build_reply(audit: Audit, fact_graph: FactGraph, requirements: RequirementGr
         if unsupported:
             lines.append("- 尚未在个人材料中找到直接依据的要求：" + "；".join(unsupported))
     else:
-        lines.append("岗位方向建议：提供目标JD后可基于现有事实进行岗位匹配排序。")
+        lines.append("岗位建议：提供目标JD后可基于现有事实进行岗位匹配排序。")
     if audit.recommendations:
         lines.append("下一步建议：")
         lines.extend(f"- {item}" for item in audit.recommendations)

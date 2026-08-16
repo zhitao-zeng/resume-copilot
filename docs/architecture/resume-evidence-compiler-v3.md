@@ -1,8 +1,9 @@
 # Resume Evidence Compiler V3
 
-V3 is an isolated, shadow-only pipeline for compiling heterogeneous career
-inputs into an evidence-bound resume.  The current V2 request path is not
-imported or changed by this prototype.
+V3 compiles heterogeneous career inputs into an evidence-bound resume.  It is
+wired into the service behind `RESUME_PIPELINE_VERSION=v3`; the default remains
+`v2` until held-out and platform gates pass, so the production baseline is not
+silently replaced.
 
 ## Why PP-Structure is conditional rather than universal
 
@@ -60,13 +61,36 @@ layout metadata is consumed.  It is not useful as a universal input parser.
 5. **ResumePlan** groups facts by immutable source record and maintains a
    coverage ledger.  It has no one-page constraint.  With no candidate facts,
    it emits a structured framework with `[待补充：...]` placeholders.
-6. **Realizer** receives fixed fact IDs.  The prototype uses a deterministic
-   connector fallback; an LLM implementation must pass the same protocol.
-7. **Atomic verifier/repair** checks source text, critical entity anchors,
+6. **Semantic compiler** uses the frozen `resume_compiler_v3.4` schema to split
+   exact source quotes into generic fact atoms and auditable context spans.
+   Labels, separators, placeholders, intent and instructions must cover their
+   exact source characters without hiding hard anchors.  Semantic errors are
+   retained as model-training evidence; they are not patched with occupation
+   keyword rules. Independent batches may execute with bounded concurrency,
+   but results are reassembled in source order and inherit the same request
+   deadline. Query and placeholder-bearing batches fail closed when no valid
+   semantic decision exists; ordinary CV facts retain exact-source fallback.
+   Batch shape is explicit as `V3_SEMANTIC_BATCH_FACTS` (default `28`) and
+   `V3_SEMANTIC_BATCH_CHARS` (default `9000`). Cross-model A/B
+   runs record both values because batch shape can change JSON-schema
+   adherence even when the semantic policy and prompt are frozen.
+   Every material schema/compiler candidate is evaluated in two paired views:
+   Qwen27B versus DeepSeek Local Flash on the identical frozen inputs and
+   batch shape, plus a provider-optimized DeepSeek ceiling probe when its best
+   batch differs. DeepSeek is a recurring second-model and schema-stress view,
+   not an automatic replacement or a guaranteed teacher. Promotion is based
+   on audited facts, ownership, response contract and latency rather than model
+   identity.
+7. **Realizer** receives fixed fact IDs through the same versioned contract.
+   Every source atom must remain verbatim, while the model may order and join
+   already-present STAR dimensions.  Invalid output falls back to source text.
+   A remaining-time admission gate skips this optional call when it cannot
+   finish safely inside the end-to-end deadline.
+8. **Atomic verifier/repair** checks source text, critical entity anchors,
    record ownership and eligibility.  Repair retains supported atoms or falls
    back to a source sentence from the same record; it never imports JD/template
    content or silently crosses records.
-8. **Reply builder** is derived from the frozen audit, so written facts cannot
+9. **Reply builder** is derived from the frozen audit, so written facts cannot
    simultaneously be reported as missing.
 
 Record ownership uses the following strict precedence: explicit
@@ -76,33 +100,52 @@ abstention (`record_id=None`); it never inherits the previous experience.
 Classification is section/structure based and does not contain a technology or
 industry dictionary.
 
-## Contracts and shadow API
+## Fixed model contracts
 
-The contracts live under `core/v3/contracts.py`.  The experiment entry point is
-`core.v3.orchestrator.run_v3(...)`; it accepts `cv_text`, `query_text`,
-`jd_text`, and an optional `TemplateAST`.  This is deliberately not wired into
-V2 or the HTTP production path.  `core/v3/render` receives a frozen content
-model and can render sections without becoming a content authority.
+The model-facing schemas live in `core/v3/training_schema.py`:
+
+* `SemanticCompilationResponse`: exact quote, fact type, destination section,
+  destination field, classification and constrained record assignment.
+* `ConstrainedRealizerResponse`: flat claims containing only text, fixed fact
+  IDs and their section/field/record/group destinations.  Internal anchors and
+  verification state are filled by trusted code, not by the model.
+
+The version is `resume_compiler_v3.4`; its canonical JSON Schema SHA256 is
+`e5292be47ea8d84f43c1f0fc58e0835756a89c648f2552ef29f67906c48fb36f`.
+`tools/export_v3_training_schema.py` exports the bundle and refuses to run if
+the code drifts without a version/fingerprint update.  Training traces are off
+by default and require both `V3_TRAINING_TRACE_ENABLED=1` and
+`V3_TRAINING_TRACE_DIR`, avoiding accidental production PII retention.
+
+## Contracts and service API
+
+Internal contracts live under `core/v3/contracts.py`.  The foundation entry
+point remains `core.v3.orchestrator.run_v3(...)`; the binary/service entry point
+is `core.v3.pipeline.run_v3_pipeline(...)`.  The latter accepts original CV
+bytes plus filename, Query, JD and template mode, invokes the schema-driven
+compiler, then adapts frozen claims into the established editable renderer.
 
 The initial tests cover exact source spans, JD/template contamination,
 cross-record ownership, critical anchors, PP-Structure metadata preservation,
 the four input scenarios, and the no-personal-information framework path.
 
-## Current implementation boundary (foundation)
+## Current implementation boundary
 
-This branch implements and validates the compiler contracts and deterministic
-shadow path.  It is intentionally not a production cut-over yet:
+This branch implements the opt-in end-to-end path but is intentionally not a
+default production cut-over yet:
 
-* `from_ppstructure_blocks` consumes the complete raster parser block payload,
-  but the live PaddleX worker still needs a V3 adapter that returns those
-  blocks instead of the V2 flattened text result.
-* `from_native_text` proves exact-span behavior; concrete DOCX paragraph/table
-  AST and native-PDF character/bbox adapters are the next integration layer.
-* The realizer currently uses a deterministic connector.  A live 27B response
-  must be treated as untrusted and pass `validate_realizer_response` with
-  planner-owned `allowed_fact_ids` before it can be frozen.
-* The renderer is a content-authority boundary, not yet the tagged/anchored
-  DOCX fidelity implementation.
+* The live PaddleX worker can return complete JSON block payloads.  DOCX body,
+  table and style hierarchy plus native-PDF line/bbox pages are concrete
+  adapters; scan/image pages use PP-Structure and retain its metadata.
+* The 27B semantic compiler and realizer are untrusted schema clients.  Exact
+  spans, source eligibility, ownership, hard anchors and full fact-ID coverage
+  are validated before freezing; failures use source-preserving fallbacks.
+  Deterministic fallback groups only atoms from the same transport fact rather
+  than concatenating an entire record into one oversized bullet.
+* Frozen claims are adapted to the existing tagged/anchored/style-only DOCX
+  implementation, retaining headers, footers, geometry and editable content.
+* Model language quality still requires held-out evaluation and later
+  fine-tuning.  This stage does not claim a Darvin score improvement.
 
 These boundaries keep the existing V2 service unchanged while the V3
 invariants are evaluated on held-out documents.  They must not be presented as

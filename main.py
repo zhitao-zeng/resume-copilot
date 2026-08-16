@@ -39,6 +39,7 @@ from schemas import (
 )
 from server_runtime import (
     API_BASE_URL,
+    API_KEY,
     DEFAULT_TEMPLATE,
     MODEL_NAME,
     REQUEST_TIMEOUT_SECONDS,
@@ -98,8 +99,9 @@ async def _backend_ready() -> bool:
         return False
     try:
         url = f"{API_BASE_URL.rstrip('/')}/models"
+        headers = {"Authorization": f"Bearer {API_KEY}"} if API_KEY else None
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=2)) as session:
-            async with session.get(url) as response:
+            async with session.get(url, headers=headers) as response:
                 return response.status == 200
     except Exception:
         return False

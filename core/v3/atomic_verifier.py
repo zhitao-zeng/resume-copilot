@@ -18,6 +18,11 @@ def audit_frozen_resume(
     ownership_errors: list[str] = []
     reasons: dict[str, str] = {}
     for claim in frozen.claims:
+        summary_citation = (
+            claim.section == "summary"
+            and claim.field == "summary"
+            and claim.group_id == "summary:profile"
+        )
         claim_bad = any(item.startswith(f"{claim.claim_id}:") for item in violations)
         if claim_bad:
             unsupported.append(claim.claim_id)
@@ -30,7 +35,7 @@ def audit_frozen_resume(
                 continue
             if fact_id not in written and not claim_bad:
                 written.append(fact_id)
-            if fact.record_id != claim.record_id:
+            if not summary_citation and fact.record_id != claim.record_id:
                 ownership_errors.append(f"{claim.claim_id}:{fact_id}")
                 reasons[fact_id] = "claim crosses source record boundary"
     eligible = {fact.fact_id for fact in fact_graph.eligible_facts()}

@@ -123,7 +123,14 @@ export REQUEST_TIMEOUT_SECONDS="${REQUEST_TIMEOUT_SECONDS:-480}"
 export LLM_TIMEOUT_SECONDS="${LLM_TIMEOUT_SECONDS:-300}"
 export DEFAULT_OUTPUT_FORMAT="${DEFAULT_OUTPUT_FORMAT:-docx}"
 export OUTPUT_DIR="${OUTPUT_DIR:-/root/app/output}"
+# `v3` enables the evidence compiler end to end. Keep `v2` as the deployment
+# default until held-out/Darvin gates select V3 explicitly.
 export RESUME_PIPELINE_VERSION="${RESUME_PIPELINE_VERSION:-v2}"
+export V3_TRAINING_TRACE_ENABLED="${V3_TRAINING_TRACE_ENABLED:-0}"
+export V3_SEMANTIC_CONCURRENCY="${V3_SEMANTIC_CONCURRENCY:-2}"
+export V3_SEMANTIC_BATCH_FACTS="${V3_SEMANTIC_BATCH_FACTS:-28}"
+export V3_SEMANTIC_BATCH_CHARS="${V3_SEMANTIC_BATCH_CHARS:-9000}"
+export V3_REALIZER_MIN_REMAINING_SECONDS="${V3_REALIZER_MIN_REMAINING_SECONDS:-240}"
 # Production defaults to the locally validated reference content path. New
 # recovery/composer modules are opt-in profiles until their grouped ownership
 # and platform gates pass; current OCR, deadlines and rendering stay shared.
@@ -135,5 +142,5 @@ export RESUME_DIAGNOSTIC_TRACE="${RESUME_DIAGNOSTIC_TRACE:-1}"
 mkdir -p "$OUTPUT_DIR"
 cd /root/app
 
-log "vLLM 就绪, 启动 resume-copilot (port=$PORT, diagnostic_trace=$RESUME_DIAGNOSTIC_TRACE)"
+log "vLLM 就绪, 启动 resume-copilot (port=$PORT, pipeline=$RESUME_PIPELINE_VERSION, diagnostic_trace=$RESUME_DIAGNOSTIC_TRACE)"
 exec python3 main.py

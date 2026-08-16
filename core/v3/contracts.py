@@ -16,7 +16,18 @@ ExtractionEngine = Literal["native_docx", "native_pdf", "text", "ocr", "ppstruct
 FactType = Literal[
     "identity", "contact", "organization", "role", "period", "action",
     "method", "deliverable", "result", "skill", "education", "credential",
-    "metric", "project", "other",
+    "degree", "major", "metric", "project", "award", "publication",
+    "training", "teaching", "other",
+]
+ResumeSection = Literal[
+    "contact", "summary", "experience", "projects", "research", "activities",
+    "education", "skills", "credentials", "awards", "publications", "training",
+    "teaching", "additional", "other",
+]
+ResumeField = Literal[
+    "name", "phone", "email", "location", "target_role", "summary",
+    "organization", "role", "period", "title", "bullet", "school", "degree",
+    "major", "skill", "credential", "item", "other",
 ]
 LayoutKind = Literal[
     "document", "page", "column", "region", "heading", "paragraph", "line",
@@ -191,6 +202,13 @@ class FactUnit(V3Model):
     eligible: bool = True
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
     classification: Literal["fact", "intent", "instruction", "ineligible"] = "fact"
+    # The semantic compiler can split one transport-level fact into exact
+    # source-backed atoms.  ``base_fact_id`` keeps that relation explicit for
+    # training and audit; it is never inferred from the generated prose.
+    base_fact_id: str | None = None
+    destination_section: ResumeSection | None = None
+    destination_field: ResumeField | None = None
+    schema_version: str = ""
 
     @model_validator(mode="after")
     def source_and_span_match(self) -> "FactUnit":
@@ -348,12 +366,14 @@ class ResumePlan(V3Model):
 class RealizedClaim(V3Model):
     claim_id: str = Field(min_length=1)
     section: str
+    field: ResumeField = "bullet"
     text: str = Field(min_length=1)
     fact_ids: list[str] = Field(default_factory=list)
     record_id: str | None = None
     anchors: list[Anchor] = Field(default_factory=list)
     atomic: bool = True
     generated: bool = False
+    group_id: str | None = None
 
 
 class RealizerResponse(V3Model):
@@ -364,6 +384,7 @@ class RealizerResponse(V3Model):
     :func:`v3.realizer.validate_realizer_response`.
     """
 
+    schema_version: Literal["resume_compiler_v3.4"] = "resume_compiler_v3.4"
     request_fact_ids: list[str] = Field(default_factory=list)
     claims: list[RealizedClaim] = Field(default_factory=list)
 
@@ -425,6 +446,6 @@ class V3Output(V3Model):
 __all__ = [
     "Anchor", "Audit", "CoverageLedger", "DocumentGraph", "FactGraph", "FactUnit",
     "FrozenResume", "JobRequirement", "LayoutNode", "NarrativeGroup", "RealizedClaim", "RealizerResponse",
-    "RecordNode", "RequirementGraph", "ResumePlan", "SectionNode", "SourceAsset",
-    "SourcePolicy", "SourceSpan", "TemplateAST", "V3Output",
+    "RecordNode", "RequirementGraph", "ResumeField", "ResumePlan", "ResumeSection",
+    "SectionNode", "SourceAsset", "SourcePolicy", "SourceSpan", "TemplateAST", "V3Output",
 ]

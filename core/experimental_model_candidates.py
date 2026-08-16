@@ -17,6 +17,12 @@ import re
 from typing import Any, Callable
 
 
+# Internal transport marker used only between OCR extraction and the V3 graph
+# adapter.  It is removed before prompts, replies, artifacts or rendered output
+# are built.
+OCR_LAYOUT_REGION_SEPARATOR = "\ue000V3_LAYOUT_REGION\ue001"
+
+
 _DIRECTION = re.compile(
     r"(?:请|帮我|麻烦|希望|想要|生成|优化|润色|修改|调整|删除|去掉|"
     r"应聘|求职|岗位|简历|\b(?:resume|cv|job|apply|application)\b)",
@@ -118,7 +124,12 @@ def cached_layout_regions(
         x1, y1, x2, y2 = values
         if not (0 <= x1 < x2 <= width and 0 <= y1 < y2 <= height):
             continue
-        regions.append({"bbox": values, "confidence": confidence})
+        region = {"bbox": values, "confidence": confidence}
+        try:
+            region["order"] = int(candidate["order"])
+        except (KeyError, TypeError, ValueError):
+            pass
+        regions.append(region)
     return regions
 
 
@@ -130,6 +141,7 @@ def region_aware_ocr_order(
     height: int,
     regions: list[dict[str, Any]],
     baseline_order: Callable[..., list[str]],
+    group_separator: str = "",
 ) -> list[str] | None:
     """Apply the frozen A3 region policy while conserving every OCR line."""
 
@@ -209,13 +221,21 @@ def region_aware_ocr_order(
             unassigned.append(local_index)
 
     groups = [
-        {"bbox": regions[index]["bbox"], "members": members}
+        {
+            "bbox": regions[index]["bbox"],
+            "members": members,
+            "structure_order": regions[index].get("order"),
+        }
         for index, members in assignments.items()
         if members
     ]
     if sum(len(group["members"]) >= 2 for group in groups) < 2:
         return None
-    groups.extend({"bbox": blocks[index]["bbox"], "members": [index]} for index in unassigned)
+    groups.extend({
+        "bbox": blocks[index]["bbox"],
+        "members": [index],
+        "structure_order": None,
+    } for index in unassigned)
 
     def polygon(bbox: list[float]) -> list[list[float]]:
         x1, y1, x2, y2 = bbox
@@ -231,20 +251,58 @@ def region_aware_ocr_order(
         )
         return [int(value.removeprefix("IDX")) for value in ordered]
 
+    group_order = baseline_indexes(groups)
+    # Preserve the deterministic BBOX positions of unassigned OCR lines while
+    # replacing only the relative order of confidently mapped structure
+    # regions.  This makes PP-Structure a layout oracle, never a text source,
+    # and conserves every PP-OCRv6 line even when region coverage is partial.
+    structured_positions = [
+        position for position, group_index in enumerate(group_order)
+        if groups[group_index].get("structure_order") is not None
+    ]
+    structured_groups = sorted(
+        (group_index for group_index in group_order
+         if groups[group_index].get("structure_order") is not None),
+        key=lambda group_index: (
+            int(groups[group_index]["structure_order"]),
+            group_index,
+        ),
+    )
+    for position, group_index in zip(structured_positions, structured_groups):
+        group_order[position] = group_index
+
     output: list[int] = []
-    for group_index in baseline_indexes(groups):
+    ordered_group_members: list[tuple[bool, list[int]]] = []
+    for group_index in group_order:
         members = groups[group_index]["members"]
         if len(members) == 1:
             output.extend(members)
+            ordered_group_members.append((
+                groups[group_index].get("structure_order") is not None,
+                list(members),
+            ))
             continue
         local = baseline_indexes([blocks[index] for index in members])
-        output.extend(members[index] for index in local)
+        ordered_members = [members[index] for index in local]
+        output.extend(ordered_members)
+        ordered_group_members.append((
+            groups[group_index].get("structure_order") is not None,
+            ordered_members,
+        ))
     if Counter(output) != Counter(range(len(blocks))):
         return None
-    return [blocks[index]["text"] for index in output]
+    if not group_separator:
+        return [blocks[index]["text"] for index in output]
+    ordered_text: list[str] = []
+    for structured, members in ordered_group_members:
+        if structured and ordered_text:
+            ordered_text.append(group_separator)
+        ordered_text.extend(blocks[index]["text"] for index in members)
+    return ordered_text
 
 
 __all__ = [
+    "OCR_LAYOUT_REGION_SEPARATOR",
     "cached_layout_regions",
     "cached_query_spans",
     "region_aware_ocr_order",

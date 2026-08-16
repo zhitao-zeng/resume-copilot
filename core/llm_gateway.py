@@ -480,6 +480,20 @@ class LLMGateway:
                 raise RuntimeError("LLM recoverable retries exhausted")
             finish_reason = getattr(response.choices[0], "finish_reason", None)
             if str(finish_reason or "").lower() in {"length", "max_tokens"}:
+                _trunc_usage = getattr(response, "usage", None)
+                _trunc_prompt = getattr(_trunc_usage, "prompt_tokens", None) if _trunc_usage else None
+                _trunc_completion = getattr(_trunc_usage, "completion_tokens", None) if _trunc_usage else None
+                _trunc_elapsed = time.perf_counter() - started
+                self._logger.warning(
+                    "LLM completion TRUNCATED | tag=%s | model=%s | elapsed=%.2fs | max_tokens=%d | finish_reason=%s | prompt_tokens=%s | completion_tokens=%s",
+                    trace_tag,
+                    self._model_name,
+                    _trunc_elapsed,
+                    effective_max_tokens,
+                    finish_reason,
+                    _trunc_prompt,
+                    _trunc_completion,
+                )
                 raise ContextBudgetError(
                     f"LLM structured completion was truncated at {effective_max_tokens} tokens"
                 )
@@ -496,8 +510,12 @@ class LLMGateway:
         # messages[-1] is the prefill "{" when using call_typed/call_json;
         # the real user prompt is always at index 1 (messages[1]).
         user_msg = messages[1]["content"] if len(messages) > 1 else ""
+        usage = getattr(response, "usage", None)
+        prompt_tokens = getattr(usage, "prompt_tokens", None) if usage else None
+        completion_tokens = getattr(usage, "completion_tokens", None) if usage else None
+        total_tokens = getattr(usage, "total_tokens", None) if usage else None
         self._logger.info(
-            "LLM completion done | tag=%s | model=%s | elapsed=%.2fs | temp=%.2f | max_tokens=%d | requested_max_tokens=%d | user_chars=%d | json_mode=%s",
+            "LLM completion done | tag=%s | model=%s | elapsed=%.2fs | temp=%.2f | max_tokens=%d | requested_max_tokens=%d | user_chars=%d | json_mode=%s | finish_reason=%s | prompt_tokens=%s | completion_tokens=%s | total_tokens=%s",
             trace_tag,
             self._model_name,
             elapsed,
@@ -506,6 +524,10 @@ class LLMGateway:
             max_tokens,
             len(user_msg or ""),
             "on" if json_mode_used else "off",
+            finish_reason,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
         )
         content = response.choices[0].message.content or ""
         # Strip thinking chain blocks from model output
@@ -576,6 +598,7 @@ class LLMGateway:
         temperature: float = 0.2,
         max_tokens: int = 4096,
         prefill: str = "{",
+        allow_repair: bool = True,
     ) -> dict[str, Any]:
         schema_hint = output_model.model_json_schema()
         messages = self._build_messages(
@@ -603,7 +626,8 @@ class LLMGateway:
             content,
             last_error,
         )
-        if self._enable_json_repair and self._can_start_repair():
+        repair_enabled = self._enable_json_repair and allow_repair
+        if repair_enabled and self._can_start_repair():
             retry_messages = self._build_messages(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
@@ -629,9 +653,82 @@ class LLMGateway:
                 retry_content,
                 retry_error or "json-parse-failed",
             )
-        elif self._enable_json_repair:
+        elif repair_enabled:
             self._logger.warning(
                 "Typed LLM repair skipped for %s: request deadline budget is too low",
+                output_model.__name__,
+            )
+        return {}
+
+    def call_schema_json(
+        self,
+        output_model: type[BaseModel],
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.2,
+        max_tokens: int = 4096,
+        prefill: str = "{",
+        allow_repair: bool = True,
+    ) -> dict[str, Any]:
+        """Return parsed JSON while still prompting with a strict model schema.
+
+        This is intended for batched contracts whose caller can validate and
+        retain independent items.  ``call_typed`` remains the right boundary
+        for atomic responses; using it for a large semantic batch meant one
+        malformed decision discarded every otherwise valid sibling decision.
+        """
+
+        schema_hint = output_model.model_json_schema()
+        messages = self._build_messages(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            output_schema=schema_hint,
+            prefill=prefill,
+        )
+        content = self._call_raw(
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            trace_tag=f"{output_model.__name__}:schema_json",
+            prefill=prefill,
+        )
+        parsed = parse_json_content(content)
+        if isinstance(parsed, dict) and parsed:
+            return parsed
+
+        error = "schema-json-parse-failed"
+        self._logger.warning(
+            "Schema-guided JSON parse failed for %s", output_model.__name__,
+        )
+        self._dump_failure_payload(output_model.__name__, content, error)
+        repair_enabled = self._enable_json_repair and allow_repair
+        if repair_enabled and self._can_start_repair():
+            retry_messages = self._build_messages(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                output_schema=schema_hint,
+                prefill=prefill,
+                error_feedback=error,
+                bad_output_excerpt=content,
+            )
+            retry_content = self._call_raw(
+                retry_messages,
+                temperature=min(temperature, 0.1),
+                max_tokens=max_tokens,
+                trace_tag=f"{output_model.__name__}:schema_json_repair",
+                prefill=prefill,
+            )
+            retry_parsed = parse_json_content(retry_content)
+            if isinstance(retry_parsed, dict) and retry_parsed:
+                return retry_parsed
+            self._dump_failure_payload(
+                f"{output_model.__name__}_schema_json_repair",
+                retry_content,
+                error,
+            )
+        elif repair_enabled:
+            self._logger.warning(
+                "Schema-guided JSON repair skipped for %s: request deadline budget is too low",
                 output_model.__name__,
             )
         return {}
@@ -722,13 +819,22 @@ class LLMGateway:
             raise
         self._record_success()
         elapsed = time.perf_counter() - started
+        finish_reason = getattr(response.choices[0], "finish_reason", None)
+        usage = getattr(response, "usage", None)
+        prompt_tokens = getattr(usage, "prompt_tokens", None) if usage else None
+        completion_tokens = getattr(usage, "completion_tokens", None) if usage else None
+        total_tokens = getattr(usage, "total_tokens", None) if usage else None
         self._logger.info(
-            "LLM text completion done | model=%s | elapsed=%.2fs | temp=%.2f | max_tokens=%d | requested_max_tokens=%d",
+            "LLM text completion done | model=%s | elapsed=%.2fs | temp=%.2f | max_tokens=%d | requested_max_tokens=%d | finish_reason=%s | prompt_tokens=%s | completion_tokens=%s | total_tokens=%s",
             self._model_name,
             elapsed,
             temperature,
             effective_max_tokens,
             max_tokens,
+            finish_reason,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
         )
         content = response.choices[0].message.content or ""
         return strip_thinking(content).strip()
