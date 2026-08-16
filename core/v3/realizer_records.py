@@ -152,6 +152,24 @@ def partition_units(
     return units
 
 
+def _has_weaving_value(unit: RealizationUnit, fact_map: dict[str, FactUnit]) -> bool:
+    """LLM realization only pays off when facts span multiple source units.
+
+    Verbatim weaving cannot improve a single-source-unit group: the
+    deterministic path already restores the exact original sentence, and any
+    connector around it adds risk without value.  Units whose facts come from
+    two or more transport facts are where coherent multi-dimension bullets
+    beat fragmented one-slice-per-claim output.
+    """
+
+    source_units = {
+        fact_map[fact_id].base_fact_id or fact_map[fact_id].fact_id
+        for fact_id in unit.fact_ids
+        if fact_id in fact_map
+    }
+    return len(source_units) >= 2
+
+
 _LABEL_PREFIX_RE = re.compile(r"^[^：:\n]{1,20}[：:]\s*$")
 
 
@@ -518,8 +536,33 @@ def realize_record_local(
 
     fact_map = graph.fact_map()
     degraded_units = [unit for unit in units if unit.degraded]
-    clean_units = [unit for unit in units if not unit.degraded and unit.fact_ids]
+    nonempty_clean = [unit for unit in units if not unit.degraded and unit.fact_ids]
     empty_units = [unit for unit in units if not unit.degraded and not unit.fact_ids]
+
+    max_chars = _env_int("V3_REALIZER_PACK_CHARS", 9000, 1000)
+    all_clean_size = sum(
+        len(json.dumps(_unit_payload(unit, fact_map, graph), ensure_ascii=False))
+        for unit in nonempty_clean
+    )
+    if nonempty_clean and all_clean_size <= max_chars:
+        # Small/medium resumes keep the established single-request behavior:
+        # every clean unit is realized by the model and the optional profile
+        # summary stays available (Phase 4 rebuilds it properly).
+        clean_units = list(nonempty_clean)
+        atomic_units: list[RealizationUnit] = []
+        summary_enabled = not degraded_units
+    else:
+        # Large resumes: single-source-unit groups skip the LLM — the exact
+        # source slice is already the most fluent verbatim realization, and
+        # spending model time there only risks violations.
+        clean_units = [
+            unit for unit in nonempty_clean if _has_weaving_value(unit, fact_map)
+        ]
+        atomic_units = [
+            unit for unit in nonempty_clean if not _has_weaving_value(unit, fact_map)
+        ]
+        # The cross-record summary is single-request and clean-graph only.
+        summary_enabled = False
 
     claims_by_unit: dict[str, list[RealizedClaim]] = {}
     unit_reports: list[UnitReport] = []
@@ -532,6 +575,17 @@ def realize_record_local(
             record_id=unit.record_id,
             section=unit.section,
             status="deterministic_degraded",
+            fact_ids=unit.fact_ids,
+        ))
+    for unit in atomic_units:
+        claims_by_unit[unit.unit_id] = _deterministic_unit_claims(
+            unit, graph, skeleton=plan.skeleton,
+        )
+        unit_reports.append(UnitReport(
+            unit_id=unit.unit_id,
+            record_id=unit.record_id,
+            section=unit.section,
+            status="deterministic_atomic",
             fact_ids=unit.fact_ids,
         ))
     for unit in empty_units:
@@ -551,13 +605,10 @@ def realize_record_local(
             error="all_units_degraded",
         )
 
-    max_chars = _env_int("V3_REALIZER_PACK_CHARS", 9000, 1000)
     packs = _pack_units(clean_units, fact_map, graph, max_chars)
-    # The optional cross-record summary stays single-request and clean-graph
-    # only: a degraded unit means the model would synthesize from a partial
-    # evidence view, so multi-pack or degraded resumes keep deterministic
-    # summaries until the Phase 4 summary compiler.
-    summary_enabled = not degraded_units and len(packs) == 1
+    # Single-request behavior additionally requires that everything fits one
+    # physical call after packing.
+    summary_enabled = summary_enabled and len(packs) == 1
     summary_fact_ids = {
         fact_id
         for unit in clean_units

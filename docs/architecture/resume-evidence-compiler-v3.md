@@ -70,8 +70,11 @@ layout metadata is consumed.  It is not useful as a universal input parser.
    but results are reassembled in source order and inherit the same request
    deadline. Query and placeholder-bearing batches fail closed when no valid
    semantic decision exists; ordinary CV facts retain exact-source fallback.
-   Batch shape is explicit as `V3_SEMANTIC_BATCH_FACTS` (default `28`) and
-   `V3_SEMANTIC_BATCH_CHARS` (default `9000`). Cross-model A/B
+   Batch shape is explicit as `V3_SEMANTIC_BATCH_FACTS` (default `14`,
+   R24-accepted after measuring fallback 53 -> 16 on the representative long
+   case), `V3_SEMANTIC_BATCH_CHARS` (default `9000`) and
+   `V3_SEMANTIC_MAX_TOKENS` (default `6144`, removing the measured 4096
+   truncation). Cross-model A/B
    runs record both values because batch shape can change JSON-schema
    adherence even when the semantic policy and prompt are frozen.
    Every material schema/compiler candidate is evaluated in two paired views:
@@ -86,6 +89,17 @@ layout metadata is consumed.  It is not useful as a universal input parser.
    already-present STAR dimensions.  Invalid output falls back to source text.
    A remaining-time admission gate skips this optional call when it cannot
    finish safely inside the end-to-end deadline.
+   Since R24 Phase 3, realization is **record-local** (`core/v3/realizer_records.py`):
+   the plan is partitioned into per-record/per-section isolation units; a
+   semantic fallback fact degrades only its own unit, clean units keep
+   constrained LLM realization, and a unit failing the hard verifier (or a
+   failed physical pack) restores exact record-local source sentences.
+   Clean units may pack under `V3_REALIZER_PACK_CHARS` for one physical call,
+   but validation and fallback stay per-unit.  Label-split atoms advertise
+   their source-line `label_prefix`; claims that strip it are rejected
+   (`label_not_preserved`) and the deterministic path restores the label, so
+   a bare value never ships unmoored.  The optional profile summary is
+   single-pack and clean-graph only until the Phase 4 summary compiler.
 8. **Atomic verifier/repair** checks source text, critical entity anchors,
    record ownership and eligibility.  Repair retains supported atoms or falls
    back to a source sentence from the same record; it never imports JD/template

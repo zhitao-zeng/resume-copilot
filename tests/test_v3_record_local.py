@@ -519,6 +519,35 @@ def test_unmoored_value_claim_falls_back_to_labeled_source_text():
     assert result.quality_report["atomic_factuality"]["precision"] == 1.0
 
 
+def test_large_resume_single_source_units_skip_llm(monkeypatch):
+    """Weaving filter: only multi-source groups spend realizer LLM budget."""
+
+    monkeypatch.setenv("V3_REALIZER_PACK_CHARS", "120")  # force the multi-pack path
+    monkeypatch.setenv("V3_REALIZER_CONCURRENCY", "1")
+    seen = []
+
+    def realizer(_model, _system, user_prompt, **_kwargs):
+        seen.append(json.loads(user_prompt))
+        return _echo_realizer(_model, _system, user_prompt, **_kwargs)
+
+    result = run_v3_pipeline(
+        cv_text=CV_TWO_RECORDS,
+        semantic_llm_call=_echo_semantic,
+        realizer_llm_call=realizer,
+    )
+
+    assert seen, "multi-source record groups must still be LLM-realized"
+    packed_fact_ids = {
+        fact_id for payload in seen for fact_id in payload["request_fact_ids"]
+    }
+    reports = _unit_reports(result)
+    for report in reports.values():
+        if report["status"] == "deterministic_atomic":
+            # Atomic units never enter a physical request.
+            assert not set(report["fact_ids"]) & packed_fact_ids
+    assert result.quality_report["atomic_factuality"]["recall"] == 1.0
+
+
 def test_labeled_value_claim_is_accepted():
     def labeled_realizer(_model, _system, user_prompt, **_kwargs):
         request = json.loads(user_prompt)
