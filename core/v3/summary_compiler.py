@@ -29,7 +29,7 @@ from typing import Any, Callable, Iterable
 from pydantic import Field
 
 from .contracts import FactGraph, FrozenResume, RealizedClaim, RequirementGraph, V3Model
-from .realizer import _NUMBER_RE
+from .realizer import _NUMBER_RE, _residual_escape_violations
 from .training_schema import SCHEMA_VERSION, SchemaVersion
 
 
@@ -210,6 +210,12 @@ def validate_summary_sentences(
             sentence_violations.append(f"{label}:timeline_concatenation")
         if _LEADING_FRAGMENT_RE.match(text):
             sentence_violations.append(f"{label}:leading_fragment")
+        # Synthesis means selection and ordering, not rewording: after the
+        # cited facts are removed, the residual may only be connectors or
+        # words that appear verbatim in the cited facts (e.g. "A/B测试" may
+        # not replace a cited "A/B Testing").
+        for escape in _residual_escape_violations(text, cited_texts, blob):
+            sentence_violations.append(f"{label}:{escape}")
         # A summary sentence must read as a complete clause: it must not end
         # mid-word where OCR or a slice cut it off.
         if text and text[-1] not in "。！？；.!?":

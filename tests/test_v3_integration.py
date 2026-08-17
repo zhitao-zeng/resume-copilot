@@ -1950,7 +1950,7 @@ def test_realizer_can_reuse_source_fact_in_optional_summary_without_ownership_er
                 "claim_id": "summary",
                 "section": "summary",
                 "field": "summary",
-                "text": "具备负责用户访谈经验。",
+                "text": "具备负责用户访谈的经验。",
                 "fact_ids": [fact_id],
                 "record_id": None,
                 "group_id": "summary:profile",
@@ -1964,7 +1964,7 @@ def test_realizer_can_reuse_source_fact_in_optional_summary_without_ownership_er
     )
 
     assert result.realization_report.status == "success"
-    assert result.resume_data["summary"] == "具备负责用户访谈经验。"
+    assert result.resume_data["summary"] == "具备负责用户访谈的经验。"
     assert result.resume_data["experience"][0]["bullets"] == ["负责用户访谈"]
     assert result.output.audit.ownership_errors == []
 

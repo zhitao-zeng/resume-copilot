@@ -33,7 +33,9 @@ _RANGE_RE = re.compile(
 # A bare short "year": 3 digits directly followed by a date unit or range sep
 _SHORT_YEAR_RE = re.compile(r"(?<![\d.])(\d{3})(?=\s*(?:年|[./-]\d|[-—~至到–]))")
 _VALID_YEAR_RE = re.compile(r"^(19|20)\d{2}$")
-MAX_PERIOD_YEARS = 45
+_MAX_PERIOD_YEARS = 45
+# A "date" with all digits lost to OCR is a degenerate shell, not a fact.
+_EMPTY_DATE_SHELL_RE = re.compile(r"^[\s年月日·./\-—~至到—]+$")
 
 
 def _year_ok(value: str) -> bool:
@@ -43,6 +45,8 @@ def _year_ok(value: str) -> bool:
 def _suspicion_reasons(fact: FactUnit) -> list[str]:
     text = fact.text
     reasons: list[str] = []
+    if _EMPTY_DATE_SHELL_RE.fullmatch(text.strip()) and not re.search(r"\d", text):
+        reasons.append("empty_date_shell")
     for match in _RANGE_RE.finditer(text):
         y1, y2 = match.group("y1"), match.group("y2")
         if not _year_ok(y1):
@@ -54,7 +58,7 @@ def _suspicion_reasons(fact: FactUnit) -> list[str]:
                 span = int(y2) - int(y1)
                 if span < 0:
                     reasons.append(f"reversed_period:{y1}-{y2}")
-                elif span > MAX_PERIOD_YEARS:
+                elif span > _MAX_PERIOD_YEARS:
                     reasons.append(f"overlong_period:{y1}-{y2}")
     for match in _SHORT_YEAR_RE.finditer(text):
         token = match.group(1)

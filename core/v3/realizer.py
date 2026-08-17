@@ -195,6 +195,8 @@ _CONNECTORS = frozenset({
     "于", "以", "向", "从", "把", "将", "对", "通过", "根据", "围绕", "等",
     "以及", "同时", "期间", "其中", "相关", "负责", "参与", "协助", "支持",
     "完成", "实现", "进行", "担任", "兼任", "包括", "含", "主要", "具备", "拥有",
+    # Framing nouns carry no entity/number/claim content of their own.
+    "经验", "经历", "能力", "方面", "背景", "工作", "技能",
 })
 _LATIN_WORD_RE = re.compile(r"[A-Za-z][A-Za-z+#.-]*")
 _CJK_RUN_RE = re.compile(r"[一-鿿]+")
