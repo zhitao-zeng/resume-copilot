@@ -14,6 +14,10 @@
 - **不得新增 LLM 调用。** 实测 `HV2-S1-009` 总耗时 384.858s，其中 `v3_pipeline_s` 367.067s，距 480s 上限仅约 95s 余量。
 - **不得把 `additional_sections` 内容直接提升为 `summary`。** 那会绕过 summary 校验器，正是本项目要防的事。任务 1 只负责**如实报告**，不负责搬运。
 - **不得为通过某个 holdout case 而写针对性规则。** 见任务 0。
+- **不得新增关键词／短语／标签常量表来做内容判定。** 判据三问：表的内容是从观测输出抄来的
+  还是领域固有的？命中后是丢弃内容还是只影响路由？有没有结构化信号（`fact_type`、
+  `record_id`、来源标记）可以替代？三问命中即禁止。已有的 `_JD_STOPWORDS`、章节名本体
+  等常量表不在此列——禁的是**用词表决定内容去留**。
 - V2 路径（`RESUME_PIPELINE_VERSION=v2`）必须零改动。
 
 ---
@@ -188,7 +192,11 @@ _BOILERPLATE_PATTERNS = (
 )
 ```
 
-匹配采用**去标点后的子串包含**，大小写不敏感。命中即整条丢弃，不进入任何 section。
+匹配**必须是去标点后的整行精确相等**，大小写不敏感。**严禁子串包含**——
+`薪酬面议谈判` 含 `面议` 却是真实事实，子串匹配会丢真事实。
+
+**此表冻结，不得增补。** 若将来出现新套话需要加词条，那正是本方案不成立的证据，
+应当**移除该表**（保留原文，D14 属化妆品级收益），而不是把表养大。
 
 - [ ] **步骤 2：把 `教育补充信息` 中的资质条目改投 `certifications`**
 
@@ -222,28 +230,35 @@ _BOILERPLATE_PATTERNS = (
 **文件：**
 - 修改：`core/v3/resume_adapter.py`（写入 `experience` / `additional` 前过滤）
 
-- [ ] **步骤 1：识别 `Label: Value` 元数据形态**
+> **计划修订 2026-08-17：** 本任务初版要求建一张 `_METADATA_LABELS` 标签表。该方案已作废，
+> 原因见下。不要实现它。
 
-```python
-_METADATA_LABELS = (
-    "years of experience",
-    "career level",
-    "industry",
-    "professional direction",
-)
-```
+- [ ] **步骤 1：用已有的归属模型判定，不要引入标签表**
 
-判定：整行匹配 `^\s*(<label>)\s*[:：]\s*(.+)$`（label 大小写不敏感）。
+**不要写 `_METADATA_LABELS`。** `Years of Experience` / `Career Level` / `Industry` /
+`Professional Direction` 这四个标签不是通用词汇，是 `candidate-matching-synthetic`
+合成数据集 header 的字段名。把它们写进产品代码，等于把评测集的形状硬编码进产品，
+直接违反任务 0 引用的 holdout 政策。
 
-- [ ] **步骤 2：命中后不整条丢弃，仅剥离标签**
+真正的缺陷是**元数据行成了 experience bullet**，而这在结构上已经可判：一条属于
+`experience` 的 claim 必须绑定到真实记录（`record_id` 非空）。`Years of Experience: 0`
+来自 query 的 header 区，不属于任何经历记录，`record_id` 为 `None`。
 
-值本身（`Junior`、`Healthcare`）是合法事实，不能丢。**只移除 `Label:` 前缀**，并阻止该条进入 `experience`——元数据不是经历。剥离后的裸值若无处可去，保留在 `补充信息`。
+判定：`section == "experience"` 且 `record_id` 为空的 claim，不得写入 `experience`。
+
+- [ ] **步骤 2：降级而非丢弃**
+
+值本身（`Junior`、`Healthcare`）是合法事实，不能丢。未绑定记录的 claim 从 `experience`
+移出，保留在 `补充信息`。
 
 - [ ] **步骤 3：新增测试** `tests/test_v3_compiler.py`
-  - 输入含 `Years of Experience: 0` → 断言 `experience` 中不含该字符串。
-  - 断言值 `Healthcare` 未从产出中整体消失（防止过度过滤导致召回下降）。
+  - 构造 `record_id=None` 的 claim → 断言 `experience` 中不含它。
+  - 构造 `record_id` 非空的正常经历 claim → 断言**仍在** `experience`（防止过度过滤）。
+  - 断言值 `Healthcare` 未从产出中整体消失。
 
-**验收：** 元数据行不再出现在 `experience`；对应值仍可被检索到。
+**验收：** 未绑定记录的 claim 不出现在 `experience`；正常经历不受影响；对应值仍可被检索到。
+
+**禁止：** 本任务不得新增任何标签、关键词或短语常量表。
 
 ---
 
@@ -286,7 +301,6 @@ def bullet_defects(text: str) -> list[str]:
 | --- | --- |
 | `fragment_start` | 首字符属于 `，。、；：）%>-` |
 | `unbalanced_bracket` | `（`/`）`、`(`/`)`、`【`/`】` 计数不等，或类型交叉（如 `（…】`） |
-| `eaten_numeral` | 量词紧邻计数词而缺数字，如 `超过个`、`价值万`、`境内个` |
 | `bare_fragment` | 去除标点后长度 < 6 **且** 不以终结标点结尾 |
 
 - [ ] **步骤 2：在 realizer 每单元校验中接入**
@@ -298,9 +312,35 @@ def bullet_defects(text: str) -> list[str]:
 2. 合并后仍有缺陷 → 回落到该记录的**源句**（现有机制）；
 3. 源句仍不成句 → 丢弃该 claim。丢弃后 coverage ledger 与 reply 已有上报路径，不需另加提示。
 
-- [ ] **步骤 3：`eaten_numeral` 特殊处置**
+- [ ] **步骤 3：被吞数字改用 provenance 判定，禁止文本模式匹配**
 
-数字被隔离后留下残句，比不写更伤。命中 `eaten_numeral` 的 bullet **直接丢弃**，不尝试合并——数值已由 numeric guard 在 reply 的「待确认数字」中上报，信息未丢失。
+> **计划修订 2026-08-17：** 本步骤初版给了 `超过个`／`价值万`／`境内个` 三个搭配。
+> 那是从观测输出抄来的短语，不可泛化；把它扩成「计数词 × 量词」正则更危险。
+> 实测一个 14 前缀 × 15 量词的版本对 10 条正常简历句**误杀 8 条**，包括
+> `负责项目全流程管理与交付`、`管理人员规模 12 人`、`负责例会组织与会议纪要输出`、
+> `管理条例修订与合规审查`。本步骤处置是**直接丢弃 bullet**，误杀即永久丢事实。
+> `eaten_numeral` 因此**移出 `bullet_defects()`**，不再是文本判定。
+
+数字不是在下游丢的，是在 OCR 重建层被抹掉的：`core/resume_io.py:904` 的
+`_suppress_disputed_numeric_anchors()` 在双见证不一致时把 `5个预约` 抹成 `个预约`；
+调用点（同文件 `1006`、`1173`）只做 `disputed += 1` 计数并写日志，**不留 per-line 标记**。
+下游因此只能猜文本形状——关键词方案是「provenance 缺失」的症状，不是修复。
+
+正确做法：
+
+1. `_suppress_disputed_numeric_anchors` 返回被抑制的位置（或由调用点记录行号/字符区间），
+   随 OCR 结果进入 `DocumentGraph` 对应 span；
+2. `FactGraph` 的 fact 继承该标记；
+3. 守卫按 **fact 溯源**判定：claim 的任一 `fact_id` 带「数字被抑制」标记 → 丢弃该 claim。
+
+零关键词、精确、语言无关。数值已由 numeric guard 在 reply 的「待确认数字」中上报，信息不丢失。
+
+**连带改动：** `tests/test_resume_io_ocr.py` 把残句形态固化成了期望值（`:164` 断言
+`"日均处理超过个预约"`、`:549` 断言 `"监督价值万美元的业务运营"`）。这些期望需随之更新为
+「文本 + 抑制标记」。**不要为了让旧断言通过而放弃标记方案。**
+
+**退出条件：** 若 provenance 透传的改动量超出本计划范围，则本步骤**整体不做**，把 D6 移入
+「不在本计划范围」并在缺陷清单记录原因。**不允许退回关键词方案。**
 
 - [ ] **步骤 4：编写测试** `tests/test_v3_text_integrity.py`
 
@@ -309,7 +349,9 @@ def bullet_defects(text: str) -> list[str]:
 ```python
 ("政支持。",                     ["bare_fragment"]),
 ("，顾问及",                     ["fragment_start", "bare_fragment"]),
-("日均处理超过个预约",             ["eaten_numeral"]),
+("负责项目全流程管理与交付",       []),            # 高频正常句，禁止误杀
+("管理人员规模 12 人",           []),            # 同上
+("负责例会组织与会议纪要输出",     []),            # 同上
 ("（公司】",                     ["unbalanced_bracket"]),
 ("协助组织社区活动并为团队提供行政支持", []),      # 正常句必须通过
 ("Excel",                       []),            # 技能标签必须通过
@@ -322,7 +364,9 @@ def bullet_defects(text: str) -> list[str]:
   - 构造同记录内被劈成两段的源 span → 断言合并后产出完整句、单元不降级。
   - 构造无法合并的孤立碎片 → 断言该单元回落到源句。
 
-**验收：** 6 个回归夹具中 `fragment_start`、`unbalanced_bracket`、`eaten_numeral` 归零；`bare_fragment` 仅在无法合并时以「丢弃」形态出现，不再作为 bullet 渲染。
+**验收：** 任务 0 迁入的回归夹具中 `fragment_start`、`unbalanced_bracket` 归零；
+`bare_fragment` 仅在无法合并时以「丢弃」形态出现，不再作为 bullet 渲染。
+**并且**：上述三条高频正常句零误杀——这是本任务的**否决项**，误杀一条即判定不通过。
 
 ---
 
