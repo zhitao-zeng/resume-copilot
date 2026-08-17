@@ -17,6 +17,7 @@ from experimental_model_candidates import OCR_LAYOUT_REGION_SEPARATOR
 
 from .contracts import DocumentGraph, LayoutNode, SourceAsset, SourceSpan
 from .document_graph import _line_kind, from_native_text, from_ppstructure_blocks
+from .ocr_numeric_witness import witness_ppstructure_blocks
 
 
 @dataclass
@@ -262,6 +263,7 @@ def _pdf_graph(content: bytes, asset: SourceAsset) -> DocumentGraph:
             pixmap = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0), alpha=False)
             png = pixmap.tobytes("png")
             blocks = extract_ppstructure_blocks(png, filename=f"page-{page_index}.png")
+            blocks = witness_ppstructure_blocks(blocks, png)
             page_drafts = _ppstructure_drafts(blocks, page_number=page_index)
             if page_drafts:
                 drafts.extend(page_drafts)
@@ -368,6 +370,7 @@ def build_input_document_graph(
             from ppstructure_runtime import extract_ppstructure_blocks
 
             blocks = extract_ppstructure_blocks(content, filename=filename)
+            blocks = witness_ppstructure_blocks(blocks, content)
             return from_ppstructure_blocks(asset, blocks)
         if suffix in {".txt", ".md", ".markdown"}:
             decoded = content.decode("utf-8", errors="replace")
