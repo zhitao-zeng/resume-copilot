@@ -87,3 +87,47 @@ def test_retired_fixture_replay(case, annotation):
         assert item.get("source") in {"not_provided", "not_rendered"}
     # 4. The pipeline never fails a fixture outright.
     assert result.resume_data is not None
+
+
+# R27 task 8 step 4: bare_fragment is intentionally kept out of _DROP_DEFECTS
+# (dropping short bullets would kill legitimate short facts like 熟练英语).
+# Measured baseline on the 6 retired fixtures: 4, all bare job-title values
+# (物业协调员/行政助理/餐饮服务员/物流专员 in HV2-S3-009).  This test measures
+# the residual; it does not change the tradeoff.
+BARE_FRAGMENT_BASELINE = 4
+
+
+def test_bare_fragment_residual_within_baseline():
+    residual = 0
+    for case, annotation in _fixture_cases():
+        inputs = _case_inputs(annotation)
+        result = run_v3_pipeline(
+            cv_text=inputs["cv_text"],
+            query_text=inputs["query_text"],
+            jd_text=inputs["jd_text"],
+            use_llm=False,
+        )
+        for claim in result.output.frozen.claims:
+            if claim.field == "bullet" and "bare_fragment" in bullet_defects(claim.text):
+                residual += 1
+    assert residual <= BARE_FRAGMENT_BASELINE
+
+
+def test_additional_sections_never_reported_not_provided():
+    """R27 task 8 step 5 (D1 regression): routed additional content is not missing."""
+
+    for case, annotation in _fixture_cases():
+        inputs = _case_inputs(annotation)
+        result = run_v3_pipeline(
+            cv_text=inputs["cv_text"],
+            query_text=inputs["query_text"],
+            jd_text=inputs["jd_text"],
+            use_llm=False,
+        )
+        additional = result.resume_data.get("additional_sections") or {}
+        if not additional.get("教育补充信息"):
+            continue
+        for item in result.missing_fields:
+            if item["field"] == "education":
+                assert item["source"] == "not_rendered", case["id"]
+

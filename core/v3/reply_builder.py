@@ -49,7 +49,10 @@ def _is_actionable_requirement(text: str) -> bool:
 
 
 def _excerpt(text: str, limit: int = 24) -> str:
-    compact = re.sub(r"\s+", "", str(text))
+    # Fold, never delete: latin word boundaries are content ("Delivered
+    # results" must not become "Deliveredresults").  Chinese text has no
+    # significant inner whitespace, so this is byte-identical there.
+    compact = re.sub(r"\s+", " ", str(text)).strip()
     compact = compact.lstrip("-•·*▪◦")
     return compact if len(compact) <= limit else compact[: limit - 1] + "…"
 

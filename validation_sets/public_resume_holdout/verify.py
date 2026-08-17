@@ -18,7 +18,7 @@ EXPECTED = {
     "holdout_v2": {"cases": 60, "per_scenario": 15},
     # After the R27 retirement/promotion the reserve is intentionally uneven:
     # 4/3/5/6 per scenario.  Uniformity is only required for the holdout.
-    "shadow_v3": {"cases": 18, "per_scenario": None},
+    "shadow_v3": {"cases": 16, "per_scenario": None},
 }
 
 

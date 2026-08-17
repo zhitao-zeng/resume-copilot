@@ -181,6 +181,45 @@ def test_reply_conflicts_hide_internal_ids():
     assert all("record:" not in item and "cv:" not in item for item in friendly)
 
 
+def test_excerpt_preserves_latin_word_boundaries():
+    """R27 task 9 (D7): reply excerpts fold, never delete, whitespace."""
+
+    from core.v3.reply_builder import _excerpt
+
+    assert _excerpt("Delivered results using structured workflows", 48) == "Delivered results using structured workflows"
+    assert " " in _excerpt("Delivered results using structured workflows and clear communication", 30)
+    # 中文无内空格输入逐字节不变
+    assert _excerpt("负责订单系统重构") == "负责订单系统重构"
+    # 超长仍按 limit 截断
+    assert _excerpt("a" * 40, 10) == "aaaaaaaaa…"
+
+
+def test_missing_fields_summary_three_state():
+    """R27 task 7: unrelated additional content must not imply a summary."""
+
+    from core.v3.pipeline import _missing_fields
+
+    base = {
+        "meta": {"name": "张三", "phone": "138"},
+        "experience": [{"bullets": ["负责后端开发"]}],
+        "education": [{"school": "甲大学"}],
+        "skills": {"others": ["Python"]},
+    }
+    # 补充信息只有兴趣爱好、summary 未降级 → not_provided
+    with_hobby = {
+        **base,
+        "additional_sections": {"补充信息": ["冲浪、创意设计、烹饪艺术"]},
+    }
+    missing = _missing_fields(with_hobby)
+    summary_item = next(item for item in missing if item["field"] == "summary")
+    assert summary_item["source"] == "not_provided"
+    # summary 真被降级 → not_rendered
+    missing = _missing_fields(with_hobby, degraded={"summary": "dropped_unverifiable"})
+    summary_item = next(item for item in missing if item["field"] == "summary")
+    assert summary_item["source"] == "not_rendered"
+    assert "未能通过校验" in summary_item["reason"]
+
+
 def test_length_budget_drops_trailing_sentences():
     result = _graph_with_sentences()
     graph = result.output.graph

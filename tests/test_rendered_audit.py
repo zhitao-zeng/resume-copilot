@@ -122,3 +122,24 @@ def test_gate_flags_facts_lost_in_render(tmp_path):
     assert report["fact_retention"] < 1.0
     assert any("缓存层" in item for item in report["fact_missing"])
     assert report["pass"] is False
+
+
+def test_no_fake_name_and_no_bare_separators(tmp_path):
+    """R27 task 10 (D22/D23): empty name/education fields render nothing fake."""
+
+    docx = _render(tmp_path, {
+        "meta": {},
+        "education": [{"degree": "BSc"}],
+        "experience": [{"company": "甲公司", "role": "工程师", "period": "2020-2022", "bullets": ["负责开发"]}],
+    })
+    from docx import Document
+
+    texts = [p.text for p in Document(docx).paragraphs]
+    assert not any("候选人" in text for text in texts)
+    for text in texts:
+        stripped = text.strip()
+        assert not (stripped.startswith("|") or stripped.endswith("|") or stripped == "·")
+    # 完整信息时分隔符正常出现（防过度过滤）
+    docx2 = _render(tmp_path, _resume_data())
+    texts2 = [p.text for p in Document(docx2).paragraphs]
+    assert any("甲公司" in text and "后端工程师" in text for text in texts2)

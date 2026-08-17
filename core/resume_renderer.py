@@ -2545,7 +2545,7 @@ def _append_docx_record_section(
 
 def _render_docx_minimal(doc: DocxDocument, resume_data: dict[str, Any]) -> None:
     meta = resume_data.get("meta", {}) if isinstance(resume_data, dict) else {}
-    name = meta.get("name", "候选人") if isinstance(meta, dict) else "候选人"
+    name = str(meta.get("name") or "") if isinstance(meta, dict) else ""
     summary = resume_data.get("summary")
     _append_docx_header_block(
         doc,
@@ -2659,7 +2659,7 @@ def _render_docx_classic(doc: DocxDocument, resume_data: dict[str, Any]) -> None
     summary = resume_data.get("summary", "") if isinstance(resume_data, dict) else ""
     publications = resume_data.get("publications", []) if isinstance(resume_data, dict) else []
 
-    name = meta.get("name", "候选人") if isinstance(meta, dict) else "候选人"
+    name = str(meta.get("name") or "") if isinstance(meta, dict) else ""
     _append_docx_header_block(
         doc,
         meta=meta,
@@ -2683,7 +2683,7 @@ def _render_docx_classic(doc: DocxDocument, resume_data: dict[str, Any]) -> None
                 if company:
                     run = p_company.add_run(company)
                     run.bold = True
-                    run.font.size = Pt(11.5)
+                    run.font.size = Pt(10.5)
                     run.font.color.rgb = RGBColor(0x0F, 0x34, 0x60)
 
                 if role:
@@ -2692,9 +2692,8 @@ def _render_docx_classic(doc: DocxDocument, resume_data: dict[str, Any]) -> None
 
                 if period:
                     run = p_company.add_run(("    " if company or role else "") + period)
-                    run.font.size = Pt(9.5)
+                    run.font.size = Pt(10.5)
                     run.font.color.rgb = RGBColor(0x88, 0x88, 0x88)
-                    run.italic = True
                 p_company.space_before = Pt(6)
                 p_company.space_after = Pt(2)
 
@@ -2754,20 +2753,30 @@ def _render_docx_classic(doc: DocxDocument, resume_data: dict[str, Any]) -> None
             if not isinstance(edu, dict):
                 continue
 
+            school = str(edu.get("school") or "").strip()
+            degree = str(edu.get("degree") or "").strip()
+            major = str(edu.get("major") or "").strip()
+            period = str(edu.get("period") or "").strip()
+            if not (school or degree or major or period):
+                # Never render a bare-separator row ("  |  BSc ·     ").
+                continue
             p_edu = doc.add_paragraph()
-            run = p_edu.add_run(edu.get("school", ""))
-            run.bold = True
-            run.font.size = Pt(11.5)
-            run.font.color.rgb = RGBColor(0x0F, 0x34, 0x60)
+            if school:
+                run = p_edu.add_run(school)
+                run.bold = True
+                run.font.size = Pt(10.5)
+                run.font.color.rgb = RGBColor(0x0F, 0x34, 0x60)
 
-            degree_major = f"  |  {edu.get('degree', '')} · {edu.get('major', '')}"
-            run = p_edu.add_run(degree_major)
-            run.font.size = Pt(10.5)
+            degree_major = " · ".join(part for part in (degree, major) if part)
+            if degree_major:
+                run = p_edu.add_run(("  |  " if school else "") + degree_major)
+                run.font.size = Pt(10.5)
 
-            run = p_edu.add_run(f"    {edu.get('period', '')}")
-            run.font.size = Pt(9.5)
-            run.font.color.rgb = RGBColor(0x88, 0x88, 0x88)
-            run.italic = True
+            if period:
+                run = p_edu.add_run(("    " if (school or degree_major) else "") + period)
+                run.font.size = Pt(10.5)
+                run.font.color.rgb = RGBColor(0x88, 0x88, 0x88)
+                run.italic = True
             p_edu.space_after = Pt(2)
 
             highlights = edu.get("highlights", [])
@@ -2854,7 +2863,7 @@ def _render_docx_modern(doc: DocxDocument, resume_data: dict[str, Any]) -> None:
     summary = resume_data.get("summary", "") if isinstance(resume_data, dict) else ""
     publications = resume_data.get("publications", []) if isinstance(resume_data, dict) else []
 
-    name = meta.get("name", "候选人") if isinstance(meta, dict) else "候选人"
+    name = str(meta.get("name") or "") if isinstance(meta, dict) else ""
     _append_docx_header_block(
         doc,
         meta=meta,
@@ -2939,17 +2948,22 @@ def _render_docx_modern(doc: DocxDocument, resume_data: dict[str, Any]) -> None:
         for edu in education:
             if not isinstance(edu, dict):
                 continue
-            p_edu = doc.add_paragraph()
-            run = p_edu.add_run(edu.get("school", ""))
-            run.bold = True
-            run.font.size = Pt(10.8)
-            run.font.color.rgb = RGBColor(0x00, 0x5A, 0x64)
+            school = str(edu.get("school") or "").strip()
             dm = f"{edu.get('degree', '')} {edu.get('major', '')}".strip()
+            period = str(edu.get("period") or "").strip()
+            if not (school or dm or period):
+                continue
+            p_edu = doc.add_paragraph()
+            if school:
+                run = p_edu.add_run(school)
+                run.bold = True
+                run.font.size = Pt(10.8)
+                run.font.color.rgb = RGBColor(0x00, 0x5A, 0x64)
             if dm:
-                rr = p_edu.add_run(f"  |  {dm}")
+                rr = p_edu.add_run(("  |  " if school else "") + dm)
                 rr.font.size = Pt(10)
-            if edu.get("period", ""):
-                pr = p_edu.add_run(f"  ·  {edu.get('period', '')}")
+            if period:
+                pr = p_edu.add_run(("  ·  " if (school or dm) else "") + period)
                 pr.font.size = Pt(9.5)
                 pr.font.color.rgb = RGBColor(0x77, 0x77, 0x77)
             p_edu.space_after = Pt(2)
@@ -3798,8 +3812,9 @@ def _fallback_render_pdf(resume_data: dict[str, Any], output_path: Path, templat
 
     lines: list[tuple[str, str]] = []
     meta = resume_data.get("meta", {}) if isinstance(resume_data, dict) else {}
-    name = meta.get("name", "候选人") if isinstance(meta, dict) else "候选人"
-    lines.append(("title", str(name)))
+    name = str(meta.get("name") or "") if isinstance(meta, dict) else ""
+    if name.strip():
+        lines.append(("title", name))
 
     contacts = [v for k in ("email", "phone", "github", "linkedin", "website") if isinstance(meta, dict) and (v := meta.get(k))]
     if contacts:

@@ -8,8 +8,10 @@ and split_manifest.json counts; verify.py is the gate.
 """
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
+import re
 import shutil
 from collections import Counter
 from pathlib import Path
@@ -18,17 +20,18 @@ ROOT = Path(__file__).resolve().parents[1]
 HOLDOUT = ROOT / "validation_sets/public_resume_holdout"
 RETIRED = ROOT / "tests/fixtures/holdout_retired"
 
-RETIRE = ["HV2-S1-009", "HV2-S1-012", "HV2-S2-008", "HV2-S2-010", "HV2-S2-012", "HV2-S3-009"]
-PROMOTE = {  # scenario -> count
-    "scenario1": 2,
-    "scenario2": 3,
-    "scenario3": 1,
-}
-NEW_IDS = {
-    "scenario1": ["HV2-S1-016", "HV2-S1-017"],
-    "scenario2": ["HV2-S2-016", "HV2-S2-017", "HV2-S2-018"],
-    "scenario3": ["HV2-S3-016"],
-}
+
+def _next_ids(existing: list[str], scenario: str, count: int) -> list[str]:
+    """Allocate the next HV2 ids for a scenario (HV2-S1-016 style)."""
+
+    short = {"scenario1": "S1", "scenario2": "S2", "scenario3": "S3", "scenario4": "S4"}[scenario]
+    used = []
+    for cid in existing:
+        match = re.fullmatch(rf"HV2-{short}-(\d+)", cid)
+        if match:
+            used.append(int(match.group(1)))
+    start = max(used or [0]) + 1
+    return [f"HV2-{short}-{index:03d}" for index in range(start, start + count)]
 
 
 def _load_jsonl(path: Path) -> list[dict]:
@@ -63,6 +66,11 @@ def _move_file(rel_from: str, split_from: str, split_to: str, dry: bool) -> str:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--retire", required=True, help="comma-separated holdout case ids to retire")
+    args = parser.parse_args()
+    retire = [item.strip() for item in args.retire.split(",") if item.strip()]
+
     hv_cases = _load_jsonl(HOLDOUT / "holdout_v2/cases.jsonl")
     hv_anns = _load_jsonl(HOLDOUT / "holdout_v2/annotations.jsonl")
     sv_cases = _load_jsonl(HOLDOUT / "shadow_v3/cases.jsonl")
@@ -70,23 +78,41 @@ def main() -> None:
 
     # 1. Retire contaminated cases into regression fixtures.
     RETIRED.mkdir(parents=True, exist_ok=True)
-    retired_cases = [c for c in hv_cases if c["id"] in RETIRE]
-    retired_anns = [a for a in hv_anns if a["case_id"] in RETIRE]
-    assert len(retired_cases) == len(RETIRE) == len(retired_anns)
-    _write_jsonl(RETIRED / "cases.jsonl", retired_cases)
-    _write_jsonl(RETIRED / "annotations.jsonl", retired_anns)
+    retired_cases = [c for c in hv_cases if c["id"] in retire]
+    retired_anns = [a for a in hv_anns if a["case_id"] in retire]
+    assert len(retired_cases) == len(retire) == len(retired_anns), (
+        f"missing cases/annotations for {retire}"
+    )
+    existing_retired_cases = (
+        _load_jsonl(RETIRED / "cases.jsonl") if (RETIRED / "cases.jsonl").exists() else []
+    )
+    existing_retired_anns = (
+        _load_jsonl(RETIRED / "annotations.jsonl") if (RETIRED / "annotations.jsonl").exists() else []
+    )
+    _write_jsonl(RETIRED / "cases.jsonl", existing_retired_cases + retired_cases)
+    _write_jsonl(RETIRED / "annotations.jsonl", existing_retired_anns + retired_anns)
 
-    hv_cases = [c for c in hv_cases if c["id"] not in RETIRE]
-    hv_anns = [a for a in hv_anns if a["case_id"] not in RETIRE]
+    hv_cases = [c for c in hv_cases if c["id"] not in retire]
+    hv_anns = [a for a in hv_anns if a["case_id"] not in retire]
+
+    # Promote the same number per scenario as retired.
+    promote: dict[str, int] = {}
+    for case in retired_cases:
+        promote[case["scenario"]] = promote.get(case["scenario"], 0) + 1
+    existing_ids = [c["id"] for c in hv_cases]
+    new_ids = {
+        scenario: _next_ids(existing_ids, scenario, count)
+        for scenario, count in promote.items()
+    }
 
     # 2. Promote shadow reserves with fresh holdout IDs.
     promoted_cases: list[dict] = []
     promoted_anns: list[dict] = []
     used_shadow_ids: list[str] = []
-    for scenario, count in PROMOTE.items():
+    for scenario, count in promote.items():
         pool = [c for c in sv_cases if c["scenario"] == scenario and c["id"] not in used_shadow_ids]
         pool.sort(key=lambda c: c["id"])
-        for case, new_id in zip(pool[:count], NEW_IDS[scenario]):
+        for case, new_id in zip(pool[:count], new_ids[scenario]):
             old_id = case["id"]
             used_shadow_ids.append(old_id)
             case = dict(case)
