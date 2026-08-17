@@ -419,10 +419,10 @@ summary 就被判为 `not_rendered`。实测反例：补充信息只有 `冲浪�
 （兴趣爱好）、summary 未降级时，用户看到
 「个人总结：材料中存在相关内容，但未能通过校验写入正文」——**断言不成立**。
 
-- [ ] **步骤 1：删掉 `or bool(additional_blob)`**
+- [x] **步骤 1：删掉 `or bool(additional_blob)`**
   `degraded.get("summary")` 已覆盖全部 6 个实测 case；该 `or` 只贡献假阳性。
   `education` 分支查具体键 `教育补充信息`，判定精确，**保持不变**。
-- [ ] **步骤 2：补测试** `tests/test_v3_summary_reply.py`
+- [x] **步骤 2：补测试** `tests/test_v3_summary_reply.py`
   - 补充信息只有兴趣爱好 + `degraded` 为空 → 断言 `not_provided`
   - 补充信息有内容 + `degraded={"summary": "dropped_unverifiable"}` → 断言 `not_rendered`（防回归）
 
@@ -439,20 +439,20 @@ summary 就被判为 `not_rendered`。实测反例：补充信息只有 `冲浪�
 后果有二：验收未真正执行；且**两个新 holdout 案例已在开发期被运行，按 holdout 政策已污染**，
 任务 0 的效果被部分抵消。
 
-- [ ] **步骤 1：退役被污染的两例**
+- [x] **步骤 1：退役被污染的两例**
   用 `tools/retire_holdout_cases.py` 把 `HV2-S1-016`、`HV2-S3-016` 移入
   `tests/fixtures/holdout_retired/`，再从 `shadow_v3` 补入两例并重建 manifest。
   跑 `verify.py` 确认 60 例、四场景均衡、root 不相交。
-- [ ] **步骤 2：新增** `tests/test_v3_retired_regression.py`
+- [x] **步骤 2：新增** `tests/test_v3_retired_regression.py`
   读 `tests/fixtures/holdout_retired/cases.jsonl`（此时应有 8 例），走确定性路径
   `use_llm=False` 到 `resume_data`。**不得标记 `integration`**——必须进常规套件。
-- [ ] **步骤 3：断言结构缺陷归零**
+- [x] **步骤 3：断言结构缺陷归零**
   对所有 bullet 调 `bullet_defects()`，断言 `fragment_start`、`unbalanced_bracket` 为 0。
-- [ ] **步骤 4：量化 `bare_fragment` 残留**
+- [x] **步骤 4：量化 `bare_fragment` 残留**
   `bare_fragment` 目前**不在** `realizer_records._DROP_DEFECTS`（丢短 bullet 会误伤
   `熟练英语` 这类合法短事实，是有意权衡）。本步骤**不改该权衡，只测量**：断言残留数不超过
   实测值并把数字写进注释作为基线；若为 0 则断言 0。
-- [ ] **步骤 5：断言 D1 不回归**
+- [x] **步骤 5：断言 D1 不回归**
   写入 `additional_sections` 的内容不得以 `not_provided` 上报。
 
 **验收：** 污染案例已退役且 holdout 重新平衡；退役夹具端到端通过；
@@ -481,11 +481,11 @@ def _excerpt(text: str, limit: int = 24) -> str:
 源文是 `Delivered results using structured workflows and clear communication`。
 **这是 reply 显示层缺陷，不是数据缺陷**——简历正文空格完好，已核实。影响 20% 英文 case。
 
-- [ ] **步骤 1：折叠而非删除** —— `re.sub(r"\s+", " ", str(text)).strip()`
-- [ ] **步骤 2：不要动同文件 `:43`**
+- [x] **步骤 1：折叠而非删除** —— `re.sub(r"\s+", " ", str(text)).strip()`
+- [x] **步骤 2：不要动同文件 `:43`**
   `_is_material_requirement()` 中 `compact` 用于 `len(compact) <= 8` 的内容密度判定，
   去空白是**有意**的，改它会改变过滤行为。
-- [ ] **步骤 3：补测试** `tests/test_v3_summary_reply.py`
+- [x] **步骤 3：补测试** `tests/test_v3_summary_reply.py`
   - 英文多词 → 断言摘录含空格、词可读
   - 中文输入 → 断言与修改前逐字节一致（防回归）
   - 超长输入 → 断言仍按 `limit` 截断
@@ -496,13 +496,13 @@ def _excerpt(text: str, limit: int = 24) -> str:
 
 ### 任务 10：渲染层两处一眼可见的破绽（D22 + D23）
 
-- [ ] **步骤 1：D22——不要用假名字当标题**
+- [x] **步骤 1：D22——不要用假名字当标题**
   `core/resume_renderer.py` 四处 `meta.get("name", "候选人")`（`:2548`、`:2662`、`:2857`、
   `:3801`）。抽不到姓名时整份简历标题就是「候选人」。
   注意默认值只在**键缺失**时生效，`meta["name"] = ""` 会得到空串——两条路径都要处理。
   期望：无姓名时**不渲染姓名段落**。缺失已由 `missing_fields` 如实上报，正文无需占位符。
   文件名路径（`:4071`）可保留兜底，文件必须有名字。
-- [ ] **步骤 2：D23——空槽位不得渲染分隔符**
+- [x] **步骤 2：D23——空槽位不得渲染分隔符**
   实测产出 `'  |      '`（只剩一根竖线）与 `'  |  BSc ·     '`。
   HTML 路径（`:1188`）已用 `if part` 滤空，**DOCX 路径没有**。请在 DOCX 教育段渲染处
   （`_add_section_heading(doc, "教育经历", ...)` 附近，`:2595` 一带）定位实际拼接，
@@ -510,8 +510,8 @@ def _excerpt(text: str, limit: int = 24) -> str:
 
   > **不要照抄行号。** 上面是定位起点；若实际代码与描述不符，**停下来报告**，
   > 不要在别处硬塞过滤。
-- [ ] **步骤 3：同段字号统一** —— 同段落出现 9.5/10.5/11.5pt 三种字号，统一为该段样式既定值。
-- [ ] **步骤 4：补测试**
+- [x] **步骤 3：同段字号统一** —— 同段落出现 9.5/10.5/11.5pt 三种字号，统一为该段样式既定值。
+- [x] **步骤 4：补测试**
   - 无姓名输入 → 断言产出不含「候选人」段落
   - 教育只有 `degree` → 断言无裸分隔符
   - 完整教育信息 → 断言分隔符正常出现（防过度过滤）
@@ -534,16 +534,16 @@ def _excerpt(text: str, limit: int = 24) -> str:
 .venv/bin/python -m pytest -m 'not integration' -q
 ```
 
-- [ ] **退役夹具端到端复跑**（见任务 8，届时应为 8 例），逐项核对：
+- [x] **退役夹具端到端复跑**（见任务 8，届时应为 8 例），逐项核对：
   - `additional_sections` 内容不再以 `not_provided` 上报（任务 1）
   - `summary_empty_after_length_repair` 消失（任务 2）
   - 套话与元数据行不出现在正文（任务 3、4）
   - 四类结构缺陷归零（任务 5）
   - 用户可见 `conflicts` 无内部 token（任务 6）
 
-- [ ] **延迟未劣化：** 单例 `total_s` 不高于修复前基线（`HV2-S1-009` 为 `384.858s`）。全部改动为确定性后处理，预期增量在毫秒级；若出现秒级增长说明实现有误。
+- [x] **延迟未劣化：** 单例 `total_s` 不高于修复前基线（`HV2-S1-009` 为 `384.858s`）。全部改动为确定性后处理，预期增量在毫秒级；若出现秒级增长说明实现有误。
 
-- [ ] **V2 路径零改动：** 确认 `RESUME_PIPELINE_VERSION=v2` 的产出逐字节不变。
+- [x] **V2 路径零改动：** 确认 `RESUME_PIPELINE_VERSION=v2` 的产出逐字节不变。
 
 - [x] **不得自行提交 Darvin 平台。** 采用门槛为 Darvin 完整均分 ≥ 66.48、零编造否决、零生成失败、全部请求 < 480s。本计划只修体感缺陷，**不构成提交依据**，是否提交由项目负责人决定。
 
