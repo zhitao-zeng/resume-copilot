@@ -129,11 +129,11 @@ def test_bare_separator_is_not_a_date_shell():
     doc = "2019年 - 2021年\n-\n年月\n"
     facts = [
         FactUnit(fact_id="cv:fact:0", source_id="cv", source_type="cv", text="2019年 - 2021年",
-                 spans=[SourceSpan(source_id="cv", char_start=0, char_end=12)]),
+                 spans=[SourceSpan(source_id="cv", char_start=0, char_end=13)]),
         FactUnit(fact_id="cv:fact:1", source_id="cv", source_type="cv", text="-",
-                 spans=[SourceSpan(source_id="cv", char_start=13, char_end=14)]),
+                 spans=[SourceSpan(source_id="cv", char_start=14, char_end=15)]),
         FactUnit(fact_id="cv:fact:2", source_id="cv", source_type="cv", text="年月",
-                 spans=[SourceSpan(source_id="cv", char_start=15, char_end=17)]),
+                 spans=[SourceSpan(source_id="cv", char_start=16, char_end=18)]),
     ]
     graph = FactGraph(documents={"cv": doc}, facts=facts)
     suspects = find_suspect_numeric_facts(graph)
