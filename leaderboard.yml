@@ -9,4 +9,4 @@ inferenceVolumeMounts:
 
 inferenceImage:
   repository: "harbor-contest.4pd.io/zengzhitao/resume-copilot"
-  tag: "7a958ac-launch-r26"
+  tag: "77708bc-launch-r26"
