@@ -35,7 +35,9 @@ _SHORT_YEAR_RE = re.compile(r"(?<![\d.])(\d{3})(?=\s*(?:年|[./-]\d|[-—~至到
 _VALID_YEAR_RE = re.compile(r"^(19|20)\d{2}$")
 _MAX_PERIOD_YEARS = 45
 # A "date" with all digits lost to OCR is a degenerate shell, not a fact.
-_EMPTY_DATE_SHELL_RE = re.compile(r"^[\s年月日·./\-—~至到—]+$")
+# It must contain at least one date unit glyph; a bare "-" or "·" separator
+# is punctuation, not a date shell.
+_EMPTY_DATE_SHELL_RE = re.compile(r"^(?=.*[年月日])[\s年月日·./\-—~至到—]+$")
 
 
 def _year_ok(value: str) -> bool:

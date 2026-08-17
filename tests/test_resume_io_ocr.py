@@ -552,6 +552,72 @@ def test_numeric_consensus_suppression_keeps_clause_but_removes_anchor():
     ) == "年月-至今"
 
 
+def test_numeric_consensus_signature_keeps_ambiguous_glyph_evidence():
+    assert resume_io._ocr_numeric_consensus_signature(
+        "处理超过5(个预约。"
+    ) == ("5", "<ambiguous-numeric-glyph>")
+    assert resume_io._ocr_numeric_consensus_signature(
+        "处理超过5个预约。"
+    ) == ("5",)
+    # A bracket between two digits is the established deterministic OCR-zero
+    # repair, not an unmatched glyph after a complete number.
+    assert resume_io._ocr_numeric_consensus_signature(
+        "收入35(0万元"
+    ) == ("3500",)
+    assert resume_io._ocr_numeric_consensus_signature(
+        "覆盖(2019年)项目"
+    ) == ("2019",)
+
+
+def test_numeric_consensus_rejects_same_digits_with_unmatched_glyph_witness(
+    monkeypatch,
+):
+    class PrimaryEngine:
+        @staticmethod
+        def crop_text_regions(_image, boxes):
+            return [np.zeros((8, 8, 3), dtype=np.uint8) for _ in boxes]
+
+        @staticmethod
+        def cls_and_rotate(crops):
+            return crops, None
+
+    class RecognitionResult:
+        def __init__(self, txts):
+            self.txts = tuple(txts)
+
+    class SecondaryRecognizer:
+        def __call__(self, _input):
+            return RecognitionResult(("处理超过5(个预约。",))
+
+    class MediumRecognizer:
+        def __init__(self):
+            self.called = False
+
+        def __call__(self, _input):
+            self.called = True
+            return RecognitionResult(("处理超过5(个预约。",))
+
+    class PrimaryResult:
+        boxes = np.zeros((1, 4, 2), dtype=np.float32)
+        txts = ("处理超过5个预约。",)
+
+    medium = MediumRecognizer()
+    monkeypatch.setattr(resume_io, "_RAPID_OCR", PrimaryEngine())
+    monkeypatch.setattr(resume_io, "_RAPID_OCR_SECONDARY_REC", SecondaryRecognizer())
+    monkeypatch.setattr(resume_io, "_RAPID_OCR_NUMERIC_REC", medium)
+    monkeypatch.setattr(resume_io, "_init_numeric_ocr_consensus", lambda: True)
+
+    result = resume_io._apply_numeric_ocr_consensus(
+        np.zeros((40, 40, 3), dtype=np.uint8),
+        PrimaryResult(),
+    )
+
+    # The independent small witness already proves the apparent agreement is
+    # unsafe, so the medium head is skipped and the number is quarantined.
+    assert medium.called is False
+    assert result.txts == ("处理超过个预约。",)
+
+
 def test_numeric_consensus_skips_medium_when_small_heads_already_disagree(monkeypatch):
     class PrimaryEngine:
         @staticmethod

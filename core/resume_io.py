@@ -515,7 +515,7 @@ def _build_tensorrt_consensus_ocr(model_dir: Path):
         det_unclip_ratio=_positive_float_env("RAPID_OCR_DET_UNCLIP_RATIO", 1.6),
         cls_thresh=_positive_float_env("RAPID_OCR_CLS_THRESH", 0.9),
         max_side_len=_positive_int_env("RAPID_OCR_ENGINE_MAX_SIDE", 1600),
-        numeric_signature=_ocr_numeric_signature,
+        numeric_signature=_ocr_numeric_consensus_signature,
         suppress_numeric=_suppress_disputed_numeric_anchors,
         repair_text=_repair_ocr_text_artifacts,
     )
@@ -571,7 +571,7 @@ def _build_tensorrt_recognition_consensus(
         "primary_ocr": primary_ocr,
         "device_id": _nonnegative_int_env("RAPID_OCR_GPU_DEVICE_ID", 0),
         "recognition_preprocess": recognition_preprocess,
-        "numeric_signature": _ocr_numeric_signature,
+        "numeric_signature": _ocr_numeric_consensus_signature,
         "suppress_numeric": _suppress_disputed_numeric_anchors,
         "repair_text": _repair_ocr_text_artifacts,
     }
@@ -859,6 +859,39 @@ def _ocr_numeric_signature(text: object) -> tuple[str, ...]:
     return tuple(re.findall(r"\d+(?:\.\d+)?", repaired))
 
 
+_AMBIGUOUS_NUMERIC_GLYPH = "<ambiguous-numeric-glyph>"
+
+
+def _ocr_numeric_consensus_signature(text: object) -> tuple[str, ...]:
+    """Retain non-digit evidence that makes an apparent number unsafe.
+
+    A degraded zero is sometimes read as an unmatched opening bracket.  The
+    three OCR heads can then appear to agree numerically (``5``, ``5(``,
+    ``5(``) even though two independent witnesses explicitly saw an extra
+    glyph.  Numeric-only signatures incorrectly accept that as consensus.
+
+    The marker is intentionally narrow: the opening bracket must be
+    unbalanced, immediately follow a digit, and *not* sit between two digits.
+    Therefore established repairs such as ``35(0`` -> ``350`` remain valid,
+    while ``5(个预约`` is treated as disputed rather than guessed.
+    """
+
+    raw = unicodedata.normalize("NFKC", str(text or ""))
+    signature = _ocr_numeric_signature(raw)
+    if not signature:
+        return signature
+    unmatched_numeric_glyph = (
+        raw.count("(") > raw.count(")")
+        and re.search(r"\d\s*\((?!\s*\d)", raw) is not None
+    ) or (
+        raw.count("[") > raw.count("]")
+        and re.search(r"\d\s*\[(?!\s*\d)", raw) is not None
+    )
+    if unmatched_numeric_glyph:
+        return (*signature, _AMBIGUOUS_NUMERIC_GLYPH)
+    return signature
+
+
 def _ocr_lexical_signature(text: object) -> str:
     """Normalize OCR prose for exact cross-recognizer comparison."""
 
@@ -927,16 +960,16 @@ def _apply_numeric_ocr_consensus(np_img, result: Any) -> Any:
                 for index, (primary_text, secondary_text) in enumerate(
                     zip(result.txts, secondary.txts)
                 )
-                if _ocr_numeric_signature(primary_text)
-                or _ocr_numeric_signature(secondary_text)
+                if _ocr_numeric_consensus_signature(primary_text)
+                or _ocr_numeric_consensus_signature(secondary_text)
             ]
             if not numeric_indexes:
                 return result
             medium_indexes = [
                 index
                 for index in numeric_indexes
-                if _ocr_numeric_signature(result.txts[index])
-                == _ocr_numeric_signature(secondary.txts[index])
+                if _ocr_numeric_consensus_signature(result.txts[index])
+                == _ocr_numeric_consensus_signature(secondary.txts[index])
             ]
             medium_started = time.perf_counter()
             numeric = (
@@ -962,10 +995,11 @@ def _apply_numeric_ocr_consensus(np_img, result: Any) -> Any:
         reconciled = list(result.txts)
         disputed = 0
         for index in numeric_indexes:
-            primary_signature = _ocr_numeric_signature(result.txts[index])
-            secondary_signature = _ocr_numeric_signature(secondary.txts[index])
+            primary_signature = _ocr_numeric_consensus_signature(result.txts[index])
+            secondary_signature = _ocr_numeric_consensus_signature(secondary.txts[index])
             if primary_signature == secondary_signature and (
-                primary_signature == _ocr_numeric_signature(numeric_by_index[index])
+                primary_signature
+                == _ocr_numeric_consensus_signature(numeric_by_index[index])
             ):
                 reconciled[index] = _repair_ocr_text_artifacts(result.txts[index])
                 continue

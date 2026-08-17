@@ -121,3 +121,20 @@ def test_quarantine_cascades_to_semantic_atoms():
     if atom is not None and "204" in atom.text:
         assert atom.eligible is False
     assert result.quality_report["atomic_factuality"]["precision"] == 1.0
+
+
+def test_bare_separator_is_not_a_date_shell():
+    from core.v3.contracts import FactGraph, FactUnit, SourceSpan
+
+    doc = "2019年 - 2021年\n-\n年月\n"
+    facts = [
+        FactUnit(fact_id="cv:fact:0", source_id="cv", source_type="cv", text="2019年 - 2021年",
+                 spans=[SourceSpan(source_id="cv", char_start=0, char_end=12)]),
+        FactUnit(fact_id="cv:fact:1", source_id="cv", source_type="cv", text="-",
+                 spans=[SourceSpan(source_id="cv", char_start=13, char_end=14)]),
+        FactUnit(fact_id="cv:fact:2", source_id="cv", source_type="cv", text="年月",
+                 spans=[SourceSpan(source_id="cv", char_start=15, char_end=17)]),
+    ]
+    graph = FactGraph(documents={"cv": doc}, facts=facts)
+    suspects = find_suspect_numeric_facts(graph)
+    assert [item["fact_id"] for item in suspects] == ["cv:fact:2"]
