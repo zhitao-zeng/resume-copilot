@@ -41,6 +41,7 @@ from .contracts import (
     V3Model,
 )
 from .realizer import _join_facts, _placeholder, merge_fragment_claims, realize_plan, validate_realizer_response
+from .text_integrity import bullet_defects
 from .realizer_llm import RealizationReport, RealizationResult, _minimum_remaining_seconds
 from .training_schema import RealizerClaimDecision, SCHEMA_VERSION, SchemaVersion
 from pydantic import Field
@@ -307,7 +308,18 @@ def _deterministic_unit_claims(
             ))
     # R25: join OCR soft-wrapped fragments within this unit before returning.
     claims = merge_fragment_claims(claims, graph)
-    return claims
+    # R27: after joining, drop bullets that still cannot read as sentences
+    # (leading fragments, unbalanced brackets).  Facts in dropped claims are
+    # reported through the coverage ledger and the reply.  Short but
+    # legitimate values (bare_fragment only) stay.
+    _DROP_DEFECTS = {"fragment_start", "unbalanced_bracket"}
+    kept: list[RealizedClaim] = []
+    for claim in claims:
+        defects = set(bullet_defects(claim.text)) if claim.field == "bullet" else set()
+        if defects & _DROP_DEFECTS:
+            continue
+        kept.append(claim)
+    return kept
 
 
 def _convert_unit_claims(
@@ -365,6 +377,12 @@ def _validate_unit(
             label = _label_prefix(fact, graph)
             if label and label not in claim.text:
                 violations.append(f"{claim.claim_id}:label_not_preserved:{fact_id}")
+    # Sentence integrity: bullets must read as sentences, not fragments.
+    for claim in claims:
+        if claim.field != "bullet":
+            continue
+        for defect in bullet_defects(claim.text):
+            violations.append(f"{claim.claim_id}:bullet_integrity:{defect}")
     return violations
 
 
@@ -745,6 +763,9 @@ def realize_record_local(
                 ))
                 continue
             claims = _convert_unit_claims(unit, list(output.claims), fact_map)
+            # Repair pass before judging: adjacent soft-wrapped fragments
+            # merge back into whole sentences at no cost to fact fidelity.
+            claims = merge_fragment_claims(claims, graph)
             violations = _validate_unit(unit, claims, graph)
             if declared_mismatch:
                 violations = violations + ["declared_request_fact_ids_mismatch"]

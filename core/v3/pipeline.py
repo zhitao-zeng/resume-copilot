@@ -15,7 +15,7 @@ from .planner import plan_resume
 from .realizer_llm import RealizationReport
 from .realizer_records import realize_record_local
 from .repair import minimal_repair
-from .reply_builder import build_reply
+from .reply_builder import build_reply, _friendly_conflicts
 from .resume_adapter import frozen_to_resume_data
 from .semantic_llm import SemanticCompilationReport, compile_semantics
 from .summary_compiler import compile_summary
@@ -131,7 +131,24 @@ def _quality_report(output: V3Output, semantic: SemanticCompilationReport, reali
     }
 
 
-def _missing_fields(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
+def _additional_blob(resume_data: dict[str, Any]) -> str:
+    """Flatten additional_sections so misrouted content stays visible."""
+
+    sections = resume_data.get("additional_sections")
+    if not isinstance(sections, dict):
+        return ""
+    parts: list[str] = []
+    for values in sections.values():
+        if isinstance(values, list):
+            parts.extend(str(value) for value in values if value)
+    return "\n".join(parts)
+
+
+def _missing_fields(
+    resume_data: dict[str, Any],
+    *,
+    degraded: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
     framework = resume_data.get("framework")
     if isinstance(framework, dict):
         return [
@@ -139,7 +156,11 @@ def _missing_fields(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
             for section in framework.get("sections", [])
             if isinstance(section, dict) and section.get("key") and section.get("title")
         ]
+    degraded = degraded or {}
     meta = resume_data.get("meta") if isinstance(resume_data.get("meta"), dict) else {}
+    additional = resume_data.get("additional_sections")
+    additional = additional if isinstance(additional, dict) else {}
+    additional_blob = _additional_blob(resume_data)
     checks = [
         ("name", "姓名", bool(meta.get("name"))),
         ("contact", "联系方式", bool(meta.get("phone") or meta.get("email"))),
@@ -152,11 +173,24 @@ def _missing_fields(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
         ),
         ("skills", "技能与资质", bool(resume_data.get("skills") or resume_data.get("certifications"))),
     ]
-    return [
-        {"field": field, "label": label, "reason": "个人材料中未提供该信息，未进行推断", "source": "not_provided"}
-        for field, label, present in checks
-        if not present
-    ]
+    # Three-state reporting: written (not reported) / not_rendered (material
+    # had content but it failed verification or was routed to supplementary
+    # sections) / not_provided (the material truly lacks it).
+    not_rendered_reason = "材料中存在相关内容，但未能通过校验写入正文，已保留在补充信息中，请人工确认"
+    missing: list[dict[str, Any]] = []
+    for field, label, present in checks:
+        if present:
+            continue
+        not_rendered = False
+        if field == "summary":
+            not_rendered = bool(degraded.get("summary")) or bool(additional_blob)
+        elif field == "education":
+            not_rendered = bool(additional.get("教育补充信息"))
+        if not_rendered:
+            missing.append({"field": field, "label": label, "reason": not_rendered_reason, "source": "not_rendered"})
+        else:
+            missing.append({"field": field, "label": label, "reason": "个人材料中未提供该信息，未进行推断", "source": "not_provided"})
+    return missing
 
 
 def run_v3_pipeline(
@@ -255,7 +289,12 @@ def run_v3_pipeline(
     )
     plan = plan.model_copy(update={"ledger": ledger})
     resume_data = frozen_to_resume_data(frozen, graph, target_role=target_role)
-    missing = _missing_fields(resume_data)
+    missing = _missing_fields(
+        resume_data,
+        degraded={"summary": summary_result.report.status}
+        if summary_result.report.status not in {"generated", "revalidated", ""}
+        else {},
+    )
     # R24 Phase 4: concise reply compiled from the frozen audit — direction,
     # bounded evidence-backed match/gap analysis, exact missing fields,
     # grouped undetermined-ownership items, and real conflicts only.
@@ -269,9 +308,11 @@ def run_v3_pipeline(
     )
     output = V3Output(graph=graph, plan=plan, frozen=frozen, audit=audit, reply=reply)
     quality = _quality_report(output, semantic_result.report, realization.report, summary_result.report.to_dict(), quarantined_numeric)
+    # Audit conflicts carry internal tokens ("cv:record:4:period").  Only
+    # user-readable descriptions may surface; anything else is dropped.
     conflicts = [
-        {"field": "source_conflict", "description": conflict}
-        for conflict in audit.conflicts
+        {"field": "source_conflict", "description": description}
+        for description in _friendly_conflicts(list(audit.conflicts))
     ]
     changes = [
         {

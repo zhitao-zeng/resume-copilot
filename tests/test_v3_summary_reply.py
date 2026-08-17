@@ -186,11 +186,29 @@ def test_length_budget_drops_trailing_sentences():
     graph = result.output.graph
     fid = _fact_ids(result)[0]
     fact_text = graph.fact_map()[fid].text
-    sentences = [{"text": fact_text, "fact_ids": [fid]}] * 6  # 远超 100 字
+    sentences = [{"text": f"曾{fact_text}。", "fact_ids": [fid]}] * 6  # 远超 100 字
     verified, violations = validate_summary_sentences(sentences, graph)
     total = sum(len(s["text"].replace(" ", "")) for s in verified)
     assert total <= MAX_COMPACT_CHARS
     assert any("exceeds" in v for v in violations)
+
+
+def test_rejected_sentences_do_not_consume_length_budget():
+    """Task D4: rejected sentences must not empty the valid ones."""
+
+    result = _graph_with_sentences()
+    graph = result.output.graph
+    fid = _fact_ids(result)[0]
+    fact_text = graph.fact_map()[fid].text
+    long_bad = "拥有多年丰富经验并且成绩为最" + fact_text * 8  # unsupported adjective + comparative
+    sentences = [
+        {"text": long_bad, "fact_ids": [fid]},
+        {"text": long_bad + "更多内容", "fact_ids": [fid]},
+        {"text": f"曾{fact_text}。", "fact_ids": [fid]},
+    ]
+    verified, violations = validate_summary_sentences(sentences, graph)
+    assert verified == [{"text": f"曾{fact_text}。", "fact_ids": [fid]}]
+    assert "summary_empty_after_length_repair" not in violations
 
 
 # ---------------------------------------------------------------------------

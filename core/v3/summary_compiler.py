@@ -233,10 +233,10 @@ def validate_summary_sentences(
                 ):
                     sentence_violations.append(f"{label}:bare_label_sentence")
                     break
-        total_chars += _compact_len(text)
         if sentence_violations:
             violations.extend(sentence_violations)
             continue
+        total_chars += _compact_len(text)
         verified.append({"text": text, "fact_ids": fact_ids})
     if total_chars > MAX_COMPACT_CHARS:
         violations.append(f"summary_exceeds_{MAX_COMPACT_CHARS}_chars")

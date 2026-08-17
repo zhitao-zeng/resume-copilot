@@ -105,12 +105,20 @@ _CONFLICT_TYPE_LABELS = {
 
 
 def _friendly_conflicts(conflicts: list[str]) -> list[str]:
-    """Render audit conflict hints without internal record/fact identifiers."""
+    """Render audit conflict hints without internal record/fact identifiers.
+
+    Entries that cannot be mapped to a user-readable description (including
+    ``unassigned`` pseudo-records) are dropped, never passed through.
+    """
 
     labels = []
     for item in conflicts:
-        fact_type = str(item).rsplit(":", 1)[-1]
-        label = _CONFLICT_TYPE_LABELS.get(fact_type, "信息")
+        owner, _, fact_type = str(item).rpartition(":")
+        if not owner or owner == "unassigned":
+            continue
+        label = _CONFLICT_TYPE_LABELS.get(fact_type)
+        if label is None:
+            continue
         if label not in labels:
             labels.append(label)
     return [

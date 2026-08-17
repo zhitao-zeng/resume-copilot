@@ -99,6 +99,35 @@ def _append_unique(container: list[str], value: str) -> None:
         container.append(value)
 
 
+_BOILERPLATE_PATTERNS = (
+    "推荐信可按需提供",
+    "可应要求提供推荐信",
+    "如需参考资料",
+    "references available upon request",
+    "referencesavailableuponrequest",
+    "面议",
+)
+_PUNCT_STRIP = re.compile(r"[\s，。、；：,.;·•\-—–（）()]+")
+
+
+def _is_boilerplate(value: str) -> bool:
+    """Whole-line boilerplate only — never substring matching.
+
+    A line that is exactly "references available upon request" carries no
+    candidate fact; a duty sentence merely containing such a phrase (e.g.
+    薪酬面议谈判) is a real fact and must survive.  Exact whole-line match
+    after punctuation stripping keeps recall intact.
+    """
+
+    probe = _PUNCT_STRIP.sub("", str(value or "")).casefold()
+    if not probe:
+        return False
+    return any(
+        probe == _PUNCT_STRIP.sub("", pattern).casefold()
+        for pattern in _BOILERPLATE_PATTERNS
+    )
+
+
 def _summary_value_is_represented(value: str, candidate: str) -> bool:
     """Return whether a longer summary claim already contains ``value``.
 
@@ -179,6 +208,11 @@ def _record_section(
     return result
 
 
+# Key-value metadata shape: a short ASCII label + colon ("Career Level:
+# Junior").  Language-independent shape — no label/keyword tables.
+_KV_METADATA_LINE = re.compile(r"^[A-Za-z][A-Za-z ]{0,28}[：:]\s*\S+")
+
+
 def frozen_to_resume_data(
     frozen: FrozenResume,
     graph: FactGraph,
@@ -190,11 +224,34 @@ def frozen_to_resume_data(
     if frozen.skeleton:
         return _framework(target_role)
     data: dict[str, Any] = {"meta": {}}
+    # D15: a claim routed to a record-family section without record binding
+    # in key-value metadata shape ("Career Level: Junior") is a profile
+    # header, never an experience entry.  Re-home it into 补充信息 intact.
+    # Unbound real bullets (no key-value shape) stay in their section.
+    sections_in: dict[str, list[Any]] = {
+        section: list(claims) for section, claims in frozen.sections.items()
+    }
+    for section in ("experience", "projects", "research", "activities", "teaching"):
+        if section not in sections_in:
+            continue
+        kept: list[Any] = []
+        for claim in sections_in[section]:
+            if (
+                claim.record_id is None
+                and claim.field == "bullet"
+                and _KV_METADATA_LINE.match(_claim_value(claim))
+            ):
+                sections_in.setdefault("additional", []).append(
+                    claim.model_copy(update={"section": "additional"})
+                )
+                continue
+            kept.append(claim)
+        sections_in[section] = kept
     if target_role:
         # Target role is user intent and is isolated from factual claims.
         data["meta"]["target_role"] = target_role
 
-    contact_claims = frozen.sections.get("contact", [])
+    contact_claims = sections_in.get("contact", [])
     contact_extras: list[str] = []
     for claim in contact_claims:
         value = _claim_value(claim)
@@ -214,7 +271,7 @@ def frozen_to_resume_data(
 
     summaries = _compact_summary_values([
         _claim_value(claim)
-        for claim in frozen.sections.get("summary", [])
+        for claim in sections_in.get("summary", [])
         if _claim_value(claim)
     ])
     if summaries:
@@ -229,7 +286,7 @@ def frozen_to_resume_data(
     }
     education_overflow: list[str] = []
     for section, target in section_targets.items():
-        claims = frozen.sections.get(section, [])
+        claims = sections_in.get(section, [])
         records = _record_section(
             claims,
             section=section,
@@ -238,7 +295,7 @@ def frozen_to_resume_data(
         if records:
             data[target] = records
 
-    skills = [_claim_value(claim) for claim in frozen.sections.get("skills", []) if _claim_value(claim)]
+    skills = [_claim_value(claim) for claim in sections_in.get("skills", []) if _claim_value(claim)]
     if skills:
         data["skills"] = {"others": list(dict.fromkeys(skills))}
 
@@ -250,22 +307,57 @@ def frozen_to_resume_data(
         "teaching": "teaching",
     }
     for section, target in flat_targets.items():
-        values = [_claim_value(claim) for claim in frozen.sections.get(section, []) if _claim_value(claim)]
+        values = [_claim_value(claim) for claim in sections_in.get(section, []) if _claim_value(claim)]
         if values:
             data[target] = list(dict.fromkeys(values))
 
     additional: dict[str, list[str]] = {}
+    fact_map = graph.fact_map()
+
+    def _fact_types(claim: Any) -> set[str]:
+        return {
+            fact_map[fact_id].fact_type
+            for fact_id in claim.fact_ids
+            if fact_id in fact_map
+        }
+
     for section in ("additional", "other"):
-        claims = frozen.sections.get(section, [])
-        values = [_claim_value(claim) for claim in claims if _claim_value(claim)]
-        if not values:
-            continue
-        title = "补充经历" if section == "additional" else "其他经历"
-        additional[title] = list(dict.fromkeys(values))
+        claims = sections_in.get(section, [])
+        values: list[str] = []
+        for claim in claims:
+            value = _claim_value(claim)
+            if not value or _is_boilerplate(value):
+                continue
+            # Credentials routed here by mistake belong to certifications,
+            # using the existing fact_type only — no keyword dictionaries.
+            if "credential" in _fact_types(claim):
+                data.setdefault("certifications", [])
+                _append_unique(data["certifications"], value)
+                continue
+            values.append(value)
+        if values:
+            title = "补充信息" if section == "additional" else "其他信息"
+            additional[title] = list(dict.fromkeys(values))
     if additional:
         data.setdefault("additional_sections", {}).update(additional)
     if education_overflow:
-        data.setdefault("additional_sections", {})["教育补充信息"] = education_overflow
+        # Route credential-typed overflow to certifications by fact_type;
+        # keep the rest as supplementary education info.
+        credential_values: set[str] = set()
+        for claim in sections_in.get("education", []):
+            if "credential" in _fact_types(claim):
+                credential_values.add(_claim_value(claim))
+        kept: list[str] = []
+        for value in education_overflow:
+            if _is_boilerplate(value):
+                continue
+            if value in credential_values:
+                data.setdefault("certifications", [])
+                _append_unique(data["certifications"], value)
+                continue
+            kept.append(value)
+        if kept:
+            data.setdefault("additional_sections", {})["教育补充信息"] = kept
     return data
 
 
