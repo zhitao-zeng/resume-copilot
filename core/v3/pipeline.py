@@ -278,10 +278,21 @@ def run_v3_pipeline(
     )
     plan = plan.model_copy(update={"ledger": ledger})
     resume_data = frozen_to_resume_data(frozen, graph, target_role=target_role)
+    # Only statuses where summary material existed and was dropped or the
+    # generation attempt itself failed may claim not_rendered.  no_evidence /
+    # disabled / skipped_skeleton mean there was nothing to render — labelling
+    # those "材料中存在相关内容" would assert a cause that was never checked
+    # (D2's defect in the opposite direction).
+    not_rendered_statuses = {
+        "dropped_unverifiable",
+        "dropped_atomic_audit",
+        "fallback",
+        "budget_fallback",
+    }
     missing = _missing_fields(
         resume_data,
         degraded={"summary": summary_result.report.status}
-        if summary_result.report.status not in {"generated", "revalidated", ""}
+        if summary_result.report.status in not_rendered_statuses
         else {},
     )
     # R24 Phase 4: concise reply compiled from the frozen audit — direction,

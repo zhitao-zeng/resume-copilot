@@ -109,6 +109,7 @@ _FORBIDDEN_SYNTHESIS = (
 )
 _COMPARATIVES = ("最", "第一", "唯一", "首位", "顶级")
 MAX_COMPACT_CHARS = 100
+_SUMMARY_CLAIM_ID = "summary:profile/compiled"
 
 
 def _minimum_remaining_seconds() -> float:
@@ -268,7 +269,7 @@ def _summary_claim(sentences: list[dict[str, Any]], graph: FactGraph) -> Realize
     seen: set[str] = set()
     ordered_ids = [fid for fid in fact_ids if not (fid in seen or seen.add(fid))]
     return RealizedClaim(
-        claim_id="summary:profile/compiled",
+        claim_id=_SUMMARY_CLAIM_ID,
         section="summary",
         field="summary",
         text="".join(sentence["text"] for sentence in sentences),
@@ -512,12 +513,30 @@ def _passes_atomic_audit(
     graph: FactGraph,
     requirements: RequirementGraph | None,
 ) -> bool:
-    """Fail closed: a compiled summary survives only if the full atomic
-    verifier still accepts the frozen resume with the summary claim added."""
+    """Fail closed on the summary itself, not on the rest of the document.
+
+    ``Audit.clean`` is document-wide: it is false when *any* claim anywhere in
+    the resume carries a violation or an ownership error.  Gating the summary
+    on it meant one blemished bullet deleted the summary of an otherwise sound
+    resume — the dominant cause of ``dropped_atomic_audit``.  The summary is
+    not responsible for defects it did not introduce, so the gate is scoped to
+    the summary claim: it survives only when the atomic verifier raises
+    nothing against it.  Every summary-applicable check still runs (unknown or
+    ineligible facts, factless claims), on top of the Phase 4 sentence
+    verifier that already bounds anchors, entities, numbers, tenure and
+    residual escapes."""
 
     from .atomic_verifier import audit_frozen_resume
 
-    return audit_frozen_resume(frozen, graph, requirements).clean
+    audit = audit_frozen_resume(frozen, graph, requirements)
+    owned = f"{_SUMMARY_CLAIM_ID}:"
+    if _SUMMARY_CLAIM_ID in audit.unsupported_claim_ids:
+        return False
+    if any(item.startswith(owned) for item in audit.violations):
+        return False
+    if any(item.startswith(owned) for item in audit.ownership_errors):
+        return False
+    return True
 
 
 def _with_summary(frozen: FrozenResume, claim: RealizedClaim) -> FrozenResume:

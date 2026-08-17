@@ -195,12 +195,56 @@ def test_excerpt_preserves_latin_word_boundaries():
 
 
 def test_english_source_uses_english_summary_prompt():
-    """D10: Latin-dominant evidence gets the English summary surface."""
+    """D10: Latin-dominant evidence gets the English summary surface.
+
+    The woven sentence may only add true glue around cited source text:
+    evaluative words (Experienced/proficient/skilled) are content, not glue,
+    and require verbatim source support like any other content word.
+    """
 
     seen = {}
 
     def summary_llm(_model, system_prompt, user_prompt, **_kwargs):
         seen["prompt"] = system_prompt
+        request = json.loads(user_prompt)
+        fact = request["evidence_facts"][0]
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "sentences": [{"text": f"{fact['source_text']}.", "fact_ids": [fact["fact_id"]]}],
+        }
+
+    def english_semantic(_model, _system, user_prompt, **_kwargs):
+        decisions = []
+        for candidate in json.loads(user_prompt)["candidates"]:
+            decisions.append({
+                "candidate_fact_id": candidate["candidate_fact_id"],
+                "classification": "fact",
+                "record_id": candidate["locked_record_id"],
+                "atoms": [{
+                    "quote": candidate["candidate_text"],
+                    "fact_type": "action",
+                    "destination_section": "experience",
+                    "destination_field": "bullet",
+                }],
+                "context_spans": [],
+            })
+        return {"schema_version": SCHEMA_VERSION, "decisions": decisions}
+
+    result = run_v3_pipeline(
+        cv_text="Data Analyst 2019 - 2023\nDelivered results using structured workflows",
+        semantic_llm_call=english_semantic,
+        realizer_llm_call=_echo_realizer,
+        summary_llm_call=summary_llm,
+    )
+    assert seen.get("prompt") and "English" in seen["prompt"]
+    assert result.resume_data.get("summary")
+
+
+def test_english_summary_rejects_unsupported_evaluative_glue():
+    """An English summary may not assert Experienced/proficiency the source
+    never states: evaluative adjectives are content words, not connectors."""
+
+    def summary_llm(_model, _system_prompt, user_prompt, **_kwargs):
         request = json.loads(user_prompt)
         fact = request["evidence_facts"][0]
         return {
@@ -231,8 +275,10 @@ def test_english_source_uses_english_summary_prompt():
         realizer_llm_call=_echo_realizer,
         summary_llm_call=summary_llm,
     )
-    assert seen.get("prompt") and "English" in seen["prompt"]
-    assert result.resume_data.get("summary")
+    assert not result.resume_data.get("summary")
+    contract = result.quality_report["model_contract"]
+    assert contract["summary_status"] == "dropped_unverifiable"
+    assert any("escape_latin:Experienced" in item for item in contract["summary_violations"])
 
 
 def test_missing_fields_summary_three_state():

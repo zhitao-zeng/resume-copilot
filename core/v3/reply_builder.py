@@ -174,13 +174,15 @@ def build_reply(
     if requirement_items:
         matches: list[str] = []
         gaps: list[str] = []
-        for item in requirement_items[:8]:
+        # Score every actionable requirement so the reported counts add up to
+        # the JD's actual total; only the displayed items are capped below.
+        for item in requirement_items:
             support = _supporting_fact(item.text, written)
             if support:
                 matches.append(f"{_excerpt(item.text, 20)}（依据：{_excerpt(support)}）")
             else:
                 gaps.append(f"{_excerpt(item.text, 20)}")
-        lines.append(f"岗位匹配：{len(matches)} 项要求找到直接事实依据，{len(gaps)} 项暂无依据（来自JD的要求仅作参考，不会补写为个人经历）。")
+        lines.append(f"岗位匹配：共 {len(requirement_items)} 项要求，{len(matches)} 项要求找到直接事实依据，{len(gaps)} 项暂无依据（来自JD的要求仅作参考，不会补写为个人经历）。")
         for match in matches[:_MAX_MATCHES]:
             lines.append(f"- 匹配：{match}")
         for gap in gaps[:_MAX_GAPS]:
@@ -219,9 +221,12 @@ def build_reply(
             "请核对原件后补充真实数值。"
         )
 
-    if audit.conflicts:
+    # Filter before slicing: taking the first three raw conflicts could pick
+    # only unmappable internal entries and render a bare "冲突检查：" header.
+    conflict_lines = friendly_conflicts(list(audit.conflicts))[:3]
+    if conflict_lines:
         lines.append("冲突检查：")
-        lines.extend(f"- {item}" for item in friendly_conflicts(list(audit.conflicts)[:3]))
+        lines.extend(f"- {item}" for item in conflict_lines)
     else:
         lines.append("冲突检查：未发现时间或信息冲突。")
     return "\n".join(lines)

@@ -199,12 +199,18 @@ _CONNECTORS = frozenset({
     "经验", "经历", "能力", "方面", "背景", "工作", "技能",
 })
 # English glue words allowed around cited facts (no content value).
+# Evaluative words are deliberately absent: "experienced/skilled/proficient/
+# familiar/strong/solid" assert a judgement about the candidate exactly as
+# _FORBIDDEN_SYNTHESIS ("资深/精通/擅长/优秀") does on the Chinese side, and
+# allowlisting them here let an English summary claim proficiency no source
+# supports.  They are not banned by a second table — removing them simply
+# means they must appear verbatim in the cited source vocabulary like any
+# other content word.
 _LATIN_CONNECTORS = frozenset({
     "a", "an", "the", "and", "or", "of", "in", "on", "at", "to", "for",
     "with", "by", "as", "is", "are", "was", "were", "be", "been", "being",
     "from", "into", "across", "over", "within", "including", "via", "per",
-    "experienced", "skilled", "proficient", "familiar", "responsible",
-    "worked", "working", "focused", "based", "related", "strong", "solid",
+    "responsible", "worked", "working", "focused", "based", "related",
 })
 _LATIN_WORD_RE = re.compile(r"[A-Za-z][A-Za-z+#.-]*")
 _CJK_RUN_RE = re.compile(r"[一-鿿]+")
