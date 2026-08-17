@@ -13,6 +13,7 @@ from __future__ import annotations
 import re
 
 _FRAGMENT_START_CHARS = "，。、；：）%>-"
+_LIST_MARKER_PREFIX = re.compile(r"^\s*(?:[•·]\s*|-\s+|\*\s+)")
 _BRACKET_PAIRS = (("（", "）"), ("(", ")"), ("【", "】"), ("「", "」"), ("《", "》"))
 _PUNCT_ALL = re.compile(r"[\s，。、；：,.;·•\-—–|｜/（）()【】「」《》\"'“”‘’<>]+")
 _LATIN_TOKEN = re.compile(r"^[A-Za-z][A-Za-z0-9+.#/_-]*$")
@@ -34,7 +35,9 @@ def bullet_defects(text: str) -> list[str]:
     if not value:
         return ["empty"]
 
-    if value[0] in _FRAGMENT_START_CHARS:
+    # A source bullet marker ("- ", "· ") is presentation, not a fragment.
+    probe = _LIST_MARKER_PREFIX.sub("", value)
+    if probe[:1] in _FRAGMENT_START_CHARS:
         defects.append("fragment_start")
 
     for left, right in _BRACKET_PAIRS:

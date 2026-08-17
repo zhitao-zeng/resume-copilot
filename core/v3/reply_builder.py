@@ -65,11 +65,30 @@ def _requirement_tokens(requirement: str) -> list[str]:
     ]
 
 
+_GENERIC_MATCH_TOKENS = {
+    "分析", "管理", "负责", "协助", "支持", "沟通", "协调", "能力", "经验",
+    "工作", "项目", "团队", "业务", "相关", "进行", "完成",
+}
+
+
 def _supporting_fact(requirement: str, fact_texts: list[str]) -> str:
+    """Return a fact with a *distinctive* token match, or '' for weak ones.
+
+    A two-character generic overlap (分析/管理) is not evidence; require a
+    Latin/skill token or a CJK token of at least 4 chars that is not a
+    generic resume word.
+    """
+
     tokens = _requirement_tokens(requirement)
+    strong = [
+        token for token in tokens
+        if re.search(r"[A-Za-z]", token) or (len(token) >= 4 and token not in _GENERIC_MATCH_TOKENS)
+    ]
+    if not strong:
+        return ""
     for fact in fact_texts:
         folded = fact.casefold()
-        if any(token in folded for token in tokens):
+        if any(token in folded for token in strong):
             return fact
     return ""
 

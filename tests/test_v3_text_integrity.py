@@ -20,6 +20,13 @@ def test_fragment_defects():
     assert "unbalanced_bracket" in bullet_defects("（公司】")
 
 
+def test_source_bullet_markers_are_not_fragments():
+    # "- "/"· " 是源文的项目符号，是排版不是碎片（否则正常 bullet 被误判）
+    assert bullet_defects("- 负责订单系统重构") == []
+    assert bullet_defects("· 搭建数据仓库") == []
+    assert bullet_defects("- Delivered results using structured workflows") == []
+
+
 def test_high_frequency_normal_sentences_never_killed():
     # 否决项：这三条是中文简历最高频的正常表达，误杀一条即不通过。
     assert bullet_defects("负责项目全流程管理与交付") == []

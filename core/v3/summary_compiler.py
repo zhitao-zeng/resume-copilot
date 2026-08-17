@@ -35,6 +35,19 @@ from .training_schema import SCHEMA_VERSION, SchemaVersion
 
 _SUMMARY_TELEMETRY = logging.getLogger("v3.summary_telemetry")
 
+SUMMARY_SYSTEM_PROMPT_EN = """You are the summary stage of a resume evidence compiler. Return the specified JSON Schema strictly.
+schema_version must be resume_compiler_v3.4.
+Task: write one profile summary of at most 100 words (English), at most 3 sentences.
+Hard rules:
+1. Every sentence lists the fact_ids supporting it; use only supplied facts.
+2. Never compute or infer tenure: a duration phrase is allowed only if a fact states it verbatim.
+3. No positioning/seniority/ability adjectives (senior, expert, excellent) unless a fact states them.
+4. No superlatives or comparatives (best, first, only) unless a fact states them.
+5. Do not concatenate timelines, company names or role labels; never invent or rewrite organizations, roles, dates, numbers, degrees or credentials.
+6. Prefer JD-supported capability evidence when a JD is provided; without a JD, summarize only established scope and strengths.
+7. When unsure, write less: an unsupported word is worse than a missing sentence."""
+
+
 SUMMARY_SYSTEM_PROMPT = """你是简历证据编译器的个人总结阶段。严格返回指定 JSON Schema。
 schema_version 必须是 resume_compiler_v3.4。
 任务：基于给定事实写一段不超过 100 字的个人总结（中文），最多 3 句。
@@ -427,10 +440,17 @@ def compile_summary(
         ],
     }
     started = time.perf_counter()
+    # D10: an English source cannot yield a Chinese summary without
+    # translation, which the verifier forbids.  Latin-dominant evidence gets
+    # the English prompt so the summary can be verbatim-woven English.
+    evidence_blob = "".join(fact.text for fact in allowed.values())
+    latin_chars = sum(1 for ch in evidence_blob if ch.isascii() and ch.isalpha())
+    cjk_chars = sum(1 for ch in evidence_blob if "一" <= ch <= "鿿")
+    english_surface = latin_chars > cjk_chars
     try:
         raw = llm_call(
             ProfileSummaryResponse,
-            SUMMARY_SYSTEM_PROMPT,
+            SUMMARY_SYSTEM_PROMPT_EN if english_surface else SUMMARY_SYSTEM_PROMPT,
             json.dumps(payload, ensure_ascii=False),
             temperature=0.1,
             max_tokens=max(512, int(os.getenv("V3_SUMMARY_MAX_TOKENS", "1024"))),

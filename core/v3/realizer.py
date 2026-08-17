@@ -198,6 +198,14 @@ _CONNECTORS = frozenset({
     # Framing nouns carry no entity/number/claim content of their own.
     "经验", "经历", "能力", "方面", "背景", "工作", "技能",
 })
+# English glue words allowed around cited facts (no content value).
+_LATIN_CONNECTORS = frozenset({
+    "a", "an", "the", "and", "or", "of", "in", "on", "at", "to", "for",
+    "with", "by", "as", "is", "are", "was", "were", "be", "been", "being",
+    "from", "into", "across", "over", "within", "including", "via", "per",
+    "experienced", "skilled", "proficient", "familiar", "responsible",
+    "worked", "working", "focused", "based", "related", "strong", "solid",
+})
 _LATIN_WORD_RE = re.compile(r"[A-Za-z][A-Za-z+#.-]*")
 _CJK_RUN_RE = re.compile(r"[一-鿿]+")
 _PUNCT_ONLY_RE = re.compile(r"^[\s，。、；：,.;·•\-—–|｜/（）()【】「」《》\"'“”‘’]+$")
@@ -226,6 +234,8 @@ def _residual_escape_violations(
         for connector in _CONNECTORS:
             probe = probe.replace(connector, " ")
         for word in _LATIN_WORD_RE.findall(probe):
+            if word.casefold() in _LATIN_CONNECTORS:
+                continue
             if word.casefold() not in vocabulary.casefold():
                 violations.append(f"escape_latin:{word}")
         for run in _CJK_RUN_RE.findall(probe):
