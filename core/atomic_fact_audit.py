@@ -44,6 +44,12 @@ _METRIC_ANCHOR = re.compile(
 _LIST_MARKER = re.compile(
     r"^\s*(?:\(?\d{1,2}[.、．)）]|[一二三四五六七八九十]{1,3}[、.．)）])\s*"
 )
+# A benign key label ("Career Level:", "成绩/平均绩点: ") is presentational
+# framing stripped from the source ledger; the value after it must still be
+# fully source-supported with every anchor matched.
+_LEADING_KEY_LABEL = re.compile(
+    r"^\s*[A-Za-z][A-Za-z ]{1,28}[：:]\s+|^\s*[一-鿿/]{2,12}[：:]\s*"
+)
 _SUMMARY_DIRECTION = re.compile(
     r"^(?:求职|应聘|职业|目标)(?:方向|岗位|目标)|^希望(?:应聘|求职)",
     re.IGNORECASE,
@@ -317,7 +323,7 @@ def _claim_match_text(claim: AtomicClaim) -> str:
         )
         if section_wrapper:
             text = section_wrapper.group(1).strip()
-    text = re.sub(r"^(?:拥有|曾任)\s*", "", text, count=1).strip()
+    text = re.sub(r"^(?:拥有|曾任|具备|持有|熟悉|擅长)\s*", "", text, count=1).strip()
     contextual = re.fullmatch(r"在(.+?)担任(.+?)期间", text)
     if contextual:
         text = "".join(contextual.groups()).strip()
@@ -460,6 +466,18 @@ def _match_atom(
     source_value = _normalize(source_text)
     atom_value = _normalize(match_text)
     unmatched = _unmatched_anchors(match_text, source_text)
+    if unmatched:
+        # The source ledger strips key-value labels from facts, so a claim
+        # that preserves the full source line ("Career Level: Junior")
+        # would otherwise report the label tokens as new hard anchors.
+        # Retry with the benign label removed; the value still requires
+        # every anchor to match.
+        stripped = _LEADING_KEY_LABEL.sub("", match_text, count=1)
+        if stripped and stripped != match_text:
+            unmatched = _unmatched_anchors(stripped, source_text)
+            if not unmatched:
+                match_text = stripped
+                atom_value = _normalize(match_text)
     if unmatched:
         return AtomicMatch(
             "unsupported", (), 0.0, "new_hard_anchor", unmatched,
