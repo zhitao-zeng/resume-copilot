@@ -16,7 +16,9 @@ from PIL import Image, ImageStat
 ROOT = Path(__file__).resolve().parent
 EXPECTED = {
     "holdout_v2": {"cases": 60, "per_scenario": 15},
-    "shadow_v3": {"cases": 24, "per_scenario": 6},
+    # After the R27 retirement/promotion the reserve is intentionally uneven:
+    # 4/3/5/6 per scenario.  Uniformity is only required for the holdout.
+    "shadow_v3": {"cases": 18, "per_scenario": None},
 }
 
 
@@ -112,7 +114,8 @@ def main() -> None:
         assert {case["id"] for case in cases} == {item["case_id"] for item in annotations}
         annotation_by_id = {item["case_id"]: item for item in annotations}
         counts = Counter(case["scenario"] for case in cases)
-        assert counts == Counter({f"scenario{i}": expected["per_scenario"] for i in range(1, 5)})
+        if expected["per_scenario"] is not None:
+            assert counts == Counter({f"scenario{i}": expected["per_scenario"] for i in range(1, 5)})
 
         for case in cases:
             for key in ("cv_path", "target_jd_file_path", "cv_template_path"):
