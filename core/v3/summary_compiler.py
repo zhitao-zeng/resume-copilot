@@ -284,6 +284,41 @@ def _without_summary(frozen: FrozenResume) -> FrozenResume:
     )
 
 
+def _relocate_to_additional(frozen: FrozenResume, claims: list[RealizedClaim]) -> FrozenResume:
+    """Keep source-exact deterministic claims as additional-section entries.
+
+    A dropped summary claim must not annihilate the underlying facts: the
+    text is verbatim source, only the summary framing failed verification.
+    """
+
+    if not claims:
+        return frozen
+    sections: dict[str, list[RealizedClaim]] = {
+        section: list(items) for section, items in frozen.sections.items()
+    }
+    relocated: list[RealizedClaim] = []
+    for claim in claims:
+        relocated.append(RealizedClaim(
+            claim_id=f"additional/{claim.claim_id}",
+            section="additional",
+            field=claim.field,
+            text=claim.text,
+            fact_ids=claim.fact_ids,
+            record_id=claim.record_id,
+            anchors=claim.anchors,
+            atomic=claim.atomic,
+            generated=claim.generated,
+            group_id=claim.group_id,
+        ))
+    sections.setdefault("additional", []).extend(relocated)
+    return FrozenResume(
+        sections=sections,
+        claims=[item for values in sections.values() for item in values],
+        skeleton=frozen.skeleton,
+        template_mode=frozen.template_mode,
+    )
+
+
 def compile_summary(
     frozen: FrozenResume,
     graph: FactGraph,
@@ -297,11 +332,19 @@ def compile_summary(
 
     base = _without_summary(frozen)
     existing = [claim for claim in frozen.claims if claim.section == "summary"]
+    # Deterministic summary-section claims carry verbatim source text; only
+    # their summary framing is unverifiable.  Relocate them to the additional
+    # section so the underlying facts survive, then verify the generative
+    # candidates under Phase 4 rules.
+    relocated = [claim for claim in existing if claim.group_id != "summary:profile"]
+    if relocated:
+        base = _relocate_to_additional(base, relocated)
+    generative = [claim for claim in existing if claim.group_id == "summary:profile"]
     # Stage 1: re-verify whatever the realizer produced under Phase 4 rules.
-    if existing:
+    if generative:
         candidates = [
             {"text": claim.text, "fact_ids": list(claim.fact_ids)}
-            for claim in existing
+            for claim in generative
         ]
         verified, violations = validate_summary_sentences(candidates, graph)
         if verified:
