@@ -50,11 +50,17 @@ def test_valid_bound_sentence_passes():
     result = _graph_with_sentences()
     fid = _fact_ids(result)[0]
     text = result.output.graph.fact_map()[fid].text
+    # 完整成句（终止标点）的绑定句通过；裸记录头不是合法总结句。
+    verified, violations = validate_summary_sentences(
+        [{"text": f"曾{text}。", "fact_ids": [fid]}], result.output.graph,
+    )
+    assert violations == [], violations
+    assert verified == [{"text": f"曾{text}。", "fact_ids": [fid]}]
     verified, violations = validate_summary_sentences(
         [{"text": text, "fact_ids": [fid]}], result.output.graph,
     )
-    assert verified == [{"text": text, "fact_ids": [fid]}]
-    assert violations == []
+    assert verified == []
+    assert any("incomplete_ending" in v for v in violations)
 
 
 def test_computed_tenure_rejected_unless_stated():
@@ -206,7 +212,7 @@ def _summary_llm(sentences):
 def test_pipeline_generates_verified_summary():
     def sentences(request):
         fact = request["evidence_facts"][0]
-        return [{"text": f"曾{fact['source_text']}", "fact_ids": [fact["fact_id"]]}]
+        return [{"text": f"曾{fact['source_text']}。", "fact_ids": [fact["fact_id"]]}]
 
     result = run_v3_pipeline(
         cv_text=CV_TWO_RECORDS,

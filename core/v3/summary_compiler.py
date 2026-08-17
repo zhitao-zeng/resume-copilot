@@ -210,6 +210,10 @@ def validate_summary_sentences(
             sentence_violations.append(f"{label}:timeline_concatenation")
         if _LEADING_FRAGMENT_RE.match(text):
             sentence_violations.append(f"{label}:leading_fragment")
+        # A summary sentence must read as a complete clause: it must not end
+        # mid-word where OCR or a slice cut it off.
+        if text and text[-1] not in "。！？；.!?":
+            sentence_violations.append(f"{label}:incomplete_ending")
         # A bare organization/role/period token is a label, not a summary
         # sentence; sequences of them concatenate into a timeline salad.
         normalized_text = re.sub(r"[。\s；;]+$", "", text)
@@ -259,10 +263,10 @@ def _summary_claim(sentences: list[dict[str, Any]], graph: FactGraph) -> Realize
 
 
 def _without_summary(frozen: FrozenResume) -> FrozenResume:
-    claims = [
-        claim for claim in frozen.claims
-        if not (claim.section == "summary" and claim.field == "summary")
-    ]
+    # The whole summary section is the compiler's surface — deterministic
+    # claims with field=item/bullet (misrouted headers included) must pass
+    # the same verification, not just summary:profile claims.
+    claims = [claim for claim in frozen.claims if claim.section != "summary"]
     sections: dict[str, list[RealizedClaim]] = {}
     for claim in claims:
         sections.setdefault(claim.section, []).append(claim)
@@ -286,10 +290,7 @@ def compile_summary(
     """Verify an existing summary or generate a verified one (fail closed)."""
 
     base = _without_summary(frozen)
-    existing = [
-        claim for claim in frozen.claims
-        if claim.section == "summary" and claim.field == "summary"
-    ]
+    existing = [claim for claim in frozen.claims if claim.section == "summary"]
     # Stage 1: re-verify whatever the realizer produced under Phase 4 rules.
     if existing:
         candidates = [
