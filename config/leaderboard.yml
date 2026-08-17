@@ -1,4 +1,4 @@
-# 最新平台提交配置：PP-StructureV3 GPU 主路径。
+# 最新平台提交配置：R25/R26 上线候选（PP-StructureV3 GPU 主路径）。
 # 与仓库根目录 leaderboard.yml 保持一致；自动测试会阻止两者漂移。
 inferenceVolumeMounts:
   - name: model
@@ -8,4 +8,4 @@ inferenceVolumeMounts:
 
 inferenceImage:
   repository: "harbor-contest.4pd.io/zengzhitao/resume-copilot"
-  tag: "1d7fb06-ppstructure-gpu-primary"
+  tag: "7a958ac-launch-r26"
