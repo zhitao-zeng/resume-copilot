@@ -210,6 +210,19 @@ def validate_summary_sentences(
             sentence_violations.append(f"{label}:timeline_concatenation")
         if _LEADING_FRAGMENT_RE.match(text):
             sentence_violations.append(f"{label}:leading_fragment")
+        # A bare organization/role/period token is a label, not a summary
+        # sentence; sequences of them concatenate into a timeline salad.
+        normalized_text = re.sub(r"[。\s；;]+$", "", text)
+        if _RANGE_PAIR_RE.fullmatch(normalized_text) or _TENURE_RE.fullmatch(normalized_text):
+            sentence_violations.append(f"{label}:bare_label_sentence")
+        else:
+            for other in graph.eligible_facts():
+                if (
+                    other.fact_type in {"organization", "role", "credential", "period"}
+                    and other.text.strip() == normalized_text
+                ):
+                    sentence_violations.append(f"{label}:bare_label_sentence")
+                    break
         total_chars += _compact_len(text)
         if sentence_violations:
             violations.extend(sentence_violations)
