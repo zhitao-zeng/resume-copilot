@@ -40,7 +40,7 @@ from .contracts import (
     RealizerResponse,
     V3Model,
 )
-from .realizer import _join_facts, _placeholder, realize_plan, validate_realizer_response
+from .realizer import _join_facts, _placeholder, merge_fragment_claims, realize_plan, validate_realizer_response
 from .realizer_llm import RealizationReport, RealizationResult, _minimum_remaining_seconds
 from .training_schema import RealizerClaimDecision, SCHEMA_VERSION, SchemaVersion
 from pydantic import Field
@@ -305,6 +305,8 @@ def _deterministic_unit_claims(
                 generated=len(bucket) > 1,
                 group_id=group.group_id,
             ))
+    # R25: join OCR soft-wrapped fragments within this unit before returning.
+    claims = merge_fragment_claims(claims, graph)
     return claims
 
 

@@ -551,6 +551,54 @@ def test_large_resume_single_source_units_skip_llm(monkeypatch):
     assert result.quality_report["atomic_factuality"]["recall"] == 1.0
 
 
+def test_atom_boundary_rewording_is_rejected_unit_locally():
+    """Rewording around a cited atom (using -> through) must fall back."""
+
+    def rewording_realizer(_model, _system, user_prompt, **_kwargs):
+        request = json.loads(user_prompt)
+        units = []
+        for unit in request["units"]:
+            claims = []
+            for group in unit["groups"]:
+                for index, fact in enumerate(group["facts"]):
+                    text = fact["source_text"]
+                    if "重构" in text:
+                        # 把引用原子外的文字换成近义改写：负责 -> 主导推动落地
+                        text = "主导推动落地" + text.replace("负责", "", 1) + "（跨团队协作）"
+                    claims.append({
+                        "claim_id": f"claim:{index}",
+                        "section": fact["destination_section"],
+                        "field": fact["destination_field"],
+                        "text": text,
+                        "fact_ids": [fact["fact_id"]],
+                        "record_id": fact["record_id"],
+                        "group_id": group["group_id"],
+                    })
+            units.append({"unit_id": unit["unit_id"], "claims": claims})
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "request_fact_ids": request["request_fact_ids"],
+            "units": units,
+        }
+
+    result = run_v3_pipeline(
+        cv_text=CV_TWO_RECORDS,
+        semantic_llm_call=_echo_semantic,
+        realizer_llm_call=rewording_realizer,
+    )
+
+    reports = _unit_reports(result)
+    escaped = [
+        report for report in reports.values()
+        if any("escape_cjk" in violation for violation in report["violations"])
+    ]
+    assert escaped, "residual rewording must be flagged as atom-boundary escape"
+    assert escaped[0]["status"] == "deterministic_fallback"
+    rendered = json.dumps(result.resume_data, ensure_ascii=False)
+    assert "主导推动落地" not in rendered
+    assert result.quality_report["atomic_factuality"]["recall"] == 1.0
+
+
 def test_labeled_value_claim_is_accepted():
     def labeled_realizer(_model, _system, user_prompt, **_kwargs):
         request = json.loads(user_prompt)

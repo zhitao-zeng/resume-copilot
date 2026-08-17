@@ -130,6 +130,12 @@ def realize_plan(plan: ResumePlan, fact_graph: FactGraph) -> FrozenResume:
     # atoms expose multiple fields.  Canonicalize the flat claim order to the
     # section mapping instead of weakening FrozenResume's consistency check.
     ordered_claims = [claim for values in sections.values() for claim in values]
+    # R25: join OCR soft-wrapped fragments back into whole sentences before
+    # freezing (exact source text, no content change).
+    ordered_claims = merge_fragment_claims(ordered_claims, fact_graph)
+    sections = {}
+    for claim in ordered_claims:
+        sections.setdefault(claim.section, []).append(claim)
     return FrozenResume(
         sections=sections,
         claims=ordered_claims,
@@ -180,6 +186,141 @@ def validate_realized_claims(frozen: FrozenResume, fact_graph: FactGraph) -> lis
 
 
 _NUMBER_RE = re.compile(r"(?<![A-Za-z])(?:\d+(?:\.\d+)?%?|\d{4}[./年-]\d{1,2})(?![A-Za-z])")
+
+# Connective-only residual allowlist: anything a claim adds around cited
+# facts must be punctuation or one of these connectors; every other token
+# must appear verbatim in the unit's source-line vocabulary (R25).
+_CONNECTORS = frozenset({
+    "的", "了", "和", "与", "及", "或", "并", "并且", "且", "而", "在", "为",
+    "于", "以", "向", "从", "把", "将", "对", "通过", "根据", "围绕", "等",
+    "以及", "同时", "期间", "其中", "相关", "负责", "参与", "协助", "支持",
+    "完成", "实现", "进行", "担任", "兼任", "包括", "含", "主要", "具备", "拥有",
+})
+_LATIN_WORD_RE = re.compile(r"[A-Za-z][A-Za-z+#.-]*")
+_CJK_RUN_RE = re.compile(r"[一-鿿]+")
+_PUNCT_ONLY_RE = re.compile(r"^[\s，。、；：,.;·•\-—–|｜/（）()【】「」《》\"'“”‘’]+$")
+
+
+def _residual_escape_violations(
+    claim_text: str,
+    cited_texts: list[str],
+    vocabulary: str,
+) -> list[str]:
+    """Residual text after removing cited facts must be connective only.
+
+    The vocabulary is the exact source-line text of the cited facts and
+    their base facts; any content token outside it is an atom-boundary
+    escape (e.g. rewriting ``using`` as ``through`` around a quoted atom).
+    """
+
+    residual = claim_text
+    for cited in sorted(cited_texts, key=len, reverse=True):
+        residual = residual.replace(cited, "\x00", 1)
+    violations: list[str] = []
+    for segment in residual.split("\x00"):
+        if not segment or _PUNCT_ONLY_RE.match(segment):
+            continue
+        probe = segment
+        for connector in _CONNECTORS:
+            probe = probe.replace(connector, " ")
+        for word in _LATIN_WORD_RE.findall(probe):
+            if word.casefold() not in vocabulary.casefold():
+                violations.append(f"escape_latin:{word}")
+        for run in _CJK_RUN_RE.findall(probe):
+            if len(run) <= 1:
+                continue
+            if run not in vocabulary:
+                violations.append(f"escape_cjk:{run[:12]}")
+    return violations
+
+_TERMINAL_PUNCT = "。！？；.!?;:：）)】」』”"
+_ITEM_START = re.compile(r"^\s*(?:[A-Z0-9]|[•·\-*▪◦]|（?\d+[）.)])")
+_LABEL_START = re.compile(r"^[^：:\n]{1,15}[：:]")
+_DATE_RANGE = re.compile(r"\d{4}\s*[年./-]")
+
+
+def _claims_are_soft_wrapped(left: "RealizedClaim", right: "RealizedClaim", fact_graph: FactGraph) -> bool:
+    """True when right is an OCR soft-wrap continuation of left.
+
+    Structural rule (no NLP guessing): both claims sit on adjacent source
+    lines separated by a single newline, the left text has no sentence-final
+    punctuation and is not a record header, and the right does not open a
+    new item or label.  Joining restores the original sentence; the merged
+    text is the exact source slice with the wrap newline removed, so every
+    fact stays a literal substring and the hard verifiers still pass.
+    """
+
+    fact_map = fact_graph.fact_map()
+    left_spans = [span for fid in left.fact_ids if fid in fact_map for span in fact_map[fid].spans]
+    right_spans = [span for fid in right.fact_ids if fid in fact_map for span in fact_map[fid].spans]
+    if not left_spans or not right_spans:
+        return False
+    # Never merge across records or plan groups: ownership stays exact.
+    if left.record_id != right.record_id or left.group_id != right.group_id:
+        return False
+    source_ids = {span.source_id for span in left_spans + right_spans}
+    if len(source_ids) != 1:
+        return False
+    source_id = next(iter(source_ids))
+    document = fact_graph.documents.get(source_id, "")
+    left_end = max(span.char_end for span in left_spans)
+    right_start = min(span.char_start for span in right_spans)
+    if right_start < left_end:
+        return False
+    gap = document[left_end:right_start]
+    if gap not in {"\n", "\r\n"}:
+        return False
+    left_text = left.text.rstrip()
+    right_text = right.text.lstrip()
+    if not left_text or not right_text:
+        return False
+    if left_text[-1] in _TERMINAL_PUNCT:
+        return False
+    # A dated record header is complete on its own line; never merge content
+    # up into it, and never merge a new header down into a fragment.
+    if _DATE_RANGE.search(left_text) or _DATE_RANGE.search(right_text):
+        return False
+    if _ITEM_START.match(right_text) or _LABEL_START.match(right_text):
+        return False
+    return True
+
+
+def merge_fragment_claims(claims: list["RealizedClaim"], fact_graph: FactGraph) -> list["RealizedClaim"]:
+    """Join OCR soft-wrapped adjacent claims back into whole sentences.
+
+    Only merges claims that are line-adjacent fragments of the same source
+    sentence (``_claims_are_soft_wrapped``); everything else is untouched.
+    Merged claims cite the union of fact IDs in order and keep the left
+    claim's section/field/record/group, so ownership and destination checks
+    are unaffected.
+    """
+
+    merged: list[RealizedClaim] = []
+    merged_last = False
+    for claim in claims:
+        # No chain merges: a claim produced by a join is never the left side
+        # of another join, so a fully-punctuated next line can never be
+        # absorbed by accident.
+        if merged and not merged_last and _claims_are_soft_wrapped(merged[-1], claim, fact_graph):
+            left = merged[-1]
+            text = left.text.rstrip() + claim.text.lstrip()
+            merged[-1] = RealizedClaim(
+                claim_id=left.claim_id,
+                section=left.section,
+                field=left.field,
+                text=text,
+                fact_ids=[*left.fact_ids, *claim.fact_ids],
+                record_id=left.record_id,
+                anchors=[*left.anchors, *claim.anchors],
+                atomic=False,
+                generated=True,
+                group_id=left.group_id,
+            )
+            merged_last = True
+            continue
+        merged.append(claim)
+        merged_last = False
+    return merged
 
 
 def validate_realizer_response(
@@ -277,7 +418,45 @@ def validate_realizer_response(
         violations.append(f"missing_requested_fact:{fact_id}")
     for fact_id in sorted({fact_id for fact_id in used if used_fact_ids.count(fact_id) > 1}):
         violations.append(f"duplicate_requested_fact:{fact_id}")
+    # Atom-boundary escape check: connective tissue around cited facts must
+    # come from punctuation, the connector allowlist, or the exact
+    # source-line vocabulary of the cited facts and their base facts.
+    for claim in response.claims:
+        summary_citation = (
+            claim.section == "summary"
+            and claim.field == "summary"
+            and claim.group_id == "summary:profile"
+        )
+        if summary_citation or not claim.fact_ids:
+            continue
+        cited_facts = [
+            fact_map[fact_id] for fact_id in claim.fact_ids
+            if fact_id in fact_map and fact_id in requested
+        ]
+        if not cited_facts:
+            continue
+        vocabulary_parts: list[str] = []
+        for fact in cited_facts:
+            vocabulary_parts.append(fact.text)
+            base = fact_map.get(fact.base_fact_id or "")
+            if base is not None:
+                vocabulary_parts.append(base.text)
+            else:
+                # The base transport fact may be replaced by its atoms and
+                # structural context facts; include every sibling derived
+                # from the same source line (label prefixes live there).
+                vocabulary_parts.extend(
+                    sibling.text
+                    for sibling in fact_graph.facts
+                    if sibling.base_fact_id == (fact.base_fact_id or fact.fact_id)
+                )
+        for violation in _residual_escape_violations(
+            claim.text,
+            [fact.text for fact in cited_facts],
+            "\n".join(vocabulary_parts),
+        ):
+            violations.append(f"{claim.claim_id}:{violation}")
     return violations
 
 
-__all__ = ["RealizerRequest", "realize_plan", "validate_realized_claims", "validate_realizer_response"]
+__all__ = ["RealizerRequest", "merge_fragment_claims", "realize_plan", "validate_realized_claims", "validate_realizer_response"]

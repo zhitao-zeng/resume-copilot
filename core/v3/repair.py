@@ -24,7 +24,7 @@ def minimal_repair(frozen: FrozenResume, audit: Audit, fact_graph: FactGraph) ->
         if supported_ids:
             facts = [fact_map[fact_id] for fact_id in supported_ids]
             repaired.append(claim.model_copy(update={
-                "text": _join_facts([fact.text for fact in facts]),
+                "text": _join_facts(facts, fact_graph),
                 "fact_ids": supported_ids,
                 "anchors": [anchor for fact in facts for anchor in fact.anchors],
                 "generated": len(facts) > 1,
