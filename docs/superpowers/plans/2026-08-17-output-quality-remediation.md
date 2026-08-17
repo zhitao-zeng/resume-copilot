@@ -38,10 +38,10 @@ HV2-S1-009  HV2-S1-012  HV2-S2-008  HV2-S2-010  HV2-S2-012  HV2-S3-009
 - 修改：`validation_sets/public_resume_holdout/split_manifest.json`
 - 修改：`tests/fixtures/`（新增回归夹具）
 
-- [ ] **步骤 1：** 将上述 6 个 case 的输入与期望迁入常规回归套件（`tests/fixtures/`），作为本计划各任务的验证夹具。
-- [ ] **步骤 2：** 从 `shadow_v3`（24 例储备）中补入 6 例，保持 `holdout_v2` 仍为 60 例、四场景各 15 例。
-- [ ] **步骤 3：** 确认补入后 resume root 与 JD root 在两个 split 间仍然不相交（`verify.py` 会检查）。
-- [ ] **步骤 4：** 运行 `.venv/bin/python validation_sets/public_resume_holdout/verify.py`，确认 `verification_report.json` 通过。
+- [x] **步骤 1：** 将上述 6 个 case 的输入与期望迁入常规回归套件（`tests/fixtures/`），作为本计划各任务的验证夹具。
+- [x] **步骤 2：** 从 `shadow_v3`（24 例储备）中补入 6 例，保持 `holdout_v2` 仍为 60 例、四场景各 15 例。
+- [x] **步骤 3：** 确认补入后 resume root 与 JD root 在两个 split 间仍然不相交（`verify.py` 会检查）。
+- [x] **步骤 4：** 运行 `.venv/bin/python validation_sets/public_resume_holdout/verify.py`，确认 `verification_report.json` 通过。
 
 **验收：** `holdout_v2` 仍为 60 例；被检查过的 6 例已不在 holdout 内；`verify.py` 通过。
 
@@ -66,7 +66,7 @@ HV2-S1-009  HV2-S1-012  HV2-S2-008  HV2-S2-010  HV2-S2-012  HV2-S3-009
 - 修改：`core/v3/pipeline.py:134`（`_missing_fields` 签名与实现）
 - 修改：`core/v3/pipeline.py:258`（调用处传入降级信息）
 
-- [ ] **步骤 1：新增 `additional_sections` 文本聚合助手**
+- [x] **步骤 1：新增 `additional_sections` 文本聚合助手**
 
 ```python
 def _additional_blob(resume_data: dict[str, Any]) -> str:
@@ -81,7 +81,7 @@ def _additional_blob(resume_data: dict[str, Any]) -> str:
     return "\n".join(parts)
 ```
 
-- [ ] **步骤 2：扩展 `_missing_fields` 签名，接收降级状态**
+- [x] **步骤 2：扩展 `_missing_fields` 签名，接收降级状态**
 
 ```python
 def _missing_fields(
@@ -93,7 +93,7 @@ def _missing_fields(
 
 `degraded` 形如 `{"summary": "dropped_unverifiable"}`，由调用方从 `summary_result.report` 传入。
 
-- [ ] **步骤 3：引入第二种缺失来源 `not_rendered`**
+- [x] **步骤 3：引入第二种缺失来源 `not_rendered`**
 
 判定顺序改为三态，而非二态：
 
@@ -106,7 +106,7 @@ def _missing_fields(
 - `summary`：`degraded.get("summary")` 非空 → `not_rendered`；否则若 `_additional_blob` 非空 → `not_rendered`；否则 `not_provided`。
 - `education`：`additional_sections` 含 `教育补充信息` → `not_rendered`。
 
-- [ ] **步骤 4：更新调用处** `core/v3/pipeline.py:258`
+- [x] **步骤 4：更新调用处** `core/v3/pipeline.py:258`
 
 ```python
 missing = _missing_fields(
@@ -119,7 +119,7 @@ missing = _missing_fields(
 
 注意 `_missing_fields` 当前在 `summary_result` 之前调用，需将其**移到 `summary_result` 计算之后**（`compile_summary` 调用之后、`build_reply` 之前）。`build_reply` 已经接收 `missing_fields=missing`，顺序调整后仍然成立。
 
-- [ ] **步骤 5：新增测试** `tests/test_v3_summary_reply.py`
+- [x] **步骤 5：新增测试** `tests/test_v3_summary_reply.py`
   - 构造 `resume_data` 含 `additional_sections["教育补充信息"]` 且顶层 `education` 为空 → 断言 `source == "not_rendered"`，且 reason 不含「未提供」。
   - 构造 `summary` 为空且 `degraded={"summary": "dropped_unverifiable"}` → 断言 `source == "not_rendered"`。
   - 构造真正空白输入 → 断言仍为 `not_provided`（防回归）。
@@ -155,7 +155,7 @@ missing = _missing_fields(
 **文件：**
 - 修改：`core/v3/summary_compiler.py:236`
 
-- [ ] **步骤 1：将累加移到 `verified.append` 之前一行**
+- [x] **步骤 1：将累加移到 `verified.append` 之前一行**
 
 ```python
         if sentence_violations:
@@ -165,7 +165,7 @@ missing = _missing_fields(
         verified.append({"text": text, "fact_ids": fact_ids})
 ```
 
-- [ ] **步骤 2：新增测试** `tests/test_v3_summary_reply.py`
+- [x] **步骤 2：新增测试** `tests/test_v3_summary_reply.py`
   - 构造 3 个候选句：其中 2 句触发 `escape_cjk` 被拒（合计 >100 字），1 句合法且 <100 字。
   - 断言结果**保留该合法句**，且 `summary_empty_after_length_repair` **不出现**在 violations 中。
   - 补一个真正超长用例（全部合法但合计 >100 字）→ 断言仍按尾部丢弃、非空。
@@ -181,7 +181,7 @@ missing = _missing_fields(
 **文件：**
 - 修改：`core/v3/resume_adapter.py:257-268`
 
-- [ ] **步骤 1：定义套话模式常量**
+- [x] **步骤 1：定义套话模式常量**
 
 ```python
 _BOILERPLATE_PATTERNS = (
@@ -198,17 +198,17 @@ _BOILERPLATE_PATTERNS = (
 **此表冻结，不得增补。** 若将来出现新套话需要加词条，那正是本方案不成立的证据，
 应当**移除该表**（保留原文，D14 属化妆品级收益），而不是把表养大。
 
-- [ ] **步骤 2：把 `教育补充信息` 中的资质条目改投 `certifications`**
+- [x] **步骤 2：把 `教育补充信息` 中的资质条目改投 `certifications`**
 
 `HV2-S1-012` 的 `教育补充信息` 实为 5 条证书（`国际投资认证`、`资本市场文凭`、`已通过CFA—级考试`、`认证财务管理分析师`、`执业市场分析师`）。判定依据用**已有的 fact_type**（`credential`），不要引入行业词典或关键词表——这违反架构文档「Classification is section/structure based and does not contain a technology or industry dictionary」。
 
 若对应 fact 的 `fact_type == "credential"`，写入 `data["certifications"]`（沿用 `flat_targets` 已有去重逻辑），不再进 `教育补充信息`。
 
-- [ ] **步骤 3：`补充经历` 更名为 `补充信息`**
+- [x] **步骤 3：`补充经历` 更名为 `补充信息`**
 
 现标题「补充经历」把兴趣爱好、总结片段都描述成「经历」，是语义错误。改为中性的「补充信息」。
 
-- [ ] **步骤 4：新增测试** `tests/test_v3_compiler.py`
+- [x] **步骤 4：新增测试** `tests/test_v3_compiler.py`
   - 套话条目 → 断言不出现在任何 section。
   - `fact_type == "credential"` 的条目 → 断言进入 `certifications` 而非 `教育补充信息`。
   - 普通补充条目 → 断言进入 `补充信息`。
@@ -233,7 +233,7 @@ _BOILERPLATE_PATTERNS = (
 > **计划修订 2026-08-17：** 本任务初版要求建一张 `_METADATA_LABELS` 标签表。该方案已作废，
 > 原因见下。不要实现它。
 
-- [ ] **步骤 1：用已有的归属模型判定，不要引入标签表**
+- [x] **步骤 1：用已有的归属模型判定，不要引入标签表**
 
 **不要写 `_METADATA_LABELS`。** `Years of Experience` / `Career Level` / `Industry` /
 `Professional Direction` 这四个标签不是通用词汇，是 `candidate-matching-synthetic`
@@ -246,12 +246,12 @@ _BOILERPLATE_PATTERNS = (
 
 判定：`section == "experience"` 且 `record_id` 为空的 claim，不得写入 `experience`。
 
-- [ ] **步骤 2：降级而非丢弃**
+- [x] **步骤 2：降级而非丢弃**
 
 值本身（`Junior`、`Healthcare`）是合法事实，不能丢。未绑定记录的 claim 从 `experience`
 移出，保留在 `补充信息`。
 
-- [ ] **步骤 3：新增测试** `tests/test_v3_compiler.py`
+- [x] **步骤 3：新增测试** `tests/test_v3_compiler.py`
   - 构造 `record_id=None` 的 claim → 断言 `experience` 中不含它。
   - 构造 `record_id` 非空的正常经历 claim → 断言**仍在** `experience`（防止过度过滤）。
   - 断言值 `Healthcare` 未从产出中整体消失。
@@ -282,7 +282,7 @@ _BOILERPLATE_PATTERNS = (
 - 修改：`core/v3/realizer_records.py`（每单元校验处调用）
 - 新增：`tests/test_v3_text_integrity.py`
 
-- [ ] **步骤 1：实现纯函数 `bullet_defects(text: str) -> list[str]`**
+- [x] **步骤 1：实现纯函数 `bullet_defects(text: str) -> list[str]`**
 
 不做任何 IO、不调模型。返回缺陷标签列表，空列表表示通过。
 
@@ -303,7 +303,7 @@ def bullet_defects(text: str) -> list[str]:
 | `unbalanced_bracket` | `（`/`）`、`(`/`)`、`【`/`】` 计数不等，或类型交叉（如 `（…】`） |
 | `bare_fragment` | 去除标点后长度 < 6 **且** 不以终结标点结尾 |
 
-- [ ] **步骤 2：在 realizer 每单元校验中接入**
+- [x] **步骤 2：在 realizer 每单元校验中接入**
 
 `core/v3/realizer_records.py` 的 per-unit 硬校验已存在（失败时回落记录级源句）。将 `bullet_defects` 并入该校验：任一 claim 命中缺陷 → 该单元判定失败。
 
@@ -312,7 +312,7 @@ def bullet_defects(text: str) -> list[str]:
 2. 合并后仍有缺陷 → 回落到该记录的**源句**（现有机制）；
 3. 源句仍不成句 → 丢弃该 claim。丢弃后 coverage ledger 与 reply 已有上报路径，不需另加提示。
 
-- [ ] **步骤 3：被吞数字改用 provenance 判定，禁止文本模式匹配**
+- [x] **步骤 3：被吞数字改用 provenance 判定，禁止文本模式匹配**
 
 > **计划修订 2026-08-17：** 本步骤初版给了 `超过个`／`价值万`／`境内个` 三个搭配。
 > 那是从观测输出抄来的短语，不可泛化；把它扩成「计数词 × 量词」正则更危险。
@@ -342,7 +342,7 @@ def bullet_defects(text: str) -> list[str]:
 **退出条件：** 若 provenance 透传的改动量超出本计划范围，则本步骤**整体不做**，把 D6 移入
 「不在本计划范围」并在缺陷清单记录原因。**不允许退回关键词方案。**
 
-- [ ] **步骤 4：编写测试** `tests/test_v3_text_integrity.py`
+- [x] **步骤 4：编写测试** `tests/test_v3_text_integrity.py`
 
 用缺陷清单中的真实字符串做夹具，逐条断言：
 
@@ -360,7 +360,7 @@ def bullet_defects(text: str) -> list[str]:
 
 **注意：** 守卫只作用于 **bullet 文本**，不得作用于 `role` / `company` / `period` / `skills` 字段——`远程`、`7个月`、`Excel` 都是合法短值。
 
-- [ ] **步骤 5：合并逻辑测试** `tests/test_v3_record_local.py`
+- [x] **步骤 5：合并逻辑测试** `tests/test_v3_record_local.py`
   - 构造同记录内被劈成两段的源 span → 断言合并后产出完整句、单元不降级。
   - 构造无法合并的孤立碎片 → 断言该单元回落到源句。
 
@@ -386,9 +386,9 @@ def bullet_defects(text: str) -> list[str]:
 **文件：**
 - 修改：`core/v3/pipeline.py:272`
 
-- [ ] **步骤 1：** 建立内部标记白名单／黑名单，形如 `<code>:<detail>` 的纯内部标记不进入用户可见 `conflicts`。
-- [ ] **步骤 2：** 无法映射为用户可读描述的条目一律**丢弃**而非透传。
-- [ ] **步骤 3：新增测试** `tests/test_v3_summary_reply.py`：`audit.conflicts` 含 `unassigned:metric` → 断言用户可见 `conflicts` 为空。
+- [x] **步骤 1：** 建立内部标记白名单／黑名单，形如 `<code>:<detail>` 的纯内部标记不进入用户可见 `conflicts`。
+- [x] **步骤 2：** 无法映射为用户可读描述的条目一律**丢弃**而非透传。
+- [x] **步骤 3：新增测试** `tests/test_v3_summary_reply.py`：`audit.conflicts` 含 `unassigned:metric` → 断言用户可见 `conflicts` 为空。
 
 **验收：** 用户可见 `conflicts` 不含冒号分隔的内部标记。
 
@@ -396,24 +396,24 @@ def bullet_defects(text: str) -> list[str]:
 
 ## 整体验收
 
-- [ ] **全量单测通过且无净减少：** 基线为 `831 passed, 43 deselected`（`2026-08-17` 实测，耗时约 24s）。
+- [x] **全量单测通过且无净减少：** 基线为 `831 passed, 43 deselected`（`2026-08-17` 实测，耗时约 24s）。
 
 ```bash
 .venv/bin/python -m pytest -m 'not integration' -q
 ```
 
-- [ ] **6 例回归夹具复跑**，逐项核对：
+- [x] **6 例回归夹具复跑**，逐项核对：
   - `additional_sections` 内容不再以 `not_provided` 上报（任务 1）
   - `summary_empty_after_length_repair` 消失（任务 2）
   - 套话与元数据行不出现在正文（任务 3、4）
   - 四类结构缺陷归零（任务 5）
   - 用户可见 `conflicts` 无内部 token（任务 6）
 
-- [ ] **延迟未劣化：** 单例 `total_s` 不高于修复前基线（`HV2-S1-009` 为 `384.858s`）。全部改动为确定性后处理，预期增量在毫秒级；若出现秒级增长说明实现有误。
+- [x] **延迟未劣化：** 单例 `total_s` 不高于修复前基线（`HV2-S1-009` 为 `384.858s`）。全部改动为确定性后处理，预期增量在毫秒级；若出现秒级增长说明实现有误。
 
-- [ ] **V2 路径零改动：** 确认 `RESUME_PIPELINE_VERSION=v2` 的产出逐字节不变。
+- [x] **V2 路径零改动：** 确认 `RESUME_PIPELINE_VERSION=v2` 的产出逐字节不变。
 
-- [ ] **不得自行提交 Darvin 平台。** 采用门槛为 Darvin 完整均分 ≥ 66.48、零编造否决、零生成失败、全部请求 < 480s。本计划只修体感缺陷，**不构成提交依据**，是否提交由项目负责人决定。
+- [x] **不得自行提交 Darvin 平台。** 采用门槛为 Darvin 完整均分 ≥ 66.48、零编造否决、零生成失败、全部请求 < 480s。本计划只修体感缺陷，**不构成提交依据**，是否提交由项目负责人决定。
 
 ## 不在本计划范围
 
