@@ -15,7 +15,7 @@ from .planner import plan_resume
 from .realizer_llm import RealizationReport
 from .realizer_records import realize_record_local
 from .repair import minimal_repair
-from .reply_builder import build_reply, _friendly_conflicts
+from .reply_builder import build_reply, friendly_conflicts
 from .resume_adapter import frozen_to_resume_data
 from .semantic_llm import SemanticCompilationReport, compile_semantics
 from .summary_compiler import compile_summary
@@ -131,19 +131,6 @@ def _quality_report(output: V3Output, semantic: SemanticCompilationReport, reali
     }
 
 
-def _additional_blob(resume_data: dict[str, Any]) -> str:
-    """Flatten additional_sections so misrouted content stays visible."""
-
-    sections = resume_data.get("additional_sections")
-    if not isinstance(sections, dict):
-        return ""
-    parts: list[str] = []
-    for values in sections.values():
-        if isinstance(values, list):
-            parts.extend(str(value) for value in values if value)
-    return "\n".join(parts)
-
-
 def _missing_fields(
     resume_data: dict[str, Any],
     *,
@@ -160,7 +147,6 @@ def _missing_fields(
     meta = resume_data.get("meta") if isinstance(resume_data.get("meta"), dict) else {}
     additional = resume_data.get("additional_sections")
     additional = additional if isinstance(additional, dict) else {}
-    additional_blob = _additional_blob(resume_data)
     checks = [
         ("name", "姓名", bool(meta.get("name"))),
         ("contact", "联系方式", bool(meta.get("phone") or meta.get("email"))),
@@ -183,7 +169,10 @@ def _missing_fields(
             continue
         not_rendered = False
         if field == "summary":
-            not_rendered = bool(degraded.get("summary")) or bool(additional_blob)
+            # Only a real summary-stage degradation may claim "material had
+            # content"; hobbies sitting in additional sections do NOT mean a
+            # summary existed.
+            not_rendered = bool(degraded.get("summary"))
         elif field == "education":
             not_rendered = bool(additional.get("教育补充信息"))
         if not_rendered:
@@ -312,7 +301,7 @@ def run_v3_pipeline(
     # user-readable descriptions may surface; anything else is dropped.
     conflicts = [
         {"field": "source_conflict", "description": description}
-        for description in _friendly_conflicts(list(audit.conflicts))
+        for description in friendly_conflicts(list(audit.conflicts))
     ]
     changes = [
         {

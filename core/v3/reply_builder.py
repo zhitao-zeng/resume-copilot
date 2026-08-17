@@ -104,7 +104,7 @@ _CONFLICT_TYPE_LABELS = {
 }
 
 
-def _friendly_conflicts(conflicts: list[str]) -> list[str]:
+def friendly_conflicts(conflicts: list[str]) -> list[str]:
     """Render audit conflict hints without internal record/fact identifiers.
 
     Entries that cannot be mapped to a user-readable description (including
@@ -199,10 +199,10 @@ def build_reply(
 
     if audit.conflicts:
         lines.append("冲突检查：")
-        lines.extend(f"- {item}" for item in _friendly_conflicts(list(audit.conflicts)[:3]))
+        lines.extend(f"- {item}" for item in friendly_conflicts(list(audit.conflicts)[:3]))
     else:
         lines.append("冲突检查：未发现时间或信息冲突。")
     return "\n".join(lines)
 
 
-__all__ = ["build_reply", "undetermined_ownership_facts"]
+__all__ = ["build_reply", "friendly_conflicts", "undetermined_ownership_facts"]

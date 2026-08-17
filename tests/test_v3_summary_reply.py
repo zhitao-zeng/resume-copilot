@@ -174,9 +174,9 @@ def test_foreign_anchor_rejected_when_not_bound():
 
 
 def test_reply_conflicts_hide_internal_ids():
-    from core.v3.reply_builder import _friendly_conflicts
+    from core.v3.reply_builder import friendly_conflicts
 
-    friendly = _friendly_conflicts(["cv:record:4:period", "cv:record:4:period", "cv:record:7:organization"])
+    friendly = friendly_conflicts(["cv:record:4:period", "cv:record:4:period", "cv:record:7:organization"])
     assert friendly == ["存在多处不一致的时间表述，请核对确认。", "存在多处不一致的组织表述，请核对确认。"]
     assert all("record:" not in item and "cv:" not in item for item in friendly)
 

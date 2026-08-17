@@ -12,7 +12,7 @@ for path in (str(REPO_ROOT), str(REPO_ROOT / "core")):
         sys.path.insert(0, path)
 
 from core.v3.contracts import FactGraph, FrozenResume, RealizedClaim, SourceSpan, FactUnit  # noqa: E402
-from core.v3.reply_builder import _friendly_conflicts  # noqa: E402
+from core.v3.reply_builder import friendly_conflicts  # noqa: E402
 from core.v3.resume_adapter import frozen_to_resume_data  # noqa: E402
 
 
@@ -86,6 +86,6 @@ def test_metadata_kv_row_never_enters_experience():
 
 
 def test_conflicts_hide_internal_codes_and_drop_unmappable():
-    friendly = _friendly_conflicts(["cv:record:4:period", "unassigned:metric", "garbage"])
+    friendly = friendly_conflicts(["cv:record:4:period", "unassigned:metric", "garbage"])
     assert friendly == ["存在多处不一致的时间表述，请核对确认。"]
     assert all(":" not in item.split("表述")[0] for item in friendly)
