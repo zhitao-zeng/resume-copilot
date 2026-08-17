@@ -126,6 +126,7 @@ def build_reply(
     *,
     missing_fields: list[dict] | None = None,
     skeleton: bool = False,
+    quarantined_numeric: list[dict] | None = None,
 ) -> str:
     fact_map = fact_graph.fact_map()
     written = [fact_map[fid].text for fid in audit.written_fact_ids if fid in fact_map]
@@ -179,6 +180,13 @@ def build_reply(
         lines.append(
             f"待确认归属：共 {len(undetermined)} 条信息未能确认所属经历，已按原文保留（展示 {shown} 条）：{excerpts}。"
             "请确认这些信息分别属于哪段经历。"
+        )
+
+    if quarantined_numeric:
+        excerpts = "、".join(f"「{_excerpt(item['text'], 30)}」" for item in quarantined_numeric[:3])
+        lines.append(
+            f"待确认数字：{len(quarantined_numeric)} 条信息的数字/时间疑似识别错误，未写入简历：{excerpts}。"
+            "请核对原件后补充真实数值。"
         )
 
     if audit.conflicts:

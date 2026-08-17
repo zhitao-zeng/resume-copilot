@@ -10,6 +10,7 @@ from .document_graph import from_native_text
 from .fact_graph import build_fact_graph
 from .input_adapters import build_input_document_graph
 from .jd_graph import build_requirement_graph
+from .numeric_guard import quarantine_suspect_numeric_facts
 from .planner import plan_resume
 from .realizer_llm import RealizationReport
 from .realizer_records import realize_record_local
@@ -47,7 +48,7 @@ def _native_graph(source_id: str, source_type: str, text: str):
     return from_native_text(asset, text)
 
 
-def _quality_report(output: V3Output, semantic: SemanticCompilationReport, realization: RealizationReport, summary: dict[str, Any] | None = None) -> dict[str, Any]:
+def _quality_report(output: V3Output, semantic: SemanticCompilationReport, realization: RealizationReport, summary: dict[str, Any] | None = None, numeric_quarantine: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     audit = output.audit
     graph = output.graph
     factual_claim_ids = [claim.claim_id for claim in output.frozen.claims if claim.fact_ids]
@@ -124,6 +125,8 @@ def _quality_report(output: V3Output, semantic: SemanticCompilationReport, reali
             "realization_unit_reports": [dict(report) for report in realization.unit_reports],
             "summary_status": (summary or {}).get("status", ""),
             "summary_violations": (summary or {}).get("violations") or [],
+            "numeric_quarantine_count": len(numeric_quarantine or []),
+            "numeric_quarantine": [dict(item) for item in (numeric_quarantine or [])],
         },
     }
 
@@ -200,6 +203,10 @@ def run_v3_pipeline(
         llm_call=semantic_llm_call,
     )
     graph = semantic_result.graph
+    # R25: quarantine suspect OCR numerics (truncated years, implausible or
+    # reversed periods, low-confidence digits) before planning — a corrupted
+    # number must never be preserved verbatim into the resume.
+    quarantined_numeric = quarantine_suspect_numeric_facts(graph)
     requirements = build_requirement_graph(jd_text)
     normalized_mode = template_mode if template_mode in {"tagged", "anchored", "style_only"} else "style_only"
     template = TemplateAST(mode=normalized_mode) if template_mode != "none" else None
@@ -258,9 +265,10 @@ def run_v3_pipeline(
         requirements,
         missing_fields=missing,
         skeleton=plan.skeleton,
+        quarantined_numeric=quarantined_numeric,
     )
     output = V3Output(graph=graph, plan=plan, frozen=frozen, audit=audit, reply=reply)
-    quality = _quality_report(output, semantic_result.report, realization.report, summary_result.report.to_dict())
+    quality = _quality_report(output, semantic_result.report, realization.report, summary_result.report.to_dict(), quarantined_numeric)
     conflicts = [
         {"field": "source_conflict", "description": conflict}
         for conflict in audit.conflicts
