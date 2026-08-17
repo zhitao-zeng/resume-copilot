@@ -40,7 +40,7 @@ from .contracts import (
     RealizerResponse,
     V3Model,
 )
-from .realizer import _join_facts, _placeholder, merge_fragment_claims, realize_plan, validate_realizer_response
+from .realizer import _join_facts, _placeholder, _source_slice, merge_fragment_claims, realize_plan, validate_realizer_response
 from .text_integrity import bullet_defects
 from .realizer_llm import RealizationReport, RealizationResult, _minimum_remaining_seconds
 from .training_schema import RealizerClaimDecision, SCHEMA_VERSION, SchemaVersion
@@ -313,10 +313,21 @@ def _deterministic_unit_claims(
     # reported through the coverage ledger and the reply.  Short but
     # legitimate values (bare_fragment only) stay.
     _DROP_DEFECTS = {"fragment_start", "unbalanced_bracket"}
+    fact_map = graph.fact_map()
     kept: list[RealizedClaim] = []
     for claim in claims:
         defects = set(bullet_defects(claim.text)) if claim.field == "bullet" else set()
         if defects & _DROP_DEFECTS:
+            # The defect inventory's remedy is merge-or-fallback, not
+            # deletion — dropping loses whole experience units.  When the
+            # cited facts share one transport span, the exact source slice
+            # is a verbatim, well-formed replacement; only fragments that
+            # cannot be restored are still dropped (ledger keeps them
+            # visible).
+            facts = [fact_map[fid] for fid in claim.fact_ids if fid in fact_map]
+            slice_text = _source_slice(facts, graph) if facts else None
+            if slice_text and not (set(bullet_defects(slice_text)) & _DROP_DEFECTS):
+                kept.append(claim.model_copy(update={"text": slice_text}))
             continue
         kept.append(claim)
     return kept

@@ -128,6 +128,31 @@ def _is_boilerplate(value: str) -> bool:
     )
 
 
+# Skill routing signals (rubric: 技能按类别归类).  Structure only: the
+# ``○语`` morphological pattern plus calendar-grade language names are a
+# domain-inherent closed set (world languages), not words collected from
+# observed output; the tool signature is charset shape.  Routing never
+# drops a value — anything unrecognized stays in "others".
+_LANGUAGE_VALUE = re.compile(
+    r"[一-鿿]{1,3}语(?![一-鿿])|普通话|粤语"
+    r"|^(?:english|mandarin|cantonese|japanese|korean|french|german|spanish"
+    r"|russian|portuguese|italian|arabic)\b",
+    re.IGNORECASE,
+)
+_TOOL_VALUE = re.compile(r"^[A-Za-z][A-Za-z0-9+.#/&\- ]{0,39}$")
+
+
+def _skill_bucket(value: str, fact_types: set[str]) -> str:
+    if "credential" in fact_types:
+        return "certifications"
+    compact = value.strip()
+    if len(compact) <= 24 and _LANGUAGE_VALUE.search(compact):
+        return "natural_languages"
+    if _TOOL_VALUE.fullmatch(compact):
+        return "tools"
+    return "others"
+
+
 def _summary_value_is_represented(value: str, candidate: str) -> bool:
     """Return whether a longer summary claim already contains ``value``.
 
@@ -295,9 +320,30 @@ def frozen_to_resume_data(
         if records:
             data[target] = records
 
-    skills = [_claim_value(claim) for claim in sections_in.get("skills", []) if _claim_value(claim)]
-    if skills:
-        data["skills"] = {"others": list(dict.fromkeys(skills))}
+    fact_map = graph.fact_map()
+
+    def _fact_types(claim: Any) -> set[str]:
+        return {
+            fact_map[fact_id].fact_type
+            for fact_id in claim.fact_ids
+            if fact_id in fact_map
+        }
+
+    # Rubric: skills/tools/certifications/languages are listed by category.
+    skill_buckets: dict[str, list[str]] = {}
+    for claim in sections_in.get("skills", []):
+        value = _claim_value(claim)
+        if not value:
+            continue
+        bucket = _skill_bucket(value, _fact_types(claim))
+        if bucket == "certifications":
+            data.setdefault("certifications", [])
+            _append_unique(data["certifications"], value)
+        else:
+            skill_buckets.setdefault(bucket, [])
+            _append_unique(skill_buckets[bucket], value)
+    if skill_buckets:
+        data["skills"] = skill_buckets
 
     flat_targets = {
         "credentials": "certifications",
@@ -312,15 +358,6 @@ def frozen_to_resume_data(
             data[target] = list(dict.fromkeys(values))
 
     additional: dict[str, list[str]] = {}
-    fact_map = graph.fact_map()
-
-    def _fact_types(claim: Any) -> set[str]:
-        return {
-            fact_map[fact_id].fact_type
-            for fact_id in claim.fact_ids
-            if fact_id in fact_map
-        }
-
     for section in ("additional", "other"):
         claims = sections_in.get(section, [])
         values: list[str] = []

@@ -157,6 +157,8 @@ def build_reply(
     missing_fields: list[dict] | None = None,
     skeleton: bool = False,
     quarantined_numeric: list[dict] | None = None,
+    missing_details: list[str] | None = None,
+    extra_conflicts: list[str] | None = None,
 ) -> str:
     fact_map = fact_graph.fact_map()
     written = [fact_map[fid].text for fid in audit.written_fact_ids if fid in fact_map]
@@ -205,6 +207,11 @@ def build_reply(
     else:
         lines.append("缺失信息：当前通用必备模块未发现明确缺项。")
 
+    # Rubric 补充类: per-section required-field gaps, already aggregated by
+    # the caller ("工作/实习经历：2 段缺少起止时间").
+    if missing_details:
+        lines.append("补充建议：" + "；".join(missing_details[:4]) + "。请补充后可获得更完整的简历。")
+
     undetermined = undetermined_ownership_facts(audit, fact_graph)
     if undetermined:
         excerpts = "、".join(f"「{_excerpt(text, 30)}」" for text in undetermined[:_MAX_UNDETERMINED])
@@ -224,6 +231,8 @@ def build_reply(
     # Filter before slicing: taking the first three raw conflicts could pick
     # only unmappable internal entries and render a bare "冲突检查：" header.
     conflict_lines = friendly_conflicts(list(audit.conflicts))[:3]
+    # Rubric 确认类: cross-record period overlaps arrive pre-rendered.
+    conflict_lines.extend((extra_conflicts or [])[:3])
     if conflict_lines:
         lines.append("冲突检查：")
         lines.extend(f"- {item}" for item in conflict_lines)

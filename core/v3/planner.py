@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import re
 
 from .contracts import CoverageLedger, FactGraph, NarrativeGroup, RequirementGraph, ResumePlan, TemplateAST
 
@@ -28,6 +29,31 @@ _SECTION_ORDER = {
 def _overlap_score(text: str, keywords: list[str]) -> int:
     value = text.casefold()
     return sum(1 for keyword in keywords if keyword.casefold() in value)
+
+
+# The month group must not swallow the leading digits of a second year
+# ("2019 - 2021" is year-to-year, not year+month 20).
+_PERIOD_START = re.compile(r"(\d{4})\s*[年./\-]\s*(\d{1,2}(?!\d))?")
+# Sections whose entries the acceptance rubric orders most-recent first.
+_TIME_ORDERED_SECTIONS = {"experience", "projects", "research", "activities", "teaching", "education"}
+
+
+def _record_start_key(fact_ids: list[str], fact_map: dict) -> int:
+    """Latest period start in the record as yyyymm; -1 when undated."""
+
+    best = -1
+    for fact_id in fact_ids:
+        fact = fact_map.get(fact_id)
+        if fact is None or fact.fact_type != "period":
+            continue
+        match = _PERIOD_START.search(fact.text)
+        if not match:
+            continue
+        year = int(match.group(1))
+        month = int(match.group(2) or 1)
+        if 1900 <= year <= 2100 and 1 <= month <= 12:
+            best = max(best, year * 100 + month)
+    return best
 
 
 def plan_resume(
@@ -86,10 +112,23 @@ def plan_resume(
         for section in ("contact", "summary", "experience", "projects", "education", "skills"):
             purpose = "framework"
             groups.append(NarrativeGroup(group_id=f"framework:{section}", section=section, fact_ids=[], purpose=purpose, priority=0))
-    # JD relevance orders records *inside* a resume section.  It must never
-    # move identity/contact or summary behind an experience merely because a
-    # job keyword happened to match the latter.
-    groups.sort(key=lambda group: (_SECTION_ORDER.get(group.section, 99), -group.priority, group.group_id))
+    # Rubric: experience/education entries are ordered most-recent first by
+    # start date.  JD relevance must not reorder dated records — it only
+    # breaks ties among undated ones — and it must never move
+    # identity/contact or summary behind an experience merely because a job
+    # keyword happened to match the latter.
+    fact_map = fact_graph.fact_map()
+    start_keys = {
+        group.group_id: _record_start_key(group.fact_ids, fact_map)
+        for group in groups
+        if group.record_id is not None and group.section in _TIME_ORDERED_SECTIONS
+    }
+    groups.sort(key=lambda group: (
+        _SECTION_ORDER.get(group.section, 99),
+        -start_keys.get(group.group_id, -1),
+        -group.priority,
+        group.group_id,
+    ))
     planned = [fact_id for group in groups for fact_id in group.fact_ids]
     ledger = CoverageLedger(eligible_fact_ids=[fact.fact_id for fact in eligible], planned_fact_ids=planned, omitted_fact_ids=[])
     mode = template.mode if template else "none"

@@ -19,6 +19,7 @@ from .reply_builder import build_reply, friendly_conflicts
 from .resume_adapter import frozen_to_resume_data
 from .semantic_llm import SemanticCompilationReport, compile_semantics
 from .summary_compiler import compile_summary
+from .time_conflicts import experience_overlaps
 from .training_examples import build_training_records, maybe_write_training_trace
 
 
@@ -149,7 +150,10 @@ def _missing_fields(
     additional = additional if isinstance(additional, dict) else {}
     checks = [
         ("name", "姓名", bool(meta.get("name"))),
-        ("contact", "联系方式", bool(meta.get("phone") or meta.get("email"))),
+        # Rubric: 联系电话 and 邮箱 are individually required — one present
+        # must not silence the prompt for the other.
+        ("phone", "联系电话", bool(meta.get("phone"))),
+        ("email", "邮箱", bool(meta.get("email"))),
         ("summary", "个人总结", bool(str(resume_data.get("summary") or "").strip())),
         ("education", "教育经历", bool(resume_data.get("education"))),
         (
@@ -180,6 +184,48 @@ def _missing_fields(
         else:
             missing.append({"field": field, "label": label, "reason": "个人材料中未提供该信息，未进行推断", "source": "not_provided"})
     return missing
+
+
+def _record_detail_prompts(resume_data: dict[str, Any]) -> list[str]:
+    """Per-section aggregation of required record fields the rubric names.
+
+    One line per section ("工作/实习经历：2 段缺少起止时间、1 段缺少岗位")
+    keeps the prompt specific without flooding the reply record-by-record.
+    """
+
+    prompts: list[str] = []
+    for target, label in (
+        ("experience", "工作/实习经历"),
+        ("projects", "项目经历"),
+        ("campus_experience", "校园经历"),
+        ("education", "教育经历"),
+    ):
+        records = [item for item in (resume_data.get(target) or []) if isinstance(item, dict)]
+        if not records:
+            continue
+        missing_counts: dict[str, int] = {}
+        for record in records:
+            bits: list[str] = []
+            if not record.get("period"):
+                bits.append("起止时间")
+            if target == "education":
+                if not record.get("school"):
+                    bits.append("学校")
+                if not record.get("degree"):
+                    bits.append("学位")
+                if not record.get("major"):
+                    bits.append("专业")
+            else:
+                if not (record.get("company") or record.get("name")):
+                    bits.append("公司/组织")
+                if not record.get("role"):
+                    bits.append("岗位")
+            for bit in bits:
+                missing_counts[bit] = missing_counts.get(bit, 0) + 1
+        if missing_counts:
+            summary = "、".join(f"{count} 段缺少{bit}" for bit, count in missing_counts.items())
+            prompts.append(f"{label}：{summary}")
+    return prompts
 
 
 def run_v3_pipeline(
@@ -295,6 +341,10 @@ def run_v3_pipeline(
         if summary_result.report.status in not_rendered_statuses
         else {},
     )
+    # Rubric 补充类/确认类: per-section required-field gaps and cross-record
+    # period overlaps are computed deterministically from the rendered data.
+    detail_prompts = _record_detail_prompts(resume_data)
+    overlaps = experience_overlaps(resume_data.get("experience") or [])
     # R24 Phase 4: concise reply compiled from the frozen audit — direction,
     # bounded evidence-backed match/gap analysis, exact missing fields,
     # grouped undetermined-ownership items, and real conflicts only.
@@ -305,6 +355,8 @@ def run_v3_pipeline(
         missing_fields=missing,
         skeleton=plan.skeleton,
         quarantined_numeric=quarantined_numeric,
+        missing_details=detail_prompts,
+        extra_conflicts=[item["description"] for item in overlaps],
     )
     output = V3Output(graph=graph, plan=plan, frozen=frozen, audit=audit, reply=reply)
     quality = _quality_report(output, semantic_result.report, realization.report, summary_result.report.to_dict(), quarantined_numeric)
@@ -314,6 +366,7 @@ def run_v3_pipeline(
         {"field": "source_conflict", "description": description}
         for description in friendly_conflicts(list(audit.conflicts))
     ]
+    conflicts.extend({"field": item["field"], "description": item["description"]} for item in overlaps)
     changes = [
         {
             "path": "fact_graph",

@@ -524,7 +524,12 @@ def test_generic_target_role_does_not_require_known_role_dictionary():
         has_jd=False,
     )
     assert result.target_role == "新能源电池工艺工程师"
-    assert result.industry == "新能源电池工艺工程师"
+    # The public industry field is the closed product taxonomy (acceptance
+    # rubric); a profession outside it folds to "other" instead of carrying
+    # the role text.  The user's stated direction lives in target_role and
+    # in the evidence trail.
+    assert result.industry == "other"
+    assert any(e.text == "新能源电池工艺工程师" for e in result.evidence.industry)
 
 
 def test_date_range_is_not_rendered_as_work_seniority():

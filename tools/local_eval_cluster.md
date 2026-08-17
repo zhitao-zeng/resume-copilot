@@ -23,8 +23,10 @@ LOCAL_EVAL_SOURCE_ROOT=/path/to/read-only/worktree \
   LOCAL_EVAL_RESUME_PIPELINE_VERSION=v2 \
   bash tools/local_eval_cluster.sh restart
 
-# Cheap gate before a full run.
-bash tools/local_eval_cluster.sh eval-case HV2-S1-012 3
+# Cheap gate before a full run.  NOTE: case IDs rotate as holdout cases are
+# retired (HV2-S1-012 etc. left the split in R27) — pick a live one first:
+#   head -1 validation_sets/public_resume_holdout/holdout_v2/cases.jsonl
+bash tools/local_eval_cluster.sh eval-case "$(.venv/bin/python -c "import json;print(json.loads(open('validation_sets/public_resume_holdout/holdout_v2/cases.jsonl').readline())['id'])")" 3
 
 # Run a fixed diagnostic subset under one named content profile.
 LOCAL_EVAL_PIPELINE_PROFILE=f507_compatible \

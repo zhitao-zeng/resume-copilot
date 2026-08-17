@@ -314,12 +314,15 @@ def merge_fragment_claims(claims: list["RealizedClaim"], fact_graph: FactGraph) 
     """
 
     merged: list[RealizedClaim] = []
-    merged_last = False
+    merged_pieces = 1
     for claim in claims:
-        # No chain merges: a claim produced by a join is never the left side
-        # of another join, so a fully-punctuated next line can never be
-        # absorbed by accident.
-        if merged and not merged_last and _claims_are_soft_wrapped(merged[-1], claim, fact_graph):
+        # Chain merges are allowed up to three source lines: a sentence
+        # wrapped across three OCR lines is still one sentence, and stopping
+        # at two left the third piece as a standalone fragment for the drop
+        # guard to eat.  Absorbing a complete line by accident remains
+        # impossible — _claims_are_soft_wrapped rejects any left side with
+        # terminal punctuation and any right side opening a new item/label.
+        if merged and merged_pieces < 3 and _claims_are_soft_wrapped(merged[-1], claim, fact_graph):
             left = merged[-1]
             text = left.text.rstrip() + claim.text.lstrip()
             merged[-1] = RealizedClaim(
@@ -334,10 +337,10 @@ def merge_fragment_claims(claims: list["RealizedClaim"], fact_graph: FactGraph) 
                 generated=True,
                 group_id=left.group_id,
             )
-            merged_last = True
+            merged_pieces += 1
             continue
         merged.append(claim)
-        merged_last = False
+        merged_pieces = 1
     return merged
 
 

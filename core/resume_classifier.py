@@ -34,6 +34,14 @@ NON_ROLE_HEADERS = {
     "job responsibilities", "requirements", "qualifications",
 }
 
+# The public industry field is the product's closed taxonomy (README
+# 多行业策略 / acceptance rubric).  The menu is built from INDUSTRY_LABELS so
+# there is a single source of truth; free text was leaking out-of-contract
+# labels ("SaaS", "Logistics") into the response.
+_INDUSTRY_MENU = ", ".join(
+    f"{key}({label})" for key, label in product_logic.INDUSTRY_LABELS.items()
+)
+
 _SYSTEM_PROMPT = (
     "你是简历生成服务的请求分类器。只做分类，不生成简历内容。\n"
     "硬约束：\n"
@@ -42,7 +50,8 @@ _SYSTEM_PROMPT = (
     "3. 证据不足时 confidence 降低，使用 other/job_seeker/空字符串。\n"
     "4. 只输出 JSON，不要输出解释。\n"
     "5. target_role 不得是'职责'、'任职要求'等 JD 章节标题。\n\n"
-    "industry 在充分判断后自由输出，不限于任何固定列表。\n"
+    f"industry 必须从以下产品分类中选择一个键值：{_INDUSTRY_MENU}。\n"
+    "证据不足或不属于任何列表项时用 other，不得自造标签。\n"
     "允许的 user_stage：student, experienced, job_seeker\n\n"
     "evidence 格式：[{\"text\": \"关键词\", \"source\": \"query|cv|jd\", \"usage\": \"fact|direction\"}]\n"
     "- 事实字段 source 只能是 query 或 cv；target_role 的 industry 参考可来自 jd\n"
@@ -259,12 +268,15 @@ def _rule_fallback(*, query: str, cv_text: str, jd_text: str, resume_data: Optio
         role_matches_inferred_industry = any(
             str(term).casefold() in role_text for term in industry_terms
         )
-    if query_role and (industry == "other" or not role_matches_inferred_industry):
-        # The public schema permits free-text industries.  Using the explicit
-        # user role is more informative than forcing an unknown profession
-        # into the nearest keyword category (for example DOE "实验设计" must
-        # not turn a battery-process role into the design industry).
-        industry = query_role
+    if query_role and industry != "other" and not role_matches_inferred_industry:
+        # The keyword inference likely latched onto an incidental term (for
+        # example DOE "实验设计" must not turn a battery-process role into
+        # the design industry).  The public field is a closed product
+        # taxonomy, so an unsupported match folds to "other" — the explicit
+        # user role stays in target_role and in the evidence trail.
+        industry = "other"
+    if query_role and industry == "other":
+        # Keep the user's stated direction visible in the evidence trail.
         industry_evidence = query_role
     return ClassificationResult(
         industry=industry, user_stage=user_stage, target_role=target_role,
@@ -369,6 +381,21 @@ def _validate_and_correct(
             f"industry '{result.industry}' normalized to '{canonical_industry}'"
         )
         result.industry = canonical_industry
+
+    # 1b. Enforce the closed product taxonomy on the public field: normalize
+    # case-insensitive key matches, fold everything else to "other".  An
+    # out-of-taxonomy label is a response-contract violation, not a useful
+    # long-tail signal — the free-text detail stays available in evidence.
+    if result.industry not in VALID_INDUSTRIES:
+        folded = {key.casefold(): key for key in VALID_INDUSTRIES}
+        matched = folded.get(str(result.industry or "").strip().casefold())
+        if matched:
+            result.industry = matched
+        else:
+            warnings.append(
+                f"industry '{result.industry}' outside product taxonomy; set to 'other'"
+            )
+            result.industry = "other"
 
     # 2. Validate user_stage (unknown industry values remain valid free text)
     if result.user_stage not in VALID_USER_STAGES:
