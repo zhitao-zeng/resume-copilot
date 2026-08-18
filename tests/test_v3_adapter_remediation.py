@@ -166,3 +166,32 @@ def test_commented_content_never_reaches_facts():
 ])
 def test_compound_section_title_inherits_known_suffix(title, expected):
     assert _sec_type(title) == expected
+
+
+# --- R28 task 3: record headers are compact labels, not sentences ---
+
+from core.v3.fact_graph import _looks_like_record_header  # noqa: E402
+
+
+@pytest.mark.parametrize("line", [
+    "第四范式（4Paradigm）｜AI 算法工程师 → 语音方向 Tech Lead｜2025.02 - 至今",
+    "伊利诺伊大学香槟分校（UIUC）｜预测分析与风险管理 · 理学硕士｜2022.08-2024.05",
+    "2020.03 - 2023.06  示例科技  算法工程师",
+    "示例科技 - 算法工程师（2020-2023）",
+])
+def test_record_header_shapes_are_detected(line):
+    assert _looks_like_record_header(line, "experience")
+
+
+@pytest.mark.parametrize("line", [
+    # A ratio parses as month/year; narrative must not become a record.
+    "局部 refinement 将 F1 0.6647→0.7319：新策略对其余 53/54 图输出保持不变；加速约 3.1 倍。",
+    "在2021年至2022年期间参与了多个项目的研发工作，负责核心模块。",
+])
+def test_narrative_lines_are_not_record_headers(line):
+    assert not _looks_like_record_header(line, "experience")
+
+
+def test_list_markers_are_stripped_from_markdown():
+    text = normalize_markdown_source("- 第一条\n1. 第二条\n* 第三条\n")
+    assert text.splitlines() == ["第一条", "第二条", "第三条"]

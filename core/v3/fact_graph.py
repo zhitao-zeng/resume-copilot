@@ -165,6 +165,21 @@ def _fact_type(text: str, section: str) -> str:
     return "other"
 
 
+# A record header is a compact label, not a sentence.  Narrative bullets can
+# still contain date-shaped substrings — a ratio such as ``53/54`` parses as
+# month/year — so the weaker single-date and separator signals additionally
+# require header shape.  Clause punctuation is the discriminator: a header
+# names an employer, role and period; it does not carry clauses.
+_SENTENCE_PUNCT_RE = re.compile(r"[。！？；;]")
+_MAX_HEADER_CHARS = 80
+
+
+def _is_compact_header_shape(value: str) -> bool:
+    if len(value) > _MAX_HEADER_CHARS:
+        return False
+    return not _SENTENCE_PUNCT_RE.search(value)
+
+
 def _looks_like_record_header(text: str, section: str, previous: str = "") -> bool:
     record_section = section in {"experience", "projects", "research", "education", "activities"}
     # Indentation is layout, not an organization/role separator.  Searching
@@ -192,9 +207,11 @@ def _looks_like_record_header(text: str, section: str, previous: str = "") -> bo
         return False
     # Education and other explicitly-labelled record sections also use a
     # single year (for example "2000 甲大学") as a compact record header.
+    if not _is_compact_header_shape(value):
+        return False
     if _DATE_RE.search(value):
         return True
-    if _ORG_ROLE_SEP_RE.search(value) and len(value) <= 120:
+    if _ORG_ROLE_SEP_RE.search(value):
         return True
     if previous and previous.strip().endswith((":", "：")):
         return True

@@ -287,6 +287,7 @@ _MD_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 _MD_EMPHASIS_RE = re.compile(r"\*\*(.+?)\*\*|__(.+?)__")
 _MD_CODE_SPAN_RE = re.compile(r"`([^`\n]+)`")
 _MD_HEADING_RE = re.compile(r"^(#{1,6})\s*", re.MULTILINE)
+_MD_LIST_MARKER_RE = re.compile(r"^[ \t]*(?:[-*+]|\d{1,2}[.)])[ \t]+", re.MULTILINE)
 
 
 def normalize_markdown_source(text: str) -> str:
@@ -300,6 +301,9 @@ def normalize_markdown_source(text: str) -> str:
     * HTML comments are author-hidden content and are removed outright
       (dogfood RD3: a commented checklist rendered as skills).
     * Emphasis and code markers are presentation, not content (RD2).
+    * List markers (bullet and ordinal) are dropped for the same reason —
+      they are the source's layout, and an ordinal surviving into a
+      reordered bullet is the "garbled numbering" the platform reported.
     * Heading markers are dropped; a known section title is still detected
       by ``is_section_heading`` on its bare text, while an unknown deeper
       heading (a record line or group label) flows on as content where the
@@ -311,6 +315,7 @@ def normalize_markdown_source(text: str) -> str:
     text = _MD_EMPHASIS_RE.sub(lambda m: m.group(1) or m.group(2) or "", text)
     text = _MD_CODE_SPAN_RE.sub(lambda m: m.group(1), text)
     text = _MD_HEADING_RE.sub("", text)
+    text = _MD_LIST_MARKER_RE.sub("", text)
     return text
 
 
