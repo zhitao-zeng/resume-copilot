@@ -234,3 +234,31 @@ def test_contact_line_is_not_a_record_header():
     # Phone digits contain a year; a contact line must not open a record.
     assert not _looks_like_record_header("手机：19975260767 |", "projects")
     assert not _looks_like_record_header("邮箱：a@example.com ｜ 浙江温州", "projects")
+
+
+# --- R28 task 7: education record lines are split into public fields ---
+
+from core.v3.resume_adapter import _split_education_line  # noqa: E402
+
+
+@pytest.mark.parametrize("line,school,period", [
+    ("示例大学（Example）｜预测分析 · 理学硕士｜2022.08-2024.05｜GPA 4.0/4.0",
+     "示例大学（Example）", "2022.08-2024.05"),
+    ("示例学院｜数学与应用数学 · 理学学士｜2018.08-2022.06", "示例学院", "2018.08-2022.06"),
+    ("2019-2023｜示例理工大学｜计算机科学", "示例理工大学", "2019-2023"),
+])
+def test_education_line_splits_into_fields(line, school, period):
+    fields = _split_education_line(line)
+    assert fields.get("school") == school
+    assert fields.get("period") == period
+
+
+def test_education_split_keeps_gpa_value_intact():
+    fields = _split_education_line("示例大学｜理学硕士｜2020-2022｜GPA 4.0/4.0")
+    assert "4.0/4.0" in " ".join(fields.values())
+
+
+@pytest.mark.parametrize("line", ["示例大学", "在示例大学完成了硕士学业并获得学位"])
+def test_unsplittable_education_line_returns_nothing(line):
+    # The caller falls back to supplementary overflow rather than guessing.
+    assert _split_education_line(line) == {}

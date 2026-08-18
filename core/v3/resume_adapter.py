@@ -187,6 +187,47 @@ def _compact_summary_values(values: list[str]) -> list[str]:
     ]
 
 
+# A comma is narrative punctuation and a bare slash appears inside values
+# such as GPA 4.0/4.0; neither can establish a field boundary.
+_EDU_SEPARATOR_RE = re.compile(r"\s*(?:\||｜|(?<=\S)\s*[·・]\s*(?=\S))\s*|\s+/\s+")
+_EDU_PERIOD_RE = re.compile(
+    r"(?:19|20)\d{2}(?:\s*[.\-/年]\s*\d{1,2})?\s*[-—–~至到]\s*"
+    r"(?:(?:19|20)\d{2}(?:\s*[.\-/年]\s*\d{1,2})?|至今|现在|今)"
+)
+
+
+def _split_education_line(value: str) -> dict[str, str]:
+    """Best-effort split of a one-line education record into public fields.
+
+    Education lines arrive as a single claim when the compiler did not split
+    them, and the public education record has no free-form bullet field, so
+    the whole line used to fall into the supplementary overflow and leave the
+    education section empty.  The period is located by date shape; the
+    remaining segments keep source order, first as school and the rest joined
+    as degree.  No vocabulary is consulted, and a line that does not split
+    into at least two segments returns nothing so the caller can fall back.
+    """
+
+    segments = [seg.strip() for seg in _EDU_SEPARATOR_RE.split(value) if seg.strip()]
+    if len(segments) < 2:
+        return {}
+    period = ""
+    rest: list[str] = []
+    for seg in segments:
+        if not period and _EDU_PERIOD_RE.search(seg):
+            period = seg
+            continue
+        rest.append(seg)
+    if not rest:
+        return {}
+    fields = {"school": rest[0]}
+    if period:
+        fields["period"] = period
+    if len(rest) > 1:
+        fields["degree"] = " · ".join(rest[1:])
+    return fields
+
+
 def _record_section(
     claims: list[RealizedClaim],
     *,
@@ -216,6 +257,12 @@ def _record_section(
                     _append_unique(record["bullets"], value)
             continue
         if section == "education" and overflow is not None:
+            split = _split_education_line(value)
+            if split:
+                for split_key, split_value in split.items():
+                    if not record.get(split_key):
+                        record[split_key] = split_value
+                continue
             _append_unique(overflow, value)
         else:
             record.setdefault("bullets", [])
@@ -307,6 +354,21 @@ def frozen_to_resume_data(
                 data["meta"][target_key] = value
         else:
             _append_unique(contact_extras, value)
+    # A phone or email is recognizable by shape alone.  When the compiler did
+    # not label it, reading the shape keeps a real contact out of the
+    # "not provided" report without inventing a value.
+    if not data["meta"].get("phone") or not data["meta"].get("email"):
+        for claims in sections_in.values():
+            for claim in claims:
+                text = _claim_value(claim)
+                if not data["meta"].get("email"):
+                    hit = re.search(r"[\w.+-]+@[\w-]+\.[\w.-]+", text)
+                    if hit:
+                        data["meta"]["email"] = hit.group()
+                if not data["meta"].get("phone"):
+                    hit = re.search(r"(?<!\d)(?:\+?86[-. ]?)?1[3-9]\d[-. ]?\d{4}[-. ]?\d{4}(?!\d)", text)
+                    if hit:
+                        data["meta"]["phone"] = hit.group()
     if contact_extras:
         # The established CanonicalResume meta contract is closed.  Unknown
         # but source-backed values must stay visible without inventing a meta
