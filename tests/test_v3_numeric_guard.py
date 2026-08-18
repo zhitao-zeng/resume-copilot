@@ -138,3 +138,43 @@ def test_bare_separator_is_not_a_date_shell():
     graph = FactGraph(documents={"cv": doc}, facts=facts)
     suspects = find_suspect_numeric_facts(graph)
     assert [item["fact_id"] for item in suspects] == ["cv:fact:2"]
+
+
+# --- R28 task 1: phone shapes are contact data, never suspect year ranges ---
+
+from core.v3.contracts import FactUnit, SourceSpan  # noqa: E402
+from core.v3.numeric_guard import _suspicion_reasons  # noqa: E402
+
+
+def _bare_fact(text: str) -> FactUnit:
+    return FactUnit(
+        fact_id="f", source_id="cv", source_type="cv", fact_type="other",
+        text=text,
+        spans=[SourceSpan(source_id="cv", char_start=0, char_end=len(text))],
+        confidence=1.0,
+    )
+
+
+@pytest.mark.parametrize("text", [
+    "电话：189-2758-0370",
+    "手机 13812345678",
+    "+86 138 1234 5678",
+    "座机 0755-8888 7777",
+])
+def test_phone_shapes_are_not_suspect(text):
+    assert _suspicion_reasons(_bare_fact(text)) == []
+
+
+@pytest.mark.parametrize("text", [
+    "2004年-204年",
+    "204-2011",
+    "1980-2035年",
+])
+def test_broken_year_ranges_still_quarantined(text):
+    assert _suspicion_reasons(_bare_fact(text))
+
+
+def test_phone_next_to_real_period_keeps_period_scrutiny():
+    # A phone must not shield an unrelated broken range in the same fact.
+    reasons = _suspicion_reasons(_bare_fact("13812345678，任职 204-2011"))
+    assert any("204" in r for r in reasons)

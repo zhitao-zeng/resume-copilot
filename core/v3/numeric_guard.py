@@ -38,6 +38,23 @@ _MAX_PERIOD_YEARS = 45
 # It must contain at least one date unit glyph; a bare "-" or "·" separator
 # is punctuation, not a date shell.
 _EMPTY_DATE_SHELL_RE = re.compile(r"^(?=.*[年月日])[\s年月日·./\-—~至到—]+$")
+# R28: phone numbers share the digit-dash shape of broken year ranges
+# (189-2758-0370 parses as year 189 .. 2758).  A span that matches a phone
+# shape is contact data, never a period; suspicion checks must not fire
+# inside it.  Shapes: CN mobile 1[3-9]########## with optional +86 and
+# 3-4-4 grouping, and landline 0AA(A)-######## with one optional split.
+_PHONE_RE = re.compile(
+    r"(?<!\d)(?:\+?86[-. ]?)?1[3-9]\d[-. ]?\d{4}[-. ]?\d{4}(?!\d)"
+    r"|(?<!\d)0\d{2,3}[-. ]?\d{3,4}[-. ]?\d{4}(?!\d)"
+)
+
+
+def _phone_spans(text: str) -> list[tuple[int, int]]:
+    return [m.span() for m in _PHONE_RE.finditer(text)]
+
+
+def _inside_phone(spans: list[tuple[int, int]], start: int, end: int) -> bool:
+    return any(start < b and end > a for a, b in spans)
 
 
 def _year_ok(value: str) -> bool:
@@ -47,9 +64,12 @@ def _year_ok(value: str) -> bool:
 def _suspicion_reasons(fact: FactUnit) -> list[str]:
     text = fact.text
     reasons: list[str] = []
+    phone_spans = _phone_spans(text)
     if _EMPTY_DATE_SHELL_RE.fullmatch(text.strip()) and not re.search(r"\d", text):
         reasons.append("empty_date_shell")
     for match in _RANGE_RE.finditer(text):
+        if _inside_phone(phone_spans, match.start(), match.end()):
+            continue
         y1, y2 = match.group("y1"), match.group("y2")
         if not _year_ok(y1):
             reasons.append(f"implausible_year:{y1}")
@@ -63,6 +83,8 @@ def _suspicion_reasons(fact: FactUnit) -> list[str]:
                 elif span > _MAX_PERIOD_YEARS:
                     reasons.append(f"overlong_period:{y1}-{y2}")
     for match in _SHORT_YEAR_RE.finditer(text):
+        if _inside_phone(phone_spans, match.start(1), match.end(1)):
+            continue
         token = match.group(1)
         # 3-digit tokens adjacent to date markers are truncated years.
         if not _year_ok(token) and f"implausible_year:{token}" not in reasons:
