@@ -137,7 +137,7 @@ holdout 全部为合成/匿名化数据；真实可用必须用真实输入验�
 - **RD4 真实 PDF 的工作经历不落 experience**：3 份真实 pdf 中 2 份内容全部归入 projects/research（experience=0），1 份 26 条塞进「教育补充信息」垃圾场——真实版式的章节识别/归属失效。
 - **RD5 姓名提取仅 7/16**；摘要仅 8/16（真实 pdf 3 份中 2 份 dropped_unverifiable）。
 
-**下一步排序（依 r0）**：RD1 电话守卫（危害最大、修复最小）→ RD2 markdown 剥离 → RD4 真实版式章节归属（与任务 3 的表达层重建并行诊断）。
+**RD1–RD5 修复已立项为 R28 批次**（`2026-08-18-real-input-hardening.md`）：任务 1–4 连续实施、每任务独立 commit、单元测试随修随跑，端到端验证（dogfood r1 + full60 + 盲评门禁）只在批次末做一次；RD4-pdf 只诊断不修，另行立项。
 
 ### 任务 2：Rubric 白捡分（全部确定性工程）
 
