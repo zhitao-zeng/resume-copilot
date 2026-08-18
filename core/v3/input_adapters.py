@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from io import BytesIO
 import os
+import re
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -282,6 +283,37 @@ def _pdf_graph(content: bytes, asset: SourceAsset) -> DocumentGraph:
     )
 
 
+_MD_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+_MD_EMPHASIS_RE = re.compile(r"\*\*(.+?)\*\*|__(.+?)__")
+_MD_CODE_SPAN_RE = re.compile(r"`([^`\n]+)`")
+_MD_HEADING_RE = re.compile(r"^(#{1,6})\s*", re.MULTILINE)
+
+
+def normalize_markdown_source(text: str) -> str:
+    """Translate markdown syntax into the conventions the pipeline reads.
+
+    This runs before ``from_native_text`` builds spans, so the normalized
+    document is the source-of-record — the same contract the PP-Structure
+    adapter uses for its normalized parser document.  Three spec-level
+    semantics, no resume-specific rules:
+
+    * HTML comments are author-hidden content and are removed outright
+      (dogfood RD3: a commented checklist rendered as skills).
+    * Emphasis and code markers are presentation, not content (RD2).
+    * Heading markers are dropped; a known section title is still detected
+      by ``is_section_heading`` on its bare text, while an unknown deeper
+      heading (a record line or group label) flows on as content where the
+      existing record-shape detection can read it (RD4-md).  Level nesting
+      is thereby preserved instead of every ``#`` line splitting sections.
+    """
+
+    text = _MD_HTML_COMMENT_RE.sub("", text)
+    text = _MD_EMPHASIS_RE.sub(lambda m: m.group(1) or m.group(2) or "", text)
+    text = _MD_CODE_SPAN_RE.sub(lambda m: m.group(1), text)
+    text = _MD_HEADING_RE.sub("", text)
+    return text
+
+
 def build_input_document_graph(
     content: bytes,
     *,
@@ -374,6 +406,8 @@ def build_input_document_graph(
             return from_ppstructure_blocks(asset, blocks)
         if suffix in {".txt", ".md", ".markdown"}:
             decoded = content.decode("utf-8", errors="replace")
+            if suffix in {".md", ".markdown"}:
+                decoded = normalize_markdown_source(decoded)
             return from_native_text(asset.model_copy(update={"text": decoded}), decoded)
     except Exception as exc:
         if not fallback_text.strip():

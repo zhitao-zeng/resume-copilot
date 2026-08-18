@@ -89,3 +89,80 @@ def test_conflicts_hide_internal_codes_and_drop_unmappable():
     friendly = friendly_conflicts(["cv:record:4:period", "unassigned:metric", "garbage"])
     assert friendly == ["存在多处不一致的时间表述，请核对确认。"]
     assert all(":" not in item.split("表述")[0] for item in friendly)
+
+
+# --- R28 task 2/2.5: markdown normalization and compound-title inheritance ---
+
+import pytest  # noqa: E402
+
+from core.v3.input_adapters import normalize_markdown_source  # noqa: E402
+from core.v3.section_ontology import section_type as _sec_type  # noqa: E402
+from core.v3.contracts import SourceAsset as _SA, SourcePolicy as _SP  # noqa: E402
+from core.v3.document_graph import from_native_text as _fnt  # noqa: E402
+from core.v3.fact_graph import build_fact_graph as _bfg  # noqa: E402
+
+_MD_SKELETON = """# 张示例
+
+## 工作经历
+
+### 示例科技｜算法工程师｜2020.03 - 至今
+
+#### 模型训练方向
+
+- **搭建训练管线：** 完成数据清洗与评测闭环。
+- 上线两个业务模型。
+
+## 专业技能
+
+- Python、PyTorch
+
+<!--
+私人备注：投递前再核对一遍数字。
+-->
+"""
+
+
+def _md_graph():
+    text = normalize_markdown_source(_MD_SKELETON)
+    asset = _SA(source_id="cv", source_type="cv", filename="cv.md",
+                media_type="text/markdown", text=text, native=True)
+    return _bfg([_fnt(asset, text)], _SP()), text
+
+
+def test_md_normalizer_strips_presentation_syntax():
+    text = normalize_markdown_source(_MD_SKELETON)
+    assert "**" not in text
+    assert "<!--" not in text and "私人备注" not in text
+    assert not any(line.startswith("#") for line in text.splitlines())
+
+
+def test_md_deep_subheading_does_not_split_experience():
+    graph, _ = _md_graph()
+    sec_of = {s.section_id: s for s in graph.sections}
+    exp_facts = [f for f in graph.facts
+                 if getattr(sec_of.get(f.section_id), "section_type", "") == "experience"]
+    assert exp_facts, "experience section must survive #### sub-headings"
+    joined = "\n".join(f.text for f in exp_facts)
+    assert "搭建训练管线" in joined
+    assert "上线两个业务模型" in joined
+
+
+def test_md_record_line_forms_record_with_company_and_period():
+    graph, _ = _md_graph()
+    titles = [getattr(r, "title", "") for r in graph.records]
+    assert any("示例科技" in t and "2020.03" in t for t in titles)
+
+
+def test_commented_content_never_reaches_facts():
+    graph, _ = _md_graph()
+    assert all("私人备注" not in f.text for f in graph.facts)
+
+
+@pytest.mark.parametrize("title,expected", [
+    ("科研项目经历", "projects"),
+    ("主要工作经历", "experience"),
+    ("经历", "other"),
+    ("这是一句提到工作经历的正文长句子所以不该命中", "other"),
+])
+def test_compound_section_title_inherits_known_suffix(title, expected):
+    assert _sec_type(title) == expected

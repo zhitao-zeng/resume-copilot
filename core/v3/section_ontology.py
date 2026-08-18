@@ -105,8 +105,37 @@ _NORMALIZED_TO_SECTION = {
 }
 
 
+# Compound headings such as 科研项目经历 end with a known section title but
+# miss the exact-alias table, leaving the previous section open and flooding
+# it (dogfood r0: 44 research facts stranded in education).  A heading whose
+# normalized text ends with a known alias inherits that alias's section.
+# The suffix must be a whole known alias of at least 4 characters, so short
+# generic tails cannot re-type ordinary lines; the longest suffix wins.
+_SUFFIX_ALIASES = sorted(
+    (alias for alias in _NORMALIZED_TO_SECTION if len(alias) >= 4),
+    key=len, reverse=True,
+)
+
+
 def section_type(value: str) -> str:
-    return _NORMALIZED_TO_SECTION.get(normalize_section_heading(value), "other")
+    normalized = normalize_section_heading(value)
+    direct = _NORMALIZED_TO_SECTION.get(normalized)
+    if direct is not None:
+        return direct
+    # Bounded heading length keeps suffix inheritance to title-like lines;
+    # prose that merely mentions a section word must stay untyped.
+    if 4 <= len(normalized) <= 12:
+        for alias in _SUFFIX_ALIASES:
+            # A compound heading is a short modifier plus a known title
+            # (科研+项目经历, 主要+工作经历).  Bounding the modifier at four
+            # characters keeps prose that merely ends with a section word
+            # (以下是全部个人信息) from being retyped as a heading.
+            if (
+                normalized.endswith(alias)
+                and 0 < len(normalized) - len(alias) <= 4
+            ):
+                return _NORMALIZED_TO_SECTION[alias]
+    return "other"
 
 
 def is_section_heading(value: str) -> bool:
