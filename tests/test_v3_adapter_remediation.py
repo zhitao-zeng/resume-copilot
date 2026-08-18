@@ -262,3 +262,29 @@ def test_education_split_keeps_gpa_value_intact():
 def test_unsplittable_education_line_returns_nothing(line):
     # The caller falls back to supplementary overflow rather than guessing.
     assert _split_education_line(line) == {}
+
+
+# --- R28 task 7b: the splitter is a floor, never a competitor to the compiler ---
+
+from core.v3.resume_adapter import (  # noqa: E402
+    _looks_like_unsplit_header,
+    _split_record_header_line,
+)
+
+
+@pytest.mark.parametrize("value", [
+    "示例科技（Example）", "预测分析与风险管理", "理学硕士", "2022.08-2024.05",
+])
+def test_compiler_assigned_fields_are_left_alone(value):
+    # When the semantic compiler already split a header, each value arrives
+    # alone and the deterministic splitter must not second-guess it.
+    assert not _looks_like_unsplit_header(value)
+
+
+def test_unsplit_header_is_split_into_its_own_fields():
+    value = "示例科技（Example）｜算法工程师 → 技术负责人｜2025.02 - 至今"
+    assert _looks_like_unsplit_header(value)
+    fields = _split_record_header_line(value, "experience")
+    assert fields["company"] == "示例科技（Example）"
+    assert fields["period"] == "2025.02 - 至今"
+    assert "算法工程师" in fields["role"]

@@ -196,16 +196,25 @@ _EDU_PERIOD_RE = re.compile(
 )
 
 
-def _split_education_line(value: str) -> dict[str, str]:
-    """Best-effort split of a one-line education record into public fields.
+def _looks_like_unsplit_header(value: str) -> bool:
+    """Return whether one claim value carries several header fields at once."""
 
-    Education lines arrive as a single claim when the compiler did not split
-    them, and the public education record has no free-form bullet field, so
-    the whole line used to fall into the supplementary overflow and leave the
-    education section empty.  The period is located by date shape; the
-    remaining segments keep source order, first as school and the rest joined
-    as degree.  No vocabulary is consulted, and a line that does not split
-    into at least two segments returns nothing so the caller can fall back.
+    return len(_EDU_SEPARATOR_RE.findall(value)) >= 2
+
+
+def _split_record_header_line(value: str, section: str) -> dict[str, str]:
+    """Best-effort split of a one-line record header into public fields.
+
+    A compact header ("Employer | Role | 2020-2023") reaches the adapter as a
+    single claim whenever the compiler did not split it.  The public record
+    has no field for such a blob, so the whole line used to land in one
+    arbitrary field or in the supplementary overflow, leaving the section
+    structurally empty.
+
+    The period is located by date shape; the remaining segments keep source
+    order, the first naming the organization and the rest joined into the
+    role.  No vocabulary is consulted.  A line that does not yield at least
+    two segments returns nothing so the caller falls back rather than guess.
     """
 
     segments = [seg.strip() for seg in _EDU_SEPARATOR_RE.split(value) if seg.strip()]
@@ -220,12 +229,19 @@ def _split_education_line(value: str) -> dict[str, str]:
         rest.append(seg)
     if not rest:
         return {}
-    fields = {"school": rest[0]}
+    org_key, detail_key = ("school", "degree") if section == "education" else ("company", "role")
+    fields = {org_key: rest[0]}
     if period:
         fields["period"] = period
     if len(rest) > 1:
-        fields["degree"] = " · ".join(rest[1:])
+        fields[detail_key] = " · ".join(rest[1:])
     return fields
+
+
+def _split_education_line(value: str) -> dict[str, str]:
+    """Backward-compatible education entry point."""
+
+    return _split_record_header_line(value, "education")
 
 
 def _record_section(
@@ -242,6 +258,15 @@ def _record_section(
             continue
         field = claim.field
         key = _RECORD_FIELD_MAPS.get(section, _RECORD_FIELD_MAPS["experience"]).get(field)
+        # A compact header that arrived whole must populate its own fields
+        # rather than occupy whichever single field the compiler guessed.
+        if key and field != "bullet" and _looks_like_unsplit_header(value):
+            split = _split_record_header_line(value, section)
+            if len(split) >= 2:
+                for split_key, split_value in split.items():
+                    if not record.get(split_key):
+                        record[split_key] = split_value
+                continue
         if key:
             if not record.get(key):
                 record[key] = value
