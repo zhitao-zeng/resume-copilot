@@ -41,6 +41,12 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-16384}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-2}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
 VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.74}"
+# CUDA graphs cost 1-2 GB but remove the eager-mode per-step overhead.  The
+# R28 measurement showed OCR peaks at ~2 GB against a 9 GB headroom, so the
+# budget can afford them; keep eager as the default for safety and let the
+# deployment opt in.
+VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-1}"
+if [ "$VLLM_ENFORCE_EAGER" = "0" ]; then VLLM_EAGER_FLAG=""; else VLLM_EAGER_FLAG="--enforce-eager"; fi
 export MAX_MODEL_LEN
 export LLM_CONTEXT_WINDOW="$MAX_MODEL_LEN"
 export LLM_TOKENIZER_PATH="${LLM_TOKENIZER_PATH:-$MODEL_FOUND}"
@@ -62,7 +68,7 @@ vllm serve "$MODEL_FOUND" \
     --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS" \
     --limit-mm-per-prompt '{"image":0,"video":0}' \
     --trust-remote-code \
-    --enforce-eager \
+    $VLLM_EAGER_FLAG \
     > /tmp/vllm_stdout.log 2>&1 &
 VLLM_LOG="/tmp/vllm_stdout.log"
 VLLM_PID=$!
