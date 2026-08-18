@@ -1,6 +1,6 @@
 # 整体质量计划 — 对齐平台 Rubric（2026-08-18）
 
-> **面向执行者：** 本计划自包含，不依赖外部技能或插件。按任务顺序逐项执行；每个任务内步骤用复选框（`- [ ]`）跟踪，全部步骤完成并通过该任务末尾的**验收**后再开始下一个任务。每次改动后运行 `.venv/bin/python -m pytest -m 'not integration' -q`，当前基线为 **858 passed, 43 deselected**，不得净减少。**勾选任何验收项前必须留下可复核证据**（测试文件、结果 JSON 或命令输出路径）——R27 计划曾因无证据勾选被整体重置，不要重演。遇到与本计划描述不符的代码现状，停下来报告，不要自行扩大改动范围。
+> **面向执行者：** 本计划自包含，不依赖外部技能或插件。按任务顺序逐项执行；每个任务内步骤用复选框（`- [ ]`）跟踪，全部步骤完成并通过该任务末尾的**验收**后再开始下一个任务。每次改动后运行 `.venv/bin/python -m pytest -m 'not integration' -q`，当前基线为 **874 passed, 43 deselected**（2026-08-18 于 e0d2236 实测；本文档写作时为 858），不得净减少。**勾选任何验收项前必须留下可复核证据**（测试文件、结果 JSON 或命令输出路径）——R27 计划曾因无证据勾选被整体重置，不要重演。遇到与本计划描述不符的代码现状，停下来报告，不要自行扩大改动范围。
 
 ## 一、目标定义
 
@@ -14,7 +14,7 @@
 | 编造否决 | 0 | 保持 0（不可回退） |
 | 最大延迟 | 479.3s / 480s | **≤ 460s** |
 
-**双量尺换算**：本地 darvin-component-evaluator-r3 与平台 rubric 逐项对齐（10/30/40/20，细项权重一致），但主观项上本地代理更严。唯一锚点：V2 线本地 56.05 ↔ 平台 65.48（offset ≈ +9.4）。V3 无平台数据点——任务 1 的提交即为校准。
+**双量尺换算**：本地 darvin-component-evaluator-r3 与平台 rubric 逐项对齐（10/30/40/20，细项权重一致），但主观项上本地代理更严。双锚点（2026-08-18 校准）：V2 本地 56.05 ↔ 平台 65.48（+9.4）；V3-R26 本地 56.36 ↔ 平台 61.1（+4.7，镜像 77708bc、job b31a382f、84 例、2026-08-17T14:29Z SUCCEEDED）。offset 非常数、随版本漂移；V3 换算按 +4.7：当前本地 61.50 ≈ 平台 66.2，刚过 V2 线 65.48；平台 ≥80 需本地 ≈75。两锚点各为单点、且平台 84 例与本地 60 例集合不同，校准仍有不确定度。
 
 **发版纪律（每次合入前）**：
 1. full60 逐 case 打分，**可用度不下降**；
@@ -31,7 +31,7 @@ R26 full60（`.codex/research-loop/artifacts/darvin-aligned-quality-20260816/qua
 - generation_quality：star_complete 0.043、JD supported **0/299**、industry 误判 **35/60**、recall 0.8619（education 缺 102、period 缺 51）。
 - V2 对照（同评测器）：总分 56.05；star 0.1353（**无原子约束仍更低** → STAR 瓶颈是源数据缺 Result + 组装，不是逐字约束本身）；industry 误判 36/60（与 V3 几乎逐例相同 → 分类器共用，坏的是组件）；metric 型事实仅 3 处丢失（→ 量化结果大多存在，只是没被组装成 R）。
 
-已落地（工作树未提交，2026-08-18，858 passed）：
+已落地（2026-08-18；后已提交为 2c5bc0b，于 e0d2236 实测 874 passed）：
 - **A1** `summary_compiler._passes_atomic_audit` 门禁作用域从全文档 `Audit.clean` 改为仅 summary 自身违规——`dropped_atomic_audit:32` 的根因。
 - **A0** `realizer._LATIN_CONNECTORS` 摘除 experienced/skilled/proficient/familiar/strong/solid（英文侧无源能力断言缺口，与 `_FORBIDDEN_SYNTHESIS` 对齐）；D10 测试改为合法织入，并新增回归测试钉死该缺口。
 - **A2** `pipeline` not_rendered 仅限 {dropped_unverifiable, dropped_atomic_audit, fallback, budget_fallback}。
@@ -60,7 +60,7 @@ R26 full60（`.codex/research-loop/artifacts/darvin-aligned-quality-20260816/qua
 按 record 分桶：A=已含结果内容（独立 metric 或结果动词）→ 纯组装可救；B=无结果但有时间/组织上下文；C=两者皆无。
 
 - [x] 跑出 A/B/C 分布与逐场景占比（证据：本节下方数字，脚本 `/tmp/star_ceiling.py`）
-- [x] 依据 A 桶占比确定任务 3 的 star 目标值：**A = 60.1% ≥ 60% → star 目标定 0.50**
+- [x] 依据 A 桶占比确定任务 3 的 star 目标值：**A = 60.1% ≥ 60% → star 目标定 0.50**（2026-08-18 修订：0.50 不足以支撑可用度 ≥50%，改为 star/ability 双 0.60——见任务 3 目标修订）
 
 **测量结果（268 个经历族 record，45 个有 record 的 case）：**
 
@@ -78,10 +78,23 @@ R26 full60（`.codex/research-loop/artifacts/darvin-aligned-quality-20260816/qua
 
 ### 任务 1：full60 基线重跑 + 平台校准提交
 
-- [ ] 用当前工作树（R27+A 批）跑 full60 + darvin-r3 重审计
-- [ ] 验证预测：summary 0.0222 → ≥0.6，总分 ≥59；若未达，查 summary 状态分布再修
-- [ ] 结果登记到本文档；这是后续所有改动的对照基线
-- [ ] （负责人拍板）提交平台一次，目的=拿 V3 平台数据点校准 offset，不是冲线
+- [x] 用当前工作树（R27+A 批）跑 full60 + darvin-r3 重审计（r27-abatch，总分 60.98）
+- [x] 验证预测：summary 0.0222 → ≥0.6，总分 ≥59（实测 summary 0.8667、总分 60.98，超额达成）
+- [x] 结果登记到本文档；这是后续所有改动的对照基线（见下方登记）
+- [x] （负责人拍板）提交平台一次，目的=拿 V3 平台数据点校准 offset，不是冲线（免新提交：2026-08-17 已在跑的 77708bc 于 14:29Z SUCCEEDED，61.1，校准点到手）
+
+**登记（2026-08-18）**
+
+| 运行 | 总分 | 可读10 | 完整30 | 表达40 | 回复20 | artifact（.codex/research-loop/artifacts/…） |
+|---|---|---|---|---|---|---|
+| R26 基线 | 56.36 | 0.9993 | 0.6846 | 0.3744 | 0.8831 | darvin-aligned-quality-20260816/quality-gate-r24-v3/r26-full60-darvin-r3.json |
+| R27+A批 | 60.98 | 0.9993 | 0.8683 | 0.3739 | 0.8831 | local-eval-cluster/r27-abatch/darvin-r3.json |
+| R27+任务2 | 61.50 | 0.9993 | 0.8874 | 0.3756 | 0.8814 | local-eval-cluster/r27-task2/darvin-r3.json |
+
+- A1 预测验证：summary 完整度 0.0222 → **0.8667**。
+- 门禁三次全绿：precision 0.9982–0.9996、ownership ≥0.9924、max latency 479.26–479.27s。
+- 可用度（per-case 折算，方法与曲线见 local-eval-cluster/r27-task2/usability-analysis.json 及同目录 usability-*.txt）：task2 **1/60 = 1.7%**、per-case 均值 58.61（A批 1.7%、58.16，可用度不降）；**11 例落在 79–80**（其中 10 例 79.999：三大项全满、仅表达差 0.0002）；**15 例 <30**（S4 框架/查询路径，结构性低分）。
+- 边际解锁：star_richness 拉满可解锁 37 例、ability_emphasis 17 例、其余细项 ≤1 例——可用度完全由表达层决定。
 
 ### 任务 2：Rubric 白捡分（全部确定性工程）
 
@@ -98,6 +111,8 @@ R26 full60（`.codex/research-loop/artifacts/darvin-aligned-quality-20260816/qua
 
 **验收**：full60 对照任务 1 基线——completeness ≥0.82、reply ≥0.93、结构缺陷 0、行业错报 0、教育/时间字段缺失清零或进提示、precision ≥0.99、可用度不降。
 
+**登记（2026-08-18，r27-task2 full60）**：completeness 0.8874 ✅（≥0.82）；precision 0.9982 ✅；可用度 1.7% 与 A批 持平 ✅；**reply 0.8814 ❌**（要求 ≥0.93，且低于 A批 0.8831）；**education 0.7444 ❌**（较 A批 0.7513 反降，2.3 的「education missing → 个位数」未达）；**max 479.27s ❌**（2.8 的 ≤460 未达）。三项未达需在任务 3 开始前补修或书面豁免。
+
 ### 任务 3：表达层重建（决定可用度的战役）
 
 前置：任务 0 的天花板数字、任务 1 的基线。
@@ -109,6 +124,13 @@ R26 full60（`.codex/research-loop/artifacts/darvin-aligned-quality-20260816/qua
 - [ ] **3.5 延迟供养**：平台按 40G 半卡记账（gpu-util 0.88×40≈35G）——评估关 enforce-eager、提 max-num-seqs；蕴含校验优先打包进现有 pack 调用。admission gate 管尾部：mean 附近 case 全流程，逼近 460s 降级为今日路径。
 
 **验收**：star_richness ≥（任务 0 定的目标）、expression ≥0.55、precision ≥0.99、编造 0、max ≤460s、可用度显著 >0（首批 case 过 80）。每个子步骤独立 full60 消融，star 与 precision 同时记录。
+
+> **目标修订（2026-08-18，依 r27-task2 可用度分析）：**
+> 1. star 目标 0.50 → **0.60**，且 **ability_emphasis 须同步 ≥0.60**。实测曲线：star 单项 0.50 → 可用度仅 30%、0.60 → 35%；star+ability 双 0.60 → **58.3%**，方过 ≥50% 线。0.60 即任务 0 的物理天花板——A 桶（60.1%）须全部救活，零余量。
+> 2. **执行顺序强制：3.5（延迟）先于 3.2（蕴含校验）。** full60 max 479.27s、余量 0.73s，先加 LLM 调用必然超时，且会把超时误判为蕴含校验方案不可行。
+> 3. **第一里程碑：79–80 分的 11 例**（S2-011/013/014/015、S3-010/011/012/013/014/015 为 79.999，S3-002 为 79.65）——三大项全满、仅卡表达，star 的任何真实改善立即把可用度 1.7% → 约 20%。
+> 4. **未决口径（阻塞 ≥50% 目标论证）：15 例 <30 的 S4/查询框架路径。** 若平台按同一 rubric 计分，其余 45 例须达 67% 可用；若平台对框架路径另行计分则目标可达。须向产品方确认后回填本节。
+> 5. 按 +4.7 offset：本地均分 ≥70 仅对应平台 ≈74.7，**不足以保证平台 ≥80（需本地 ≈75）**；而 star/ability 双 0.60 时实测 per-case 均值仅 67.3——「均分 ≥70」与「可用度 ≥50%」两目标在当前结构下不能同时满足，第一节指标表需负责人重定。
 
 ### 任务 4：模型与匹配（与任务 3 后半并行）
 
