@@ -112,11 +112,32 @@ holdout 全部为合成/匿名化数据；真实可用必须用真实输入验�
 | 收集的他人简历 | 3 份真实 pdf（姓名不入库） | Mac `~/Desktop/4para/05_Resumes/` |
 | 0611 验收原件 | 真实输入 pdf + 21 份构造 CV（7 行业 × docx/pdf/png） | 项目 `acceptance_testset/0611case/`、`acceptance_testset/files/cv/` |
 
-- [ ] 把 badcase-0702 的 12 份解包为 dogfood 集（保持 query+JD+模板完整），从 `tmp/` 迁入持久目录，目录**加入 .gitignore——真实 PII 永不入 git**
+- [x] 把 badcase-0702 的 12 份解包为 dogfood 集（`validation_sets/dogfood_real/`，已入 .gitignore；另含 3 份附件 docx、负责人简历 md、3 份本地收集 pdf，共 16 例）
 - [ ] 每批改动跑 dogfood 集并人读输出，按三档记录进本文档；「不能用」未清零前不谈平台提交
-- [ ] 负责人本人简历跑一次当前版，作为第一份人工判定样本
+- [x] 负责人本人简历已跑（own-zzt，308s，DOCX 已拉回 Mac `~/Desktop/4para/dogfood-r0/`）；**三档判定待负责人亲读**
 
 **红线**：真实简历内容不进 git、不粘贴进会话记录、不外发；仅在 gpu16/本机处理。
+
+**r0 登记（2026-08-18，代码态 cce2917，16 例全部 HTTP 200，均时 199s，产物 `validation_sets/dogfood_real/runs/r0-cce2917/`，DOCX 已拉回负责人 Mac）**
+
+结构初筛三档（**人读待负责人确认**，非最终判定）：
+
+| 初筛档 | case | 依据 |
+|---|---|---|
+| 直接可投候选 | bc11、bc71、bc81 | 结构完整（含公司/时间）+ 摘要 + 零结构缺陷 + 零缺失 |
+| 小改可投 | bc1、bc21、bc51、bc61、bc31、bc41 | 碎片 2–4 处，或源信息薄（S2 短 query） |
+| 不能用 | own-zzt、loc-A/B/C（本地 3 份，姓名不入库） | 见下方新缺陷类 |
+| 按产品定义合格 / 按 rubric 为 0 | bc91、bc101、bc111（S4 无个人信息） | 框架输出符合设计；平台口径仍待产品方确认 |
+
+**真实输入暴露的新缺陷类（合成 holdout 全部测不到）：**
+
+- **RD1（最重）手机号被数字守卫剥除**：own-zzt 的「189-2758-0370」被 `_RANGE_RE` 匹配为可疑年份区间，从简历中移除并在 reply 报「数字/时间疑似识别错误」——**真实用户会丢联系方式**。守卫需先识别电话号形态再判年份。
+- **RD2 Markdown 标记泄漏**：.md 输入的 `**` 加粗符原样进入 bullet 文本（own-zzt 多处「…体系：** 横评…」）。输入规范化缺 markdown 剥离。
+- **RD3 私人备注被路由进技能**：own-zzt 的「求职注意事项 1–5」编号清单整段渲染为 skills 条目。
+- **RD4 真实 PDF 的工作经历不落 experience**：3 份真实 pdf 中 2 份内容全部归入 projects/research（experience=0），1 份 26 条塞进「教育补充信息」垃圾场——真实版式的章节识别/归属失效。
+- **RD5 姓名提取仅 7/16**；摘要仅 8/16（真实 pdf 3 份中 2 份 dropped_unverifiable）。
+
+**下一步排序（依 r0）**：RD1 电话守卫（危害最大、修复最小）→ RD2 markdown 剥离 → RD4 真实版式章节归属（与任务 3 的表达层重建并行诊断）。
 
 ### 任务 2：Rubric 白捡分（全部确定性工程）
 
