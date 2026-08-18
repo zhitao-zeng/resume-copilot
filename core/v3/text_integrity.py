@@ -65,4 +65,44 @@ def bullet_defects(text: str) -> list[str]:
     return defects
 
 
-__all__ = ["bullet_defects"]
+# --- R28 task 6: presentation cleanup shared by every input branch ---
+
+# The digit lookahead keeps a decimal such as "3.1 倍" intact: an ordinal
+# marker is never followed by another digit.
+_ORDINAL_PREFIX_RE = re.compile(
+    r"^\s*(?:\(?\d{1,2}[.)、）](?!\d)|[①-⑳]|[一二三四五六七八九十]{1,2}[、.）)])\s*"
+)
+_URLISH_RE = re.compile(r"://|@|[A-Za-z0-9-]+\.(?:com|cn|org|net|io|dev|edu|gov)\b", re.I)
+_CJK_RE = re.compile(r"[一-鿿]")
+
+
+def strip_ordinal_prefix(text: str) -> str:
+    """Drop a leading source ordinal from a bullet.
+
+    A list number is the source document's layout.  Once bullets are
+    reordered or split it no longer counts anything, which is the
+    "garbled numbering" reported from the platform review.
+    """
+
+    return _ORDINAL_PREFIX_RE.sub("", str(text or ""), count=1).strip()
+
+
+def is_junk_token(text: str) -> bool:
+    """Return whether a value is an extraction artifact rather than content.
+
+    Real PDFs leak embedded resource names and base64-like fragments.  They
+    are long, unspaced, mixed alphanumeric and carry no CJK.  URLs, emails
+    and domains are explicitly exempt: a portfolio link is real content.
+    """
+
+    value = str(text or "").strip()
+    if len(value) <= 20 or " " in value or _CJK_RE.search(value):
+        return False
+    if _URLISH_RE.search(value):
+        return False
+    has_alpha = any(c.isalpha() for c in value)
+    has_digit = any(c.isdigit() for c in value)
+    return has_alpha and has_digit
+
+
+__all__ = ["bullet_defects", "strip_ordinal_prefix", "is_junk_token"]

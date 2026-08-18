@@ -195,3 +195,42 @@ def test_narrative_lines_are_not_record_headers(line):
 def test_list_markers_are_stripped_from_markdown():
     text = normalize_markdown_source("- 第一条\n1. 第二条\n* 第三条\n")
     assert text.splitlines() == ["第一条", "第二条", "第三条"]
+
+
+# --- R28 task 6: presentation cleanup (feedback item 3) ---
+
+from core.v3.text_integrity import is_junk_token, strip_ordinal_prefix  # noqa: E402
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("4. 设计相关拟合算法", "设计相关拟合算法"),
+    ("1、负责数据清洗", "负责数据清洗"),
+    ("① 主导项目评审", "主导项目评审"),
+    ("一、工作职责说明", "工作职责说明"),
+    ("(2) 参与架构评审", "参与架构评审"),
+])
+def test_source_ordinals_are_stripped(raw, expected):
+    assert strip_ordinal_prefix(raw) == expected
+
+
+@pytest.mark.parametrize("raw", ["3.1 倍加速", "2.5 万用户覆盖"])
+def test_decimals_are_not_mistaken_for_ordinals(raw):
+    assert strip_ordinal_prefix(raw) == raw
+
+
+@pytest.mark.parametrize("value,junk", [
+    ("32380b8d618fe5591XR639u_ElpVwI-_UPqb", True),
+    ("github.com/example/repo", False),
+    ("https://example.com/a1b2c3d4e5f6g7h8", False),
+    ("someone@example.com", False),
+    ("PP-OCRv6", False),
+    ("负责端侧推理优化与部署", False),
+])
+def test_junk_token_detection_exempts_links_and_content(value, junk):
+    assert is_junk_token(value) is junk
+
+
+def test_contact_line_is_not_a_record_header():
+    # Phone digits contain a year; a contact line must not open a record.
+    assert not _looks_like_record_header("手机：19975260767 |", "projects")
+    assert not _looks_like_record_header("邮箱：a@example.com ｜ 浙江温州", "projects")

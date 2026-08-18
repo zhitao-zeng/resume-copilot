@@ -5,6 +5,7 @@ from collections import OrderedDict
 import re
 from typing import Any
 
+from .text_integrity import is_junk_token, strip_ordinal_prefix
 from .contracts import FactGraph, FrozenResume, RealizedClaim
 
 
@@ -73,6 +74,7 @@ def _claim_value(claim: RealizedClaim) -> str:
     # source-backed while avoiding public roles such as ``**机械工长**`` that
     # strict consumers interpret as a different title.
     value = re.sub(r"^(?:[•·]\s*|-\s+|\*\s+)", "", value).strip()
+    value = strip_ordinal_prefix(value)
     wrappers = (("**", "**"), ("__", "__"), ("`", "`"))
     changed = True
     while changed and value:
@@ -256,6 +258,23 @@ def frozen_to_resume_data(
     sections_in: dict[str, list[Any]] = {
         section: list(claims) for section, claims in frozen.sections.items()
     }
+    # R28-6: extraction artifacts and cross-section repeats are presentation
+    # damage, not candidate facts.  Dropping them here keeps every downstream
+    # consumer (renderer, audit, reply) reading one cleaned view.
+    seen_values: set[str] = set()
+    for section, claims in list(sections_in.items()):
+        deduped: list[Any] = []
+        for claim in claims:
+            value = _claim_value(claim)
+            if is_junk_token(value):
+                continue
+            key = re.sub(r"\s+", "", value)
+            if len(key) > 8:
+                if key in seen_values:
+                    continue
+                seen_values.add(key)
+            deduped.append(claim)
+        sections_in[section] = deduped
     for section in ("experience", "projects", "research", "activities", "teaching"):
         if section not in sections_in:
             continue

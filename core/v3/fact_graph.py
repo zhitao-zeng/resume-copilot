@@ -177,7 +177,12 @@ _MAX_HEADER_CHARS = 80
 def _is_compact_header_shape(value: str) -> bool:
     if len(value) > _MAX_HEADER_CHARS:
         return False
-    return not _SENTENCE_PUNCT_RE.search(value)
+    if _SENTENCE_PUNCT_RE.search(value):
+        return False
+    # A contact line is header-shaped but names no experience.  Its phone
+    # digits also parse as a year (19975260767 contains 1997), which on real
+    # PDFs opened a fresh record per contact line and shattered grouping.
+    return not _CONTACT_RE.search(value)
 
 
 def _looks_like_record_header(text: str, section: str, previous: str = "") -> bool:
