@@ -103,7 +103,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # Application code and model artifacts change frequently; copy them after the
 # expensive OS/Python dependency layers so iterative fixes keep the cache.
-COPY core/*.py ./core/
+# core/*.py matches only top-level files, so core/v3 (and any future
+# core/v4) was silently absent from every image built here.  Nothing
+# failed at build or boot time because the default pipeline is v2; the
+# gap only surfaced as ModuleNotFoundError under RESUME_PIPELINE_VERSION=v3.
+# Copy the package whole, then assert the subpackages are present.
+COPY core ./core
 COPY main.py cli.py drafts.py eval_runner.py http_compat.py ./
 COPY config/start.sh ./start.sh
 COPY eval_cases.jsonl ./
@@ -115,6 +120,10 @@ COPY config/ppocrv6-small-ort.sha256 /tmp/ppocrv6-small-ort.sha256
 COPY config/ppocrv6-trt-a100-fp32.sha256 /tmp/ppocrv6-trt-a100-fp32.sha256
 COPY config/ppocrv6-tensorrt-runtime-10.13.3.9.sha256 /tmp/ppocrv6-tensorrt-runtime.sha256
 COPY config/ppstructure-v3-layout-ocr.sha256 /tmp/ppstructure-v3-layout-ocr.sha256
+
+# Build-time guard: a pipeline package that the runtime can select must be
+# importable in the image.  Fail the build, not a production request.
+RUN test -f ./core/v3/__init__.py || (echo "core/v3 missing from image" && exit 1)
 
 RUN test -s /root/app/models/ppocrv6-small-ort/det.onnx \
     && test -s /root/app/models/ppocrv6-small-ort/rec.onnx \
